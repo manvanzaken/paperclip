@@ -47,15 +47,15 @@ The bot already has an inverted-fill guard at `real_trader.py:3863-3880` that em
 
 - **Type:** float (percentage points, same units as `ENTRY_SPREAD_PCT`).
 - **Range:** must satisfy `-MAX_SANE_SPREAD_PCT ≤ MIN_FILL_SPREAD_PCT < ENTRY_SPREAD_PCT`. On out-of-range values, log a warning and clamp to `-0.10` (current default).
-- **Hot-reload:** picked up by the existing config-reload path each cycle; no bot restart required.
+- **Activation:** read by `_apply_bot_config_overrides()` at startup, same lifecycle as `ENTRY_SPREAD_PCT`. **Bot restart required to change** — the trader does not currently re-read config at runtime despite some dashboard `needs_restart=false` flags suggesting otherwise. Implementing true runtime reload is out of scope.
 - **Default if key missing:** `-0.10` (preserves current behavior exactly — guarantees the deploy is a no-op until the operator sets it).
 
 ### 4.2 Modified abort guard
 
 In `real_trader.py:3863-3880` (`open_position`, "both legs filled" branch):
 
-- Replace local constant `INVERTED_FILL_TOLERANCE = -0.10` with the value of `MIN_FILL_SPREAD_PCT` read via the same hot-reload mechanism that already supplies `ENTRY_SPREAD_PCT`. Implementation may be via `self.config[...]`, a module-level global refreshed each cycle, or whatever pattern the existing code uses for `ENTRY_SPREAD_PCT` — match it for consistency.
-- Change the comparison to `actual_entry_spread < min_acceptable`.
+- Replace the local constant `INVERTED_FILL_TOLERANCE = -0.10` with a reference to the new module-level `MIN_FILL_SPREAD_PCT`, defined alongside `ENTRY_SPREAD_PCT` (around line 95) using the same `float(os.environ.get(...))` pattern. Default: `-0.10` (preserves current behavior).
+- Change the comparison to `actual_entry_spread < MIN_FILL_SPREAD_PCT`.
 - When the active threshold is `≥ 0` (i.e., operator has activated the new behavior), the log line changes from `INVERTED ENTRY` to `FILL-QUALITY ABORT` so it's distinguishable in logs and the existing log-grepping tooling.
 
 The emergency-close of both legs and the `failed_entry_cooldowns` write are unchanged.
@@ -134,14 +134,14 @@ Before deploying, run the full bot with `MIN_FILL_SPREAD_PCT = -0.10` (or absent
 
 1. Merge code with `MIN_FILL_SPREAD_PCT` defaulting to `-0.10`. Deploy.
 2. Verify zero behavioral change in production for at least 30 minutes.
-3. Edit `bot_config_live.json` to set `MIN_FILL_SPREAD_PCT = 0.30`. Hot-reload picks it up next cycle.
+3. Edit `bot_config_live.json` to set `MIN_FILL_SPREAD_PCT = 0.30` AND restart the bot (the trader does not currently re-read config at runtime).
 4. Monitor `fill_quality_abort` records appearing in the dashboard and logs.
 5. After 24 h, compare:
    - Number of `fill_quality_abort` events vs. our predicted ~38/200 (~19%) frequency.
    - Net P&L of remaining live trades — expected to improve since the lag-degraded losers are removed.
    - If aborts fire too often → raise threshold (e.g. `0.20`); too rare → lower (e.g. `0.40`).
 
-Easy revert: set the config key back to `-0.10`, hot-reload, no deploy.
+Easy revert: set the config key back to `-0.10` and restart the bot.
 
 ## 9. Explicitly dropped: rate-gate removal
 
