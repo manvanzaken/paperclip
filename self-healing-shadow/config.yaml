@@ -1,0 +1,32 @@
+exchanges:
+  binance:  { taker_fee_bps: 5,   maker_fee_bps: 2,   starting_balance_usd: 1000 }
+  bybit:    { taker_fee_bps: 6,   maker_fee_bps: 1,   starting_balance_usd: 1000 }
+  bitget:   { taker_fee_bps: 6,   maker_fee_bps: 2,   starting_balance_usd: 1000 }
+  gateio:   { taker_fee_bps: 5,   maker_fee_bps: 1.5, starting_balance_usd: 1000 }
+  mexc:     { taker_fee_bps: 2,   maker_fee_bps: 0,   starting_balance_usd: 1000 }
+
+symbols: ["BTC/USDT:USDT"]
+
+strategy:
+  lookback_window: 200
+  entry_z: 2.0
+  exit_z: 0.5
+  stop_loss_z: 4.0
+  min_net_profit_usd: 5.0
+  max_position_usd: 100
+  max_concurrent_positions: 5
+
+heal:
+  ws_stale_threshold_sec: 10
+  health_check_interval_sec: 300
+  hurst_window: 200
+  hurst_threshold: 0.5
+  sim_leg_failure_rate: 0.0
+  saga_quarantine_after_failures: 5
+  backoff_base_sec: 1
+  backoff_max_sec: 60
+
+paths:
+  data_dir: "./data"
+  journal_db: "./data/journal.sqlite"
+  state_file: "./data/state.json"
