@@ -76,6 +76,17 @@ class TestSpreadEngine:
         assert z_ab == pytest.approx(math.sqrt(3.0 / 2.0), abs=1e-6)  # mean=2, std=sqrt(2/3)*... actually compute below
         # mean=2, std=sqrt(((1-2)^2+(2-2)^2+(3-2)^2)/3)=sqrt(2/3); Z=(3-2)/sqrt(2/3)=sqrt(3/2)
 
+    def test_mean_returns_none_when_window_not_full(self):
+        eng = SpreadEngine(lookback_window=5)
+        eng.update(pair=("A", "B"), spread=1.0)
+        assert eng.mean(("A", "B")) is None
+
+    def test_mean_returns_arithmetic_mean_of_window(self):
+        eng = SpreadEngine(lookback_window=5)
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0]:
+            eng.update(pair=("A", "B"), spread=v)
+        assert eng.mean(("A", "B")) == pytest.approx(3.0)
+
     def test_engine_pair_order_does_not_matter(self):
         # ("A", "B") and ("B", "A") are the same pair (canonical ordering).
         eng = SpreadEngine(lookback_window=3)

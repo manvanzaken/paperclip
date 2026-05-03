@@ -73,7 +73,9 @@ class TestSaga:
         )
         saga = ReconciliationSaga(sim=sim, journal=journal)
         result = await saga.run(
-            position_id="t-1", leg_a=a, leg_b=b,
+            position_id="t-1",
+            exchange_a="mexc", exchange_b="binance",
+            leg_a=a, leg_b=b,
             client_order_id_a="A", client_order_id_b="B",
         )
         # Both legs filled is not actually a saga case — caller skips
@@ -92,7 +94,9 @@ class TestSaga:
 
         saga = ReconciliationSaga(sim=sim, journal=journal)
         result = await saga.run(
-            position_id="t-1", leg_a=a, leg_b=leg_b_exc,
+            position_id="t-1",
+            exchange_a="mexc", exchange_b="binance",
+            leg_a=a, leg_b=leg_b_exc,
             client_order_id_a="A", client_order_id_b="B-never-placed",
         )
         assert result.both_filled is False
@@ -117,7 +121,9 @@ class TestSaga:
 
         saga = ReconciliationSaga(sim=sim, journal=journal)
         result = await saga.run(
-            position_id="t-1", leg_a=a, leg_b=leg_b_exc,
+            position_id="t-1",
+            exchange_a="mexc", exchange_b="binance",
+            leg_a=a, leg_b=leg_b_exc,
             client_order_id_a="A", client_order_id_b="B",
         )
         assert result.both_filled is True
@@ -132,7 +138,9 @@ class TestSaga:
         leg_b_exc = SimulatedFailure("x")
         saga = ReconciliationSaga(sim=sim, journal=journal)
         await saga.run(
-            position_id="t-1", leg_a=a, leg_b=leg_b_exc,
+            position_id="t-1",
+            exchange_a="mexc", exchange_b="binance",
+            leg_a=a, leg_b=leg_b_exc,
             client_order_id_a="A", client_order_id_b="B",
         )
         journal.flush()
@@ -153,7 +161,9 @@ class TestSaga:
 
         saga = ReconciliationSaga(sim=sim, journal=journal)
         await saga.run(
-            position_id="t-1", leg_a=a, leg_b=leg_b_exc,
+            position_id="t-1",
+            exchange_a="mexc", exchange_b="binance",
+            leg_a=a, leg_b=leg_b_exc,
             client_order_id_a="A", client_order_id_b="B",
         )
         # Rollback was a SELL on mexc -> balance increased back ~ to start.
@@ -173,6 +183,7 @@ class TestQuarantineCounter:
             )
             await saga.run(
                 position_id=f"t-{i}",
+                exchange_a="mexc", exchange_b="binance",
                 leg_a=a, leg_b=SimulatedFailure("net"),
                 client_order_id_a=f"A{i}", client_order_id_b=f"B{i}",
             )
@@ -191,6 +202,7 @@ class TestQuarantineCounter:
             )
             await saga.run(
                 position_id=f"t-{i}",
+                exchange_a="mexc", exchange_b="binance",
                 leg_a=a, leg_b=SimulatedFailure("net"),
                 client_order_id_a=f"A{i}", client_order_id_b=f"B{i}",
             )
@@ -204,6 +216,7 @@ class TestQuarantineCounter:
             )
             await saga.run(
                 position_id=f"t-{i}",
+                exchange_a="mexc", exchange_b="binance",
                 leg_a=a, leg_b=SimulatedFailure("net"),
                 client_order_id_a=f"A{i}", client_order_id_b=f"B{i}",
             )

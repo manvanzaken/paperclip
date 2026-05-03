@@ -55,6 +55,14 @@ class SpreadEngine:
             self._windows[key] = window
         window.append(spread)
 
+    def mean(self, pair: tuple[str, str]) -> Optional[float]:
+        """Arithmetic mean of the rolling window, or None if not yet full."""
+        key = _canonical_pair(pair)
+        window = self._windows.get(key)
+        if window is None or len(window) < self.lookback_window:
+            return None
+        return float(np.mean(window))
+
     def zscore(self, pair: tuple[str, str]) -> Optional[float]:
         """Return the Z-score of the most recent spread for `pair`.
 

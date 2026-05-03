@@ -20,7 +20,7 @@ import itertools
 import logging
 import signal
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -34,7 +34,7 @@ from core.execution_sim import (
     SimulatedFailure,
 )
 from core.orderbook import OrderBook
-from core.signal_engine import EntrySignal, ExitSignal, SignalEngine
+from core.signal_engine import EntrySignal, ExitSignal, SignalEngine  # noqa: F401
 from core.spread_engine import SpreadEngine, log_spread, mid_price
 from core.state_machine import Position, PositionState
 from core.trade_journal import TradeJournal
@@ -93,24 +93,27 @@ class PaperTrader:
             },
             sim_leg_failure_rate=cfg["heal"]["sim_leg_failure_rate"],
         )
+        self.saga = ReconciliationSaga(
+            sim=self.execution,
+            journal=self.journal,
+            quarantine_after=cfg["heal"]["saga_quarantine_after_failures"],
+        )
         self.signal_engine = SignalEngine(
             heartbeat=self.heartbeat,
             canary=self.canary,
             journal=self.journal,
+            spread_engine=self.spread_engine,
             entry_z=cfg["strategy"]["entry_z"],
             exit_z=cfg["strategy"]["exit_z"],
             stop_loss_z=cfg["strategy"]["stop_loss_z"],
             min_net_profit_usd=cfg["strategy"]["min_net_profit_usd"],
             max_position_usd=cfg["strategy"]["max_position_usd"],
+            recovery_fraction=cfg["strategy"].get("recovery_fraction", 0.5),
             taker_fees_bps={
                 ex: float(c["taker_fee_bps"])
                 for ex, c in cfg["exchanges"].items()
             },
-        )
-        self.saga = ReconciliationSaga(
-            sim=self.execution,
-            journal=self.journal,
-            quarantine_after=cfg["heal"]["saga_quarantine_after_failures"],
+            is_quarantined=self.saga.exchange_quarantined,
         )
         self.health = TradingHealthCheck(
             journal=self.journal,
@@ -126,6 +129,7 @@ class PaperTrader:
         self._safe_mode = False
         self._stop = asyncio.Event()
         self._max_concurrent = cfg["strategy"]["max_concurrent_positions"]
+        self._max_hold = timedelta(minutes=cfg["strategy"].get("max_hold_min", 30))
 
     # --- runtime --------------------------------------------------------
 
@@ -139,11 +143,12 @@ class PaperTrader:
             for ex in self.exchanges
         ]
         tasks += [
-            asyncio.create_task(self._spread_loop(),     name="spread"),
-            asyncio.create_task(self._heartbeat_loop(),  name="heartbeat"),
-            asyncio.create_task(self._health_loop(),     name="health"),
-            asyncio.create_task(self._journal_flusher(), name="journal-flush"),
-            asyncio.create_task(self._checkpoint_loop(), name="checkpoint"),
+            asyncio.create_task(self._spread_loop(),         name="spread"),
+            asyncio.create_task(self._heartbeat_loop(),      name="heartbeat"),
+            asyncio.create_task(self._health_loop(),         name="health"),
+            asyncio.create_task(self._position_monitor_loop(), name="position-monitor"),
+            asyncio.create_task(self._journal_flusher(),     name="journal-flush"),
+            asyncio.create_task(self._checkpoint_loop(),     name="checkpoint"),
         ]
         if minutes is not None:
             tasks.append(asyncio.create_task(self._timer(minutes), name="timer"))
@@ -177,6 +182,8 @@ class PaperTrader:
 
     async def _on_book(self, exchange: str, symbol: str, book: OrderBook) -> None:
         self.books[exchange] = book
+        # Mirror into the execution simulator so create_order can walk it.
+        self.execution.set_book(exchange, symbol, book)
         await self._eval_queue.put((exchange, symbol))
 
     # --- spread evaluator ----------------------------------------------
@@ -231,6 +238,7 @@ class PaperTrader:
                 pair=pair,
                 symbol=symbol,
                 z_score=z,
+                current_spread_log=spread,
                 book_a=book_changed,
                 book_b=book_other,
             )
@@ -277,12 +285,15 @@ class PaperTrader:
         position.transition(PositionState.RECONCILING, reason="checking legs")
 
         result = await self.saga.run(
-            position_id=pid, leg_a=leg_a, leg_b=leg_b,
+            position_id=pid,
+            exchange_a=a, exchange_b=b,
+            leg_a=leg_a, leg_b=leg_b,
             client_order_id_a=cid_a, client_order_id_b=cid_b,
         )
 
         if result.both_filled:
             position.transition(PositionState.POSITION_OPEN, reason="both filled")
+            position.opened_at = datetime.now(timezone.utc)
             position.transition(PositionState.MONITORING, reason="awaiting convergence")
             self.journal.log(
                 event_type="FILL",
@@ -324,6 +335,39 @@ class PaperTrader:
             if sig is None:
                 continue
             await self._close_position(pid, p, sig, z_score)
+
+    async def _position_monitor_loop(self) -> None:
+        """Once per second, re-check exits and max-hold for every open position.
+
+        This guarantees positions are evaluated even when the WS feed for
+        their pair goes quiet (otherwise an exit can be missed for a long
+        time during low-volume periods).
+        """
+        while True:
+            try:
+                await self._tick_open_positions()
+            except Exception as e:
+                log.exception("position monitor: %s", e)
+                self.journal.log(event_type="ERROR", payload={"where": "position_monitor", "err": str(e)})
+            await asyncio.sleep(1.0)
+
+    async def _tick_open_positions(self) -> None:
+        now = datetime.now(timezone.utc)
+        for pid, p in list(self.open_positions.items()):
+            if p.state is not PositionState.MONITORING:
+                continue
+            # Max-hold timeout: close regardless of Z.
+            if p.opened_at is not None and (now - p.opened_at) > self._max_hold:
+                z = self.spread_engine.zscore(p.pair) or 0.0
+                await self._close_position(pid, p, ExitSignal(reason="max_hold"), z)
+                continue
+            # Z-based exit re-check using the latest rolling Z.
+            z = self.spread_engine.zscore(p.pair)
+            if z is None:
+                continue
+            sig = self.signal_engine.evaluate_exit(z_score=z, stop_loss_hit=False)
+            if sig is not None:
+                await self._close_position(pid, p, sig, z)
 
     async def _close_position(
         self, pid: str, p: Position, sig: ExitSignal, z_score: float,
@@ -386,7 +430,13 @@ class PaperTrader:
             log.warning("HealthCheck -> SAFE_MODE")
         elif status.recommended_action == "FORCE_EXIT_OLDEST":
             log.warning("HealthCheck -> FORCE_EXIT_OLDEST (advisory in MVP)")
-        # Other actions are advisory in MVP.
+        elif status.recommended_action == "CONTINUE" and self._safe_mode:
+            # Auto-clear: a fully healthy check after a saga-triggered
+            # SAFE_MODE means the underlying issue resolved (e.g. exchange
+            # came back, rate limit cleared). Without this the bot would
+            # be permanently locked out of new entries after one failure.
+            self._safe_mode = False
+            log.info("HealthCheck CONTINUE -> SAFE_MODE cleared")
 
     async def _journal_flusher(self) -> None:
         while True:

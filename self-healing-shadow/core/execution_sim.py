@@ -126,7 +126,10 @@ class ExecutionSim:
         if book is None:
             raise InsufficientLiquidity(f"no book for {exchange}:{symbol}")
 
-        levels = book.asks if side == "buy" else book.bids
+        # Walk against the canonically-sorted side so VWAP is correct
+        # regardless of the source feed's ordering quirks.
+        norm = book.normalised()
+        levels = norm.asks if side == "buy" else norm.bids
         vwap, _units = _walk_book(levels, size_usd)
 
         fee_bps = self._taker_fees_bps.get(exchange, 0.0)

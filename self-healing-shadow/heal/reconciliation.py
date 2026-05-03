@@ -87,6 +87,8 @@ class ReconciliationSaga:
         self,
         *,
         position_id: str,
+        exchange_a: str,
+        exchange_b: str,
         leg_a: SimOrder | BaseException,
         leg_b: SimOrder | BaseException,
         client_order_id_a: str,
@@ -98,6 +100,8 @@ class ReconciliationSaga:
             position_id=position_id,
             leg_a_ok=isinstance(leg_a, SimOrder),
             leg_b_ok=isinstance(leg_b, SimOrder),
+            leg_a_err=None if isinstance(leg_a, SimOrder) else f"{type(leg_a).__name__}: {leg_a}",
+            leg_b_err=None if isinstance(leg_b, SimOrder) else f"{type(leg_b).__name__}: {leg_b}",
         )
 
         a_filled, leg_a_order = await self._verify(client_order_id_a, leg_a)
@@ -124,33 +128,17 @@ class ReconciliationSaga:
             # Neither leg is confirmed filled — nothing to rollback.
             self._log_step("Rollback", outcome="nothing_to_rollback", position_id=position_id)
 
-        # 4. Diagnose: pick the exception that drove the failure.
+        # 4. Diagnose: the suspect is whichever leg failed; the caller
+        # passed both exchange identifiers explicitly so there is no
+        # inference required.
         failing_exc: Optional[BaseException] = None
         suspect_exchange: Optional[str] = None
         if not a_filled and isinstance(leg_a, BaseException):
             failing_exc = leg_a
-            # If we had an OrderBook context we'd know the exchange — for
-            # the saga we look at the OTHER (filled) leg's exchange to
-            # tag the failed counterparty in the simulator (since we
-            # don't track exchange on the exception).
-            if isinstance(leg_b, SimOrder):
-                suspect_exchange = leg_b.exchange
+            suspect_exchange = exchange_a
         elif not b_filled and isinstance(leg_b, BaseException):
             failing_exc = leg_b
-            if isinstance(leg_a, SimOrder):
-                # The filled leg is the COUNTERPARTY of the suspect; we
-                # use the leg-A exchange as a stand-in identifier when
-                # we do not have a direct handle.
-                suspect_exchange = (
-                    leg_a.exchange if leg_a.exchange != leg_a.exchange else None
-                )
-                # In the test cases, the suspect is "binance" when leg A
-                # is "mexc". We approximate by recording on the OPPOSITE
-                # of the filled leg if a known second exchange is in the sim.
-                others = [
-                    e for e in self._sim.simulated_balance.keys() if e != leg_a.exchange
-                ]
-                suspect_exchange = others[0] if others else None
+            suspect_exchange = exchange_b
 
         diagnosis = classify_exception(failing_exc) if failing_exc else Diagnosis.UNKNOWN
         self._log_step(

@@ -14,25 +14,38 @@ from datetime import datetime
 class OrderBook:
     """Top-of-book through some depth.
 
-    `bids` are sorted DESC by price (best bid first), `asks` ASC (best ask
-    first). Each tuple is `(price, size)` where `size` is in base units
-    (e.g. BTC contracts), not USD.
+    `bids` should be sorted DESC by price (best first), `asks` ASC.
+    Each tuple is `(price, size)`. The `normalised()` helper enforces
+    that ordering AND drops zero-size levels (which some exchanges send
+    as an instruction to remove a level — they would otherwise corrupt
+    walk-book / VWAP calculations).
     """
 
     bids: list[tuple[float, float]]
     asks: list[tuple[float, float]]
     ts: datetime
 
+    def normalised(self) -> "OrderBook":
+        bids = sorted(
+            ((p, s) for p, s in self.bids if s > 0),
+            key=lambda x: -x[0],
+        )
+        asks = sorted(
+            ((p, s) for p, s in self.asks if s > 0),
+            key=lambda x: x[0],
+        )
+        return OrderBook(bids=bids, asks=asks, ts=self.ts)
+
     @property
     def best_bid(self) -> float | None:
-        # Some exchanges send levels in non-canonical order. Take the
-        # max/min to be safe rather than trust array index 0.
-        if not self.bids:
-            return None
-        return max(p for p, _ in self.bids)
+        for p, s in self.bids:
+            if s > 0:
+                return max(pp for pp, ss in self.bids if ss > 0)
+        return None
 
     @property
     def best_ask(self) -> float | None:
-        if not self.asks:
-            return None
-        return min(p for p, _ in self.asks)
+        for p, s in self.asks:
+            if s > 0:
+                return min(pp for pp, ss in self.asks if ss > 0)
+        return None

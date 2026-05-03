@@ -12,9 +12,11 @@ strategy:
   entry_z: 2.0
   exit_z: 0.5
   stop_loss_z: 4.0
-  min_net_profit_usd: 5.0
-  max_position_usd: 100
+  min_net_profit_usd: 0.50
+  max_position_usd: 1000
   max_concurrent_positions: 5
+  max_hold_min: 30                  # close any position open longer than this
+  recovery_fraction: 0.5            # expected convergence capture (0..1)
 
 heal:
   ws_stale_threshold_sec: 10
