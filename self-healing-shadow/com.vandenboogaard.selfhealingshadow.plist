@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Symlinked / copied from this file into ~/Library/LaunchAgents/ to run
+  the bot 24/7 under launchd with auto-restart on crash.
+
+  Install:
+      cp com.vandenboogaard.selfhealingshadow.plist \
+         ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.vandenboogaard.selfhealingshadow.plist
+
+  Stop / uninstall:
+      launchctl bootout gui/$(id -u)/com.vandenboogaard.selfhealingshadow
+
+  Status:
+      launchctl print gui/$(id -u)/com.vandenboogaard.selfhealingshadow
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vandenboogaard.selfhealingshadow</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/vandenboogaard/Claude projects/Claude Paperclip/self-healing-shadow</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/vandenboogaard/Claude projects/Claude Paperclip/self-healing-shadow/.venv/bin/python</string>
+        <string>paper_trader.py</string>
+        <string>--config</string>
+        <string>config.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vandenboogaard/Claude projects/Claude Paperclip/self-healing-shadow/data/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/vandenboogaard/Claude projects/Claude Paperclip/self-healing-shadow/data/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

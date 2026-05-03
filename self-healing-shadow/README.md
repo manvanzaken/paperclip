@@ -8,12 +8,30 @@ simulates concurrent two-leg execution. No real orders are ever placed.
 
 Spec: [`docs/superpowers/specs/2026-04-29-self-healing-shadow-paper-trader-design.md`](../docs/superpowers/specs/2026-04-29-self-healing-shadow-paper-trader-design.md)
 
-## Run
+## Run (foreground)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python paper_trader.py --config config.yaml
+```
+
+## Run as a daemon (24/7, auto-restart on crash)
+
+```bash
+cp com.vandenboogaard.selfhealingshadow.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/com.vandenboogaard.selfhealingshadow.plist
+```
+
+Stop:
+```bash
+launchctl bootout gui/$(id -u)/com.vandenboogaard.selfhealingshadow
+```
+
+Status:
+```bash
+launchctl print gui/$(id -u)/com.vandenboogaard.selfhealingshadow | grep -E "state|pid"
 ```
 
 Tail the journal:
