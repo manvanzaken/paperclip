@@ -38,6 +38,7 @@ from core.signal_engine import EntrySignal, ExitSignal, SignalEngine  # noqa: F4
 from core.spread_engine import SpreadEngine, log_spread, mid_price
 from core.state_machine import Position, PositionState
 from core.trade_journal import TradeJournal
+from heal.adaptive_tuner import AdaptiveTuner
 from heal.atomic_writes import write_state
 from heal.health_check import HealthStatus, TradingHealthCheck
 from heal.heartbeat import HeartbeatMonitor
@@ -56,6 +57,40 @@ log = logging.getLogger("paper_trader")
 def load_config(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge `overlay` onto `base`. Overlay wins for leaf keys."""
+    out = dict(base)
+    for k, v in overlay.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config_with_overrides(
+    base_path: str | Path,
+    overrides_path: str | Path,
+) -> dict:
+    """Load `base_path` then deep-merge any `overrides_path` on top.
+
+    The overrides file is written by the adaptive tuner and represents
+    the bot's learned adjustments. The base config is the user's intent;
+    overrides are bot-managed. Deleting the overrides file resets the
+    bot to the base config — useful for testing or rolling back a bad
+    learning epoch.
+    """
+    base = load_config(base_path)
+    overrides_path = Path(overrides_path)
+    if not overrides_path.exists():
+        return base
+    with open(overrides_path, "r", encoding="utf-8") as fh:
+        overlay = yaml.safe_load(fh) or {}
+    if not isinstance(overlay, dict):
+        return base
+    return _deep_merge(base, overlay)
 
 
 # ---------------------------------------------------------------------
@@ -122,6 +157,27 @@ class PaperTrader:
             get_open_positions=lambda: list(self.open_positions.values()),
             interval_sec=cfg["heal"]["health_check_interval_sec"],
         )
+        # Adaptive tuner reads the journal once per day and writes
+        # nudges to params_overrides.yaml; bot then exits so launchd
+        # respawns with the merged config.
+        tuner_cfg = cfg.get("tuner", {})
+        self._tuner_enabled = bool(tuner_cfg.get("enabled", False))
+        self._tuner_restart_after_change = bool(
+            tuner_cfg.get("restart_after_change", True)
+        )
+        if self._tuner_enabled:
+            self.tuner = AdaptiveTuner(
+                journal=self.journal,
+                base_config=cfg,
+                overrides_path=Path(
+                    cfg["paths"].get(
+                        "overrides_file", "./data/params_overrides.yaml"
+                    )
+                ),
+                interval_sec=tuner_cfg.get("interval_sec", 86400.0),
+            )
+        else:
+            self.tuner = None
 
         # Eval queue: (exchange_with_new_book, symbol).
         self._eval_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
@@ -150,6 +206,10 @@ class PaperTrader:
             asyncio.create_task(self._journal_flusher(),     name="journal-flush"),
             asyncio.create_task(self._checkpoint_loop(),     name="checkpoint"),
         ]
+        if self.tuner is not None:
+            tasks.append(
+                asyncio.create_task(self._tuner_loop(), name="adaptive-tuner")
+            )
         if minutes is not None:
             tasks.append(asyncio.create_task(self._timer(minutes), name="timer"))
         try:
@@ -438,6 +498,28 @@ class PaperTrader:
             self._safe_mode = False
             log.info("HealthCheck CONTINUE -> SAFE_MODE cleared")
 
+    async def _tuner_loop(self) -> None:
+        """Run adaptive_tuner.run_once() every interval_sec; if it
+        produced any changes and restart_after_change is true, request
+        an orderly stop so launchd respawns the bot with the new config.
+        """
+        assert self.tuner is not None
+        while True:
+            await asyncio.sleep(self.tuner._interval_sec)
+            try:
+                result = await self.tuner.run_once()
+            except Exception as e:
+                log.exception("tuner loop: %s", e)
+                self.journal.log(event_type="ERROR", payload={"where": "tuner_loop", "err": str(e)})
+                continue
+            if result.changes and self._tuner_restart_after_change:
+                log.info(
+                    "tuner applied %d change(s); requesting restart so launchd respawns with new params",
+                    len(result.changes),
+                )
+                self.request_stop()
+                return
+
     async def _journal_flusher(self) -> None:
         while True:
             await asyncio.sleep(1.0)
@@ -484,7 +566,10 @@ def main() -> None:
     args = p.parse_args()
 
     _setup_logging()
-    cfg = load_config(args.config)
+    cfg = load_config_with_overrides(
+        args.config,
+        Path(args.config).parent / "data" / "params_overrides.yaml",
+    )
     bot = PaperTrader(cfg)
 
     loop = asyncio.new_event_loop()

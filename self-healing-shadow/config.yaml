@@ -32,3 +32,9 @@ paths:
   data_dir: "./data"
   journal_db: "./data/journal.sqlite"
   state_file: "./data/state.json"
+  overrides_file: "./data/params_overrides.yaml"
+
+tuner:
+  enabled: true
+  interval_sec: 86400               # 24h between adaptive runs
+  restart_after_change: true        # bot exits 0 so launchd respawns with new params
