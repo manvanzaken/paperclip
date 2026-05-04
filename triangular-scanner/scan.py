@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -62,6 +63,13 @@ async def _run(cfg):
         log.error("no sources enabled — exiting")
         return
 
+    from triscan.storage.jsonl import JsonlWriter
+    from triscan.storage.sqlite import SqliteStore
+
+    data_dir = Path(cfg.storage.data_dir)
+    jsonl = JsonlWriter(data_dir=data_dir, retention_days=cfg.storage.jsonl_retention_days)
+    sqlite_store = SqliteStore(cfg.storage.sqlite_path)
+
     pollers_by_name = {}
     for src in sources:
         log.info("loading markets for %s ...", src.name)
@@ -91,13 +99,15 @@ async def _run(cfg):
             taker_fee_pct=_D(str(src.taker_fee_pct)),
         )
 
-        async def on_opp(evt, _name=src.name):
+        async def on_opp(evt, _name=src.name, _jsonl=jsonl, _sqlite=sqlite_store):
+            await _jsonl.write(evt)
+            if evt["type"] == "OpportunityClosed":
+                _sqlite.insert_opportunity(evt["opportunity"])
+            o = evt["opportunity"]
             if evt["type"] == "OpportunityOpen":
-                o = evt["opportunity"]
                 print(f"[{_name}] OPEN  {o['triangle_id']} net={o['open_net_edge_pct']:+.4f}% "
                       f"size=${o['peak_executable_size_usd']:.0f} profit=${o['peak_executable_profit_usd']:.2f}")
             else:
-                o = evt["opportunity"]
                 print(f"[{_name}] CLOSE {o['triangle_id']} life={o['lifetime_ms']}ms "
                       f"peak_net={o['peak_net_edge_pct']:+.4f}% peak_profit=${o['peak_executable_profit_usd']:.2f} "
                       f"reason={o['closed_reason']}")
@@ -127,6 +137,13 @@ async def _run(cfg):
                 await p.tick()
             await asyncio.sleep(1)
 
+    total_triangles = sum(len(p.triangles) for p in pollers_by_name.values())
+    run_id = sqlite_store.start_scan_run(
+        config=json.loads(cfg.model_dump_json()),
+        exchanges=[s.name for s in sources],
+        triangle_count=total_triangles,
+    )
+
     tasks = [
         p.run_loop(cfg.scanner.tier1_interval_sec, make_callback(name))
         for name, p in pollers_by_name.items()
@@ -134,9 +151,24 @@ async def _run(cfg):
     tasks.append(_reenumerate_loop(cfg, sources, pollers_by_name))
     tasks.append(tick_loop())
 
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+
+    import signal
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, main_task.cancel)
+
     try:
         await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
     finally:
+        try:
+            sqlite_store.end_scan_run(run_id)
+        except Exception as e:
+            log.warning("end_scan_run failed: %s", e)
+        await jsonl.close()
+        sqlite_store.close()
         await asyncio.gather(*(s.close() for s in sources), return_exceptions=True)
 
 
@@ -146,10 +178,7 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     logging.basicConfig(level=getattr(logging, cfg.output.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    try:
-        asyncio.run(_run(cfg))
-    except KeyboardInterrupt:
-        sys.exit(0)
+    asyncio.run(_run(cfg))
 
 
 if __name__ == "__main__":
