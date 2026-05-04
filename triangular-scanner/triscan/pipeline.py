@@ -45,6 +45,7 @@ class Pipeline:
         ws_manager: WsManager,
         config: PipelineConfig,
         on_opportunity: Callable[[dict], Awaitable[None]],
+        on_state_change: Optional[Callable[[Triangle, OpportunityState, dict], Awaitable[None]]] = None,
     ):
         self._states: Dict[str, _TriangleState] = {t.id: _TriangleState(t) for t in triangles}
         self._symbol_index: Dict[str, List[str]] = {}
@@ -54,6 +55,7 @@ class Pipeline:
         self.ws = ws_manager
         self.cfg = config
         self.on_opportunity = on_opportunity
+        self.on_state_change = on_state_change
 
     def state(self, t: Triangle) -> OpportunityState:
         return self._states[t.id].state
@@ -91,6 +93,11 @@ class Pipeline:
         for sym, _side in ts.triangle.legs:
             await self.ws.acquire(sym, self.handle_book)
         log.info("pipeline: %s IDLE -> CANDIDATE (tier1=%.4f%%)", ts.triangle.id, ts.last_tier1_pct)
+        if self.on_state_change is not None:
+            try:
+                await self.on_state_change(ts.triangle, OpportunityState.CANDIDATE, {})
+            except Exception:
+                pass
 
     async def _release_to_idle(self, ts: _TriangleState, reason: str) -> None:
         for sym, _side in ts.triangle.legs:
@@ -101,6 +108,11 @@ class Pipeline:
         ts.below_since_ms = None
         ts.books.clear()
         log.info("pipeline: %s -> IDLE (%s)", ts.triangle.id, reason)
+        if self.on_state_change is not None:
+            try:
+                await self.on_state_change(ts.triangle, OpportunityState.IDLE, {"reason": reason})
+            except Exception:
+                pass
 
     async def handle_book(self, book: Book) -> None:
         for tid in self._symbol_index.get(book.symbol, []):
@@ -130,6 +142,11 @@ class Pipeline:
             if ts.state == OpportunityState.CONFIRMED:
                 await self._close_opportunity(ts, reason="edge_decay")
                 ts.state = OpportunityState.CANDIDATE
+                if self.on_state_change is not None:
+                    try:
+                        await self.on_state_change(ts.triangle, OpportunityState.CANDIDATE, {"reason": "edge_decay"})
+                    except Exception:
+                        pass
             return
 
         # Use threshold=0.0 here: the gross_pct gate above already confirmed edge exists;
@@ -143,6 +160,11 @@ class Pipeline:
             if ts.state == OpportunityState.CONFIRMED:
                 await self._close_opportunity(ts, reason="book_thinned")
                 ts.state = OpportunityState.CANDIDATE
+                if self.on_state_change is not None:
+                    try:
+                        await self.on_state_change(ts.triangle, OpportunityState.CANDIDATE, {"reason": "book_thinned"})
+                    except Exception:
+                        pass
             return
 
         result = simulate_cycle_through_book(legs_books, Decimal(str(size)))
@@ -153,6 +175,11 @@ class Pipeline:
             if ts.state == OpportunityState.CONFIRMED:
                 await self._close_opportunity(ts, reason="edge_decay")
                 ts.state = OpportunityState.CANDIDATE
+                if self.on_state_change is not None:
+                    try:
+                        await self.on_state_change(ts.triangle, OpportunityState.CANDIDATE, {"reason": "edge_decay"})
+                    except Exception:
+                        pass
             return
 
         if ts.state == OpportunityState.CANDIDATE:
@@ -180,6 +207,16 @@ class Pipeline:
             })
             log.info("pipeline: %s CANDIDATE -> CONFIRMED (net=%.4f%% size=$%.2f profit=$%.2f)",
                      ts.triangle.id, net_pct, float(size), profit_usd)
+            if self.on_state_change is not None:
+                try:
+                    await self.on_state_change(ts.triangle, OpportunityState.CONFIRMED, {
+                        "net_edge_pct": net_pct,
+                        "executable_size_usd": float(size),
+                        "executable_profit_usd": profit_usd,
+                        "bottleneck_leg": result.bottleneck_leg,
+                    })
+                except Exception:
+                    pass
         else:
             opp = ts.opportunity
             if net_pct > opp.peak_net_edge_pct:
@@ -226,12 +263,22 @@ class Pipeline:
             if ts.state == OpportunityState.CONFIRMED:
                 await self._close_opportunity(ts, reason="ws_disconnect")
                 ts.state = OpportunityState.CANDIDATE
+                if self.on_state_change is not None:
+                    try:
+                        await self.on_state_change(ts.triangle, OpportunityState.CANDIDATE, {"reason": "ws_disconnect"})
+                    except Exception:
+                        pass
 
     async def shutdown(self) -> None:
         for ts in self._states.values():
             if ts.state == OpportunityState.CONFIRMED:
                 await self._close_opportunity(ts, reason="manual_stop")
                 ts.state = OpportunityState.CANDIDATE
+                if self.on_state_change is not None:
+                    try:
+                        await self.on_state_change(ts.triangle, OpportunityState.CANDIDATE, {"reason": "manual_stop"})
+                    except Exception:
+                        pass
 
     async def tick(self, now_ms: Optional[int] = None) -> None:
         """Periodic cooldown + housekeeping. Call regularly (every 1s)."""

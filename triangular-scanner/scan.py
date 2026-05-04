@@ -114,6 +114,18 @@ async def _run(cfg, args=None):
     from triscan.pipeline import Pipeline, PipelineConfig
     from decimal import Decimal as _D
 
+    use_live_console = cfg.output.console.enabled
+
+    live_console = None
+    if use_live_console:
+        from triscan.output.console import LiveConsole, ConsoleRow
+        live_console = LiveConsole(
+            refresh_ms=cfg.output.console.refresh_ms,
+            top_n=cfg.output.console.top_n,
+            show_candidates=cfg.output.console.show_candidates,
+        )
+        live_console.__enter__()
+
     pipelines = {}
     ws_managers = {}
     for src in sources:
@@ -133,20 +145,46 @@ async def _run(cfg, args=None):
             await _jsonl.write(evt)
             if evt["type"] == "OpportunityClosed":
                 _sqlite.insert_opportunity(evt["opportunity"])
-            o = evt["opportunity"]
-            if evt["type"] == "OpportunityOpen":
-                print(f"[{_name}] OPEN  {o['triangle_id']} net={o['open_net_edge_pct']:+.4f}% "
-                      f"size=${o['peak_executable_size_usd']:.0f} profit=${o['peak_executable_profit_usd']:.2f}")
+            if not use_live_console:
+                o = evt["opportunity"]
+                if evt["type"] == "OpportunityOpen":
+                    print(f"[{_name}] OPEN  {o['triangle_id']} net={o['open_net_edge_pct']:+.4f}% "
+                          f"size=${o['peak_executable_size_usd']:.0f} profit=${o['peak_executable_profit_usd']:.2f}")
+                else:
+                    print(f"[{_name}] CLOSE {o['triangle_id']} life={o['lifetime_ms']}ms "
+                          f"peak_net={o['peak_net_edge_pct']:+.4f}% peak_profit=${o['peak_executable_profit_usd']:.2f} "
+                          f"reason={o['closed_reason']}")
             else:
-                print(f"[{_name}] CLOSE {o['triangle_id']} life={o['lifetime_ms']}ms "
-                      f"peak_net={o['peak_net_edge_pct']:+.4f}% peak_profit=${o['peak_executable_profit_usd']:.2f} "
-                      f"reason={o['closed_reason']}")
+                o = evt["opportunity"]
+                if evt["type"] == "OpportunityOpen":
+                    log.debug("[%s] OPEN %s net=%+.4f%%", _name, o['triangle_id'], o['open_net_edge_pct'])
+                else:
+                    log.debug("[%s] CLOSE %s reason=%s", _name, o['triangle_id'], o.get('closed_reason'))
+
+        async def on_state_change(triangle, state, info, _console=live_console):
+            if _console is None:
+                return
+            from triscan.output.console import ConsoleRow
+            from triscan.models import OpportunityState as _OState
+            if state == _OState.IDLE:
+                _console.remove_row(triangle.id)
+            else:
+                _console.update_row(ConsoleRow(
+                    triangle_id=triangle.id,
+                    state=state.value,
+                    net_edge_pct=info.get("net_edge_pct", 0.0),
+                    size_usd=info.get("executable_size_usd", 0.0),
+                    profit_usd=info.get("executable_profit_usd", 0.0),
+                    bottleneck_leg=info.get("bottleneck_leg", -1),
+                    age_ms=0,
+                ))
 
         pipelines[src.name] = Pipeline(
             triangles=pollers_by_name[src.name].triangles,
             ws_manager=ws_managers[src.name],
             config=pcfg,
             on_opportunity=on_opp,
+            on_state_change=on_state_change if use_live_console else None,
         )
         ws_managers[src.name]._on_symbol_failure = pipelines[src.name].notify_ws_failed  # late-bind
 
@@ -154,10 +192,14 @@ async def _run(cfg, args=None):
         async def cb(results):
             results.sort(key=lambda r: r.gross_edge_pct, reverse=True)
             top = results[: cfg.output.console.top_n]
-            if top:
-                print(f"--- {name} tier1 (top {len(top)}) ---")
-                for r in top:
-                    print(f"  {r.triangle.id}  gross={r.gross_edge_pct:+.4f}%  net={r.net_edge_pct:+.4f}%")
+            if not use_live_console:
+                if top:
+                    print(f"--- {name} tier1 (top {len(top)}) ---")
+                    for r in top:
+                        print(f"  {r.triangle.id}  gross={r.gross_edge_pct:+.4f}%  net={r.net_edge_pct:+.4f}%")
+            else:
+                if top:
+                    log.debug("--- %s tier1 (top %d) ---", name, len(top))
             if name in pipelines:
                 await pipelines[name].handle_tier1(results)
         return cb
@@ -197,6 +239,11 @@ async def _run(cfg, args=None):
     except asyncio.CancelledError:
         pass
     finally:
+        if live_console is not None:
+            try:
+                live_console.__exit__(None, None, None)
+            except Exception:
+                pass
         try:
             sqlite_store.end_scan_run(run_id)
         except Exception as e:
