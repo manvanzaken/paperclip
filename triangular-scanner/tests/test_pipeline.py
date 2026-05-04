@@ -90,6 +90,28 @@ async def test_ws_disconnect_closes_confirmed_with_correct_reason():
 
 
 @pytest.mark.asyncio
+async def test_sampled_snapshots_recorded_every_n_updates():
+    tri = Triangle("binance", "USDT",
+                   (("BTC/USDT", LegSide.BUY), ("ETH/BTC", LegSide.BUY), ("ETH/USDT", LegSide.SELL)))
+    ws = MagicMock(); ws.acquire = AsyncMock(return_value=True); ws.release = AsyncMock()
+    on_opp = AsyncMock()
+    cfg = PipelineConfig(tier1_threshold_pct=0.5, tier2_threshold_pct=0.1,
+                         min_profit_usd=1.0, cooldown_sec=60, max_size_cap_usd=Decimal("10000"),
+                         taker_fee_pct=Decimal("0.10"), sample_every_n_updates=2)
+    p = Pipeline([tri], ws, cfg, on_opportunity=on_opp)
+    await p.handle_tier1([Tier1Result(tri, 0.6, 0.3, 1)])
+    for _ in range(6):
+        await p.handle_book(_book("BTC/USDT", 59999, 10, 60000, 10, seq=1))
+        await p.handle_book(_book("ETH/BTC",  0.04999, 100, 0.05000, 100, seq=1))
+        await p.handle_book(_book("ETH/USDT", 3010, 1000, 3011, 1000, seq=1))
+    await p.shutdown()
+    args, _ = on_opp.await_args
+    snaps = args[0]["opportunity"]["snapshots"]
+    assert len(snaps) >= 1
+    assert "net_edge_pct" in snaps[0]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_closes_with_manual_stop():
     tri = Triangle("binance", "USDT",
                    (("BTC/USDT", LegSide.BUY), ("ETH/BTC", LegSide.BUY), ("ETH/USDT", LegSide.SELL)))

@@ -23,6 +23,7 @@ class PipelineConfig:
     cooldown_sec: int
     max_size_cap_usd: Decimal
     taker_fee_pct: Decimal
+    sample_every_n_updates: int = 0
 
 
 @dataclass
@@ -187,6 +188,14 @@ class Pipeline:
                 opp.peak_executable_size_usd = float(size)
                 opp.peak_at = now_ms
                 opp.bottleneck_leg_at_peak = result.bottleneck_leg
+            if self.cfg.sample_every_n_updates > 0 and ts.ws_update_count % self.cfg.sample_every_n_updates == 0:
+                opp.snapshots.append({
+                    "ts_ms": now_ms,
+                    "net_edge_pct": net_pct,
+                    "executable_size_usd": float(size),
+                    "executable_profit_usd": profit_usd,
+                    "bottleneck_leg": result.bottleneck_leg,
+                })
 
     async def _close_opportunity(self, ts: _TriangleState, reason: str) -> None:
         opp = ts.opportunity
@@ -254,6 +263,7 @@ def _opp_to_dict(o: Opportunity) -> dict:
         "ws_update_count": o.ws_update_count,
         "median_book_age_ms": o.median_book_age_ms,
         "closed_reason": o.closed_reason,
+        "snapshots": o.snapshots,
     }
 
 
