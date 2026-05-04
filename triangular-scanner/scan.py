@@ -185,6 +185,7 @@ async def _run(cfg, args=None):
             config=pcfg,
             on_opportunity=on_opp,
             on_state_change=on_state_change if use_live_console else None,
+            data_dir=data_dir,
         )
         ws_managers[src.name]._on_symbol_failure = pipelines[src.name].notify_ws_failed  # late-bind
 
@@ -223,6 +224,8 @@ async def _run(cfg, args=None):
     ]
     tasks.append(_reenumerate_loop(cfg, sources, pollers_by_name))
     tasks.append(tick_loop())
+    for p in pipelines.values():
+        tasks.append(p.status_writer())
     if args is not None and getattr(args, "validate_books", False):
         for src in sources:
             tasks.append(_validate_loop(src, ws_managers))

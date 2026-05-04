@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 
 class LegSide(str, Enum):
@@ -65,6 +65,16 @@ class Triangle:
     @property
     def symbols(self) -> List[str]:
         return [sym for sym, _ in self.legs]
+
+
+@dataclass
+class LiveStatus:
+    ts: str
+    confirmed: list
+    candidates: list
+    ws_subscriptions_per_exchange: dict
+    triangle_count_per_exchange: dict
+    last_tier1_poll_per_exchange: dict
 
 
 @dataclass

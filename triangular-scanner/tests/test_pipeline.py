@@ -112,6 +112,25 @@ async def test_sampled_snapshots_recorded_every_n_updates():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_status_after_confirmed_open(tmp_path):
+    tri = Triangle("binance", "USDT",
+                   (("BTC/USDT", LegSide.BUY), ("ETH/BTC", LegSide.BUY), ("ETH/USDT", LegSide.SELL)))
+    ws = MagicMock(); ws.acquire = AsyncMock(return_value=True); ws.release = AsyncMock()
+    cfg = PipelineConfig(0.5, 0.1, 1.0, 60, Decimal("10000"), Decimal("0.10"))
+    p = Pipeline([tri], ws, cfg, on_opportunity=AsyncMock(), data_dir=tmp_path)
+    await p.handle_tier1([Tier1Result(tri, 0.6, 0.3, 1)])
+    await p.handle_book(_book("BTC/USDT", 59999, 10, 60000, 10, seq=1))
+    await p.handle_book(_book("ETH/BTC",  0.04999, 100, 0.05000, 100, seq=1))
+    await p.handle_book(_book("ETH/USDT", 3010, 1000, 3011, 1000, seq=1))
+    status = p._snapshot_status()
+    assert len(status.confirmed) == 1
+    row = status.confirmed[0]
+    assert "triangle_id" in row
+    assert "profit_usd" in row
+    assert row["profit_usd"] >= 1.0
+
+
+@pytest.mark.asyncio
 async def test_shutdown_closes_with_manual_stop():
     tri = Triangle("binance", "USDT",
                    (("BTC/USDT", LegSide.BUY), ("ETH/BTC", LegSide.BUY), ("ETH/USDT", LegSide.SELL)))

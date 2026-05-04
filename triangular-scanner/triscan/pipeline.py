@@ -1,13 +1,15 @@
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from .models import Triangle, LegSide, Book, OpportunityState, Opportunity
+from .models import Triangle, LegSide, Book, LiveStatus, OpportunityState, Opportunity
 from .pricing import gross_multiplier, net_multiplier, simulate_cycle_through_book, binary_search_executable_size
 from .rest_poller import Tier1Result
 from .ws_manager import WsManager
@@ -46,6 +48,8 @@ class Pipeline:
         config: PipelineConfig,
         on_opportunity: Callable[[dict], Awaitable[None]],
         on_state_change: Optional[Callable[[Triangle, OpportunityState, dict], Awaitable[None]]] = None,
+        data_dir: Optional[Path] = None,
+        top_n: int = 20,
     ):
         self._states: Dict[str, _TriangleState] = {t.id: _TriangleState(t) for t in triangles}
         self._symbol_index: Dict[str, List[str]] = {}
@@ -56,6 +60,9 @@ class Pipeline:
         self.cfg = config
         self.on_opportunity = on_opportunity
         self.on_state_change = on_state_change
+        self._status_path: Optional[Path] = Path(data_dir) / "triscan_status.json" if data_dir is not None else None
+        self._top_n = top_n
+        self._status_shutdown = asyncio.Event()
 
     def state(self, t: Triangle) -> OpportunityState:
         return self._states[t.id].state
@@ -257,6 +264,54 @@ class Pipeline:
         })
         ts.opportunity = None
 
+    def _snapshot_status(self) -> LiveStatus:
+        from datetime import datetime, timezone
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        confirmed = []
+        candidates = []
+        for state in self._states.values():
+            row = {
+                "triangle_id": state.triangle.id,
+                "exchange": state.triangle.exchange,
+                "net_edge_pct": state.last_tier1_pct,
+                "profit_usd": (state.opportunity.peak_executable_profit_usd if state.opportunity else 0.0),
+                "size_usd": (state.opportunity.peak_executable_size_usd if state.opportunity else 0.0),
+                "age_ms": 0,
+                "bottleneck_leg": (state.opportunity.bottleneck_leg_at_peak if state.opportunity else -1),
+                "gross_edge_pct": state.last_tier1_pct,
+            }
+            if state.state == OpportunityState.CONFIRMED:
+                confirmed.append(row)
+            elif state.state == OpportunityState.CANDIDATE:
+                candidates.append(row)
+        candidates.sort(key=lambda r: -r["gross_edge_pct"])
+        return LiveStatus(
+            ts=now_iso,
+            confirmed=confirmed,
+            candidates=candidates[: self._top_n],
+            ws_subscriptions_per_exchange={},
+            triangle_count_per_exchange={},
+            last_tier1_poll_per_exchange={},
+        )
+
+    async def status_writer(self) -> None:
+        """Write triscan_status.json every 1s. Returns when shutdown event is set."""
+        if self._status_path is None:
+            return
+        while not self._status_shutdown.is_set():
+            try:
+                from dataclasses import asdict
+                status = self._snapshot_status()
+                tmp = self._status_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(asdict(status)))
+                tmp.replace(self._status_path)
+            except Exception:
+                log.exception("status_writer failed")
+            try:
+                await asyncio.wait_for(self._status_shutdown.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
     async def notify_ws_failed(self, symbol: str) -> None:
         for tid in self._symbol_index.get(symbol, []):
             ts = self._states[tid]
@@ -270,6 +325,7 @@ class Pipeline:
                         pass
 
     async def shutdown(self) -> None:
+        self._status_shutdown.set()
         for ts in self._states.values():
             if ts.state == OpportunityState.CONFIRMED:
                 await self._close_opportunity(ts, reason="manual_stop")
