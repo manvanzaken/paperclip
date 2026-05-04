@@ -1,0 +1,50 @@
+scanner:
+  tier1_interval_sec: 5
+  tier1_threshold_pct: 0.5
+  tier2_threshold_pct: 0.1
+  min_profit_usd: 1.0
+  cooldown_sec: 60
+  max_size_cap_usd: 10000
+  max_ws_subscriptions_per_exchange: 50
+  triangle_refresh_hours: 6
+  sample_every_n_updates: 0
+filters:
+  anchors: [USDT, USDC]
+  min_24h_volume_usd: 1000000
+exchanges:
+  mexc:
+    enabled: true
+    taker_fee_pct: 0.05
+    rest_url: https://api.mexc.com
+    ws_url: wss://wbs.mexc.com/ws
+  binance:
+    enabled: true
+    taker_fee_pct: 0.10
+    rest_url: https://api.binance.com
+    ws_url: wss://stream.binance.com:9443/ws
+  gate:
+    enabled: true
+    taker_fee_pct: 0.10
+    rest_url: https://api.gateio.ws
+    ws_url: wss://api.gateio.ws/ws/v4/
+  kucoin:
+    enabled: true
+    taker_fee_pct: 0.10
+    rest_url: https://api.kucoin.com
+    ws_url: ""  # KuCoin requires a token-fetched WS URL; left empty, source fetches at runtime
+  bybit:
+    enabled: true
+    taker_fee_pct: 0.10
+    rest_url: https://api.bybit.com
+    ws_url: wss://stream.bybit.com/v5/public/spot
+storage:
+  data_dir: ./data
+  jsonl_retention_days: 30
+  sqlite_path: ./data/triscan.db
+output:
+  console:
+    enabled: true
+    refresh_ms: 500
+    show_candidates: true
+    top_n: 20
+  log_level: INFO
