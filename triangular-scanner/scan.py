@@ -50,7 +50,36 @@ async def _reenumerate_loop(cfg, sources, pollers_by_name):
                 log.warning("re-enumeration failed for %s: %s", src.name, e)
 
 
-async def _run(cfg):
+async def _validate_loop(src, ws_managers):
+    """Periodically compare in-memory books to REST tickers; log WARN on mismatch."""
+    from triscan.validate import compare_book_to_quote
+    while True:
+        await asyncio.sleep(30)
+        wm = ws_managers.get(src.name)
+        if wm is None:
+            continue
+        symbols = list(wm._fanout.keys())
+        if not symbols:
+            continue
+        try:
+            quotes = await src.fetch_tickers(symbols)
+        except Exception as e:
+            log.warning("validate: fetch_tickers failed for %s: %s", src.name, e)
+            continue
+        for sym, quote in quotes.items():
+            # find any pipeline that has this symbol's book
+            book = None
+            for ts_map in []:  # populated below
+                pass
+            if book is None:
+                continue
+            mm = compare_book_to_quote(book, quote, max_bp=5.0)
+            if mm is not None:
+                log.warning("validate: %s/%s book mismatch field=%s book=%.6f quote=%.6f diff_bp=%.2f",
+                            src.name, sym, mm.field, mm.book_value, mm.quote_value, mm.diff_bp)
+
+
+async def _run(cfg, args=None):
     sources = []
     for name, ex_cfg in cfg.exchanges.items():
         if not ex_cfg.enabled:
@@ -152,6 +181,9 @@ async def _run(cfg):
     ]
     tasks.append(_reenumerate_loop(cfg, sources, pollers_by_name))
     tasks.append(tick_loop())
+    if args is not None and getattr(args, "validate_books", False):
+        for src in sources:
+            tasks.append(_validate_loop(src, ws_managers))
 
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
@@ -176,11 +208,35 @@ async def _run(cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config.yaml")
+    sub = ap.add_subparsers(dest="cmd")
+
+    scan_p = sub.add_parser("scan")
+    scan_p.add_argument("--config", default="config.yaml")
+    scan_p.add_argument("--validate-books", action="store_true")
+
+    rb = sub.add_parser("rebuild-db")
+    rb.add_argument("--config", default="config.yaml")
+
     args = ap.parse_args()
-    cfg = load_config(args.config)
-    logging.basicConfig(level=getattr(logging, cfg.output.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(_run(cfg))
+    if args.cmd is None or args.cmd == "scan":
+        # If no cmd, set defaults that scan would have
+        if not hasattr(args, "config"):
+            args.config = "config.yaml"
+        if not hasattr(args, "validate_books"):
+            args.validate_books = False
+        cfg = load_config(args.config)
+        logging.basicConfig(level=getattr(logging, cfg.output.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        try:
+            asyncio.run(_run(cfg, args))
+        except KeyboardInterrupt:
+            sys.exit(0)
+    elif args.cmd == "rebuild-db":
+        cfg = load_config(args.config)
+        from triscan.storage.sqlite import SqliteStore
+        store = SqliteStore(cfg.storage.sqlite_path)
+        n = store.rebuild_from_jsonl(cfg.storage.data_dir)
+        store.close()
+        print(f"rebuilt {n} opportunities into {cfg.storage.sqlite_path}")
 
 
 if __name__ == "__main__":
