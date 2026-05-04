@@ -279,6 +279,7 @@ def main():
             sys.exit(0)
     elif args.cmd == "rebuild-db":
         cfg = load_config(args.config)
+        logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s: %(message)s")
         from triscan.storage.sqlite import SqliteStore
         store = SqliteStore(cfg.storage.sqlite_path)
         n = store.rebuild_from_jsonl(cfg.storage.data_dir)
