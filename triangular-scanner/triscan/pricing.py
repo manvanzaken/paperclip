@@ -141,4 +141,47 @@ def _carry_remaining_zero(legs, stopped_at: int, partial_out: Decimal) -> Decima
     return flow
 
 
-def binary_search_executable_size(*a, **kw): raise NotImplementedError
+def binary_search_executable_size(
+    legs: List[Tuple[str, LegSide, Book]],
+    fee_pct: Decimal,
+    tier2_threshold_pct: float,
+    max_size_cap_usd: Decimal,
+    iterations: int = 30,
+    min_size_usd: Decimal = Decimal("1"),
+) -> float:
+    """
+    Find the largest input size S in [0, max_size_cap_usd] such that simulating the
+    cycle yields net_edge >= tier2_threshold_pct. Returns the largest such S, or 0 if
+    even min_size_usd fails the threshold.
+
+    Edge is computed from the simulated cycle output:
+      net_edge_pct = (output_quote / input_consumed - 1) * 100  (after applying fees)
+    """
+    f = float(fee_pct) / 100.0
+    fee_factor = (1.0 - f) ** 3
+
+    def net_edge_at(size: Decimal) -> float:
+        if size <= 0:
+            return -1.0
+        result = simulate_cycle_through_book(legs, size)
+        if result.input_consumed <= 0:
+            return -1.0
+        gross = result.output_quote / result.input_consumed
+        net = gross * fee_factor
+        return (net - 1.0) * 100.0
+
+    if net_edge_at(min_size_usd) < tier2_threshold_pct:
+        return 0.0
+
+    lo = min_size_usd
+    hi = max_size_cap_usd
+    if net_edge_at(hi) >= tier2_threshold_pct:
+        return float(hi)
+
+    for _ in range(iterations):
+        mid = (lo + hi) / 2
+        if net_edge_at(mid) >= tier2_threshold_pct:
+            lo = mid
+        else:
+            hi = mid
+    return float(lo)
