@@ -73,6 +73,44 @@ async def _run(cfg):
         log.info("%s: %d markets, %d triangles", src.name, len(markets), len(triangles))
         pollers_by_name[src.name] = Tier1Poller(source=src, triangles=triangles)
 
+    from triscan.ws_manager import WsManager
+    from triscan.pipeline import Pipeline, PipelineConfig
+    from decimal import Decimal as _D
+
+    pipelines = {}
+    ws_managers = {}
+    for src in sources:
+        if src.name != "binance":
+            continue
+        ws_managers[src.name] = WsManager(source=src,
+                                          max_subscriptions=cfg.scanner.max_ws_subscriptions_per_exchange)
+        pcfg = PipelineConfig(
+            tier1_threshold_pct=cfg.scanner.tier1_threshold_pct,
+            tier2_threshold_pct=cfg.scanner.tier2_threshold_pct,
+            min_profit_usd=cfg.scanner.min_profit_usd,
+            cooldown_sec=cfg.scanner.cooldown_sec,
+            max_size_cap_usd=_D(str(cfg.scanner.max_size_cap_usd)),
+            taker_fee_pct=_D(str(src.taker_fee_pct)),
+        )
+
+        async def on_opp(evt, _name=src.name):
+            if evt["type"] == "OpportunityOpen":
+                o = evt["opportunity"]
+                print(f"[{_name}] OPEN  {o['triangle_id']} net={o['open_net_edge_pct']:+.4f}% "
+                      f"size=${o['peak_executable_size_usd']:.0f} profit=${o['peak_executable_profit_usd']:.2f}")
+            else:
+                o = evt["opportunity"]
+                print(f"[{_name}] CLOSE {o['triangle_id']} life={o['lifetime_ms']}ms "
+                      f"peak_net={o['peak_net_edge_pct']:+.4f}% peak_profit=${o['peak_executable_profit_usd']:.2f} "
+                      f"reason={o['closed_reason']}")
+
+        pipelines[src.name] = Pipeline(
+            triangles=pollers_by_name[src.name].triangles,
+            ws_manager=ws_managers[src.name],
+            config=pcfg,
+            on_opportunity=on_opp,
+        )
+
     def make_callback(name):
         async def cb(results):
             results.sort(key=lambda r: r.gross_edge_pct, reverse=True)
@@ -81,13 +119,22 @@ async def _run(cfg):
                 print(f"--- {name} tier1 (top {len(top)}) ---")
                 for r in top:
                     print(f"  {r.triangle.id}  gross={r.gross_edge_pct:+.4f}%  net={r.net_edge_pct:+.4f}%")
+            if name in pipelines:
+                await pipelines[name].handle_tier1(results)
         return cb
+
+    async def tick_loop():
+        while True:
+            for p in pipelines.values():
+                await p.tick()
+            await asyncio.sleep(1)
 
     tasks = [
         p.run_loop(cfg.scanner.tier1_interval_sec, make_callback(name))
         for name, p in pollers_by_name.items()
     ]
     tasks.append(_reenumerate_loop(cfg, sources, pollers_by_name))
+    tasks.append(tick_loop())
 
     try:
         await asyncio.gather(*tasks)
