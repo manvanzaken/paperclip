@@ -80,8 +80,6 @@ async def _run(cfg):
     pipelines = {}
     ws_managers = {}
     for src in sources:
-        if src.name != "binance":
-            continue
         ws_managers[src.name] = WsManager(source=src,
                                           max_subscriptions=cfg.scanner.max_ws_subscriptions_per_exchange)
         pcfg = PipelineConfig(
