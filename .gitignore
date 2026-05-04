@@ -50,3 +50,6 @@ tests/release-smoke/test-results/
 tests/release-smoke/playwright-report/
 .superset/
 .claude/worktrees/
+
+# triangular-scanner runtime config (generated from config.example.yaml)
+triangular-scanner/config.yaml
