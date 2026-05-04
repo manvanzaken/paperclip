@@ -1,0 +1,3 @@
+{"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1700000000100,
+ "data":{"s":"BTCUSDT","u":2,
+         "b":[["60000","0.5"]], "a":[["60001","0"]]}}

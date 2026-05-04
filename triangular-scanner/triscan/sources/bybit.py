@@ -1,14 +1,20 @@
 from __future__ import annotations
+import asyncio
+import json as _json
+import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
+import websockets
 
 from .base import Source
 from ..enumerator import Market
-from ..models import Quote, Book
+from ..models import Quote, Book, BookLevel
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,9 +63,80 @@ class BybitSource(Source):
                     continue
         return out
 
-    async def subscribe_book(self, symbol, on_update):
-        raise NotImplementedError("WS implemented in Phase 5")
+    async def subscribe_book(self, symbol: str, on_update):
+        native = self._to_native(symbol)
+        topic = f"orderbook.50.{native}"
+        cancelled = asyncio.Event()
+
+        async def runner():
+            while not cancelled.is_set():
+                try:
+                    async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10) as ws:
+                        await ws.send(_json.dumps({"op": "subscribe", "args": [topic]}))
+                        book = None
+                        while not cancelled.is_set():
+                            msg = _json.loads(await ws.recv())
+                            if msg.get("topic") != topic:
+                                continue
+                            if msg.get("type") == "snapshot":
+                                book = _book_from_bybit_snapshot(self.name, symbol, msg)
+                                await on_update(book)
+                            elif msg.get("type") == "delta" and book is not None:
+                                new_u = int(msg["data"]["u"])
+                                if new_u != book.seq + 1:
+                                    log.warning("bybit %s seq gap (%s vs %s) — re-subscribe", symbol, new_u, book.seq)
+                                    break
+                                _apply_bybit_delta(book, msg)
+                                await on_update(book)
+                except Exception as e:
+                    if cancelled.is_set():
+                        return
+                    log.warning("bybit ws %s error: %s", symbol, e)
+                    await asyncio.sleep(1.0)
+
+        task = asyncio.create_task(runner())
+
+        async def cancel():
+            cancelled.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        return cancel
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+
+def _book_from_bybit_snapshot(exchange: str, symbol: str, msg: dict) -> Book:
+    d = msg["data"]
+    bids = [BookLevel(Decimal(p), Decimal(q)) for p, q in d.get("b", [])]
+    asks = [BookLevel(Decimal(p), Decimal(q)) for p, q in d.get("a", [])]
+    bids.sort(key=lambda l: l.price, reverse=True)
+    asks.sort(key=lambda l: l.price)
+    return Book(exchange=exchange, symbol=symbol, bids=bids, asks=asks,
+                ts_ms=int(msg.get("ts", 0)), seq=int(d.get("u", 0)))
+
+
+def _apply_bybit_delta(book: Book, msg: dict) -> None:
+    d = msg["data"]
+    for raw, levels in ((d.get("b", []), book.bids), (d.get("a", []), book.asks)):
+        for p_str, q_str in raw:
+            price = Decimal(p_str)
+            size = Decimal(q_str)
+            idx = next((i for i, lv in enumerate(levels) if lv.price == price), -1)
+            if size == 0:
+                if idx >= 0:
+                    levels.pop(idx)
+            else:
+                if idx >= 0:
+                    levels[idx] = BookLevel(price, size)
+                else:
+                    levels.append(BookLevel(price, size))
+    book.bids.sort(key=lambda l: l.price, reverse=True)
+    book.asks.sort(key=lambda l: l.price)
+    book.seq = int(d["u"])
+    book.ts_ms = int(msg.get("ts", book.ts_ms))
