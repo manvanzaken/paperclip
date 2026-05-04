@@ -1,8 +1,10 @@
-aiohttp==3.9.5
-websockets==12.0
-pydantic==2.7.1
-ccxt==4.3.30
-rich==13.7.1
-PyYAML==6.0.1
-pytest==8.2.0
-pytest-asyncio==0.23.6
+# Minimum-version pins (not exact) so wheels exist for the running Python.
+# Python 3.14 needs pydantic >= 2.13 (older pydantic-core has PyO3 < Python 3.14 support).
+aiohttp>=3.10
+websockets>=12
+pydantic>=2.13
+ccxt>=4.4
+rich>=13
+PyYAML>=6.0.2
+pytest>=8.2
+pytest-asyncio>=0.23
