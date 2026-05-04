@@ -63,7 +63,7 @@ class BybitSource(Source):
                     continue
         return out
 
-    async def subscribe_book(self, symbol: str, on_update):
+    async def subscribe_book(self, symbol: str, on_update, on_failure=None):
         native = self._to_native(symbol)
         topic = f"orderbook.50.{native}"
         cancelled = asyncio.Event()
@@ -92,6 +92,11 @@ class BybitSource(Source):
                     if cancelled.is_set():
                         return
                     log.warning("bybit ws %s error: %s", symbol, e)
+                    if on_failure is not None:
+                        try:
+                            await on_failure()
+                        except Exception:
+                            pass
                     await asyncio.sleep(1.0)
 
         task = asyncio.create_task(runner())

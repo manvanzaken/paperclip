@@ -67,3 +67,41 @@ async def test_candidate_to_confirmed_emits_opportunity_open():
     args, _ = on_opp.await_args
     evt = args[0]
     assert evt["type"] == "OpportunityOpen"
+
+
+@pytest.mark.asyncio
+async def test_ws_disconnect_closes_confirmed_with_correct_reason():
+    tri = Triangle("binance", "USDT",
+                   (("BTC/USDT", LegSide.BUY), ("ETH/BTC", LegSide.BUY), ("ETH/USDT", LegSide.SELL)))
+    ws = MagicMock(); ws.acquire = AsyncMock(return_value=True); ws.release = AsyncMock()
+    on_opp = AsyncMock()
+    cfg = PipelineConfig(0.5, 0.1, 1.0, 60, Decimal("10000"), Decimal("0.10"))
+    p = Pipeline([tri], ws, cfg, on_opportunity=on_opp)
+    await p.handle_tier1([Tier1Result(tri, 0.6, 0.3, 1)])
+    await p.handle_book(_book("BTC/USDT", 59999, 10, 60000, 10, seq=1))
+    await p.handle_book(_book("ETH/BTC",  0.04999, 100, 0.05000, 100, seq=1))
+    await p.handle_book(_book("ETH/USDT", 3010, 1000, 3011, 1000, seq=1))
+    on_opp.reset_mock()
+    await p.notify_ws_failed("BTC/USDT")
+    on_opp.assert_awaited()
+    args, _ = on_opp.await_args
+    assert args[0]["type"] == "OpportunityClosed"
+    assert args[0]["opportunity"]["closed_reason"] == "ws_disconnect"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_with_manual_stop():
+    tri = Triangle("binance", "USDT",
+                   (("BTC/USDT", LegSide.BUY), ("ETH/BTC", LegSide.BUY), ("ETH/USDT", LegSide.SELL)))
+    ws = MagicMock(); ws.acquire = AsyncMock(return_value=True); ws.release = AsyncMock()
+    on_opp = AsyncMock()
+    cfg = PipelineConfig(0.5, 0.1, 1.0, 60, Decimal("10000"), Decimal("0.10"))
+    p = Pipeline([tri], ws, cfg, on_opportunity=on_opp)
+    await p.handle_tier1([Tier1Result(tri, 0.6, 0.3, 1)])
+    await p.handle_book(_book("BTC/USDT", 59999, 10, 60000, 10, seq=1))
+    await p.handle_book(_book("ETH/BTC",  0.04999, 100, 0.05000, 100, seq=1))
+    await p.handle_book(_book("ETH/USDT", 3010, 1000, 3011, 1000, seq=1))
+    on_opp.reset_mock()
+    await p.shutdown()
+    args, _ = on_opp.await_args
+    assert args[0]["opportunity"]["closed_reason"] == "manual_stop"

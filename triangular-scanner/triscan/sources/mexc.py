@@ -70,7 +70,7 @@ class MexcSource(Source):
                     continue
         return out
 
-    async def subscribe_book(self, symbol: str, on_update):
+    async def subscribe_book(self, symbol: str, on_update, on_failure=None):
         native = self._to_native(symbol)
         chan = f"spot@public.limit.depth.v3.api@{native}@20"
         cancelled = asyncio.Event()
@@ -90,6 +90,11 @@ class MexcSource(Source):
                     if cancelled.is_set():
                         return
                     log.warning("mexc ws %s error: %s — reconnecting", symbol, e)
+                    if on_failure is not None:
+                        try:
+                            await on_failure()
+                        except Exception:
+                            pass
                     await asyncio.sleep(1.0)
 
         task = asyncio.create_task(runner())

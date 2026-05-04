@@ -101,7 +101,7 @@ class BinanceSource(Source):
                     continue
         return out
 
-    async def subscribe_book(self, symbol: str, on_update):
+    async def subscribe_book(self, symbol: str, on_update, on_failure=None):
         """Maintain a live L2 book for `symbol`. Calls `on_update(book)` after each accepted diff."""
         native = self._to_native(symbol).lower()
         stream_url = f"{self.ws_url.rstrip('/')}/{native}@depth@100ms"
@@ -154,6 +154,11 @@ class BinanceSource(Source):
                     if cancelled.is_set():
                         return
                     log.warning("binance ws %s error: %s — reconnecting in 1s", symbol, e)
+                    if on_failure is not None:
+                        try:
+                            await on_failure()
+                        except Exception:
+                            pass
                     await asyncio.sleep(1.0)
 
         task = asyncio.create_task(runner())

@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from typing import Awaitable, Callable, Dict
+from typing import Awaitable, Callable, Dict, Optional
 from .models import Book
 from .sources.base import Source
 
@@ -17,9 +17,11 @@ class WsManager:
     invoked for every subscriber of that symbol — the manager fan-outs.
     """
 
-    def __init__(self, source: Source, max_subscriptions: int):
+    def __init__(self, source: Source, max_subscriptions: int,
+                 on_symbol_failure: Optional[Callable[[str], Awaitable[None]]] = None):
         self.source = source
         self.max_subscriptions = max_subscriptions
+        self._on_symbol_failure = on_symbol_failure
         self._refcount: Dict[str, int] = defaultdict(int)
         self._cancellers: Dict[str, Callable[[], Awaitable[None]]] = {}
         self._fanout: Dict[str, list] = defaultdict(list)
@@ -46,7 +48,11 @@ class WsManager:
                     except Exception as e:
                         log.warning("ws callback error %s/%s: %s", self.source.name, symbol, e)
 
-            cancel = await self.source.subscribe_book(symbol, fanout)
+            async def on_failure(_sym=symbol):
+                if self._on_symbol_failure:
+                    await self._on_symbol_failure(_sym)
+
+            cancel = await self.source.subscribe_book(symbol, fanout, on_failure=on_failure)
             self._cancellers[symbol] = cancel
             self._refcount[symbol] = 1
             self._fanout[symbol] = [on_update]

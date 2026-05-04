@@ -211,6 +211,19 @@ class Pipeline:
         })
         ts.opportunity = None
 
+    async def notify_ws_failed(self, symbol: str) -> None:
+        for tid in self._symbol_index.get(symbol, []):
+            ts = self._states[tid]
+            if ts.state == OpportunityState.CONFIRMED:
+                await self._close_opportunity(ts, reason="ws_disconnect")
+                ts.state = OpportunityState.CANDIDATE
+
+    async def shutdown(self) -> None:
+        for ts in self._states.values():
+            if ts.state == OpportunityState.CONFIRMED:
+                await self._close_opportunity(ts, reason="manual_stop")
+                ts.state = OpportunityState.CANDIDATE
+
     async def tick(self, now_ms: Optional[int] = None) -> None:
         """Periodic cooldown + housekeeping. Call regularly (every 1s)."""
         now = now_ms if now_ms is not None else int(time.time() * 1000)

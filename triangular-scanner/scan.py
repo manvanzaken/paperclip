@@ -97,6 +97,7 @@ async def _run(cfg):
             cooldown_sec=cfg.scanner.cooldown_sec,
             max_size_cap_usd=_D(str(cfg.scanner.max_size_cap_usd)),
             taker_fee_pct=_D(str(src.taker_fee_pct)),
+            sample_every_n_updates=cfg.scanner.sample_every_n_updates,
         )
 
         async def on_opp(evt, _name=src.name, _jsonl=jsonl, _sqlite=sqlite_store):
@@ -118,6 +119,7 @@ async def _run(cfg):
             config=pcfg,
             on_opportunity=on_opp,
         )
+        ws_managers[src.name]._on_symbol_failure = pipelines[src.name].notify_ws_failed  # late-bind
 
     def make_callback(name):
         async def cb(results):

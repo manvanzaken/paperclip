@@ -2,7 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Awaitable, Callable, Dict, Iterable, List
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 from ..models import Quote, Book
 from ..enumerator import Market
@@ -28,6 +28,7 @@ class Source(ABC):
         self,
         symbol: str,
         on_update: Callable[[Book], Awaitable[None]],
+        on_failure: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Callable[[], Awaitable[None]]:
         """Subscribe to L2 book updates for `symbol`. Returns a cancel coroutine."""
 

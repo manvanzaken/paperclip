@@ -75,7 +75,7 @@ class KucoinSource(Source):
         token = body["data"]["token"]
         return f"{server['endpoint']}?token={token}"
 
-    async def subscribe_book(self, symbol: str, on_update):
+    async def subscribe_book(self, symbol: str, on_update, on_failure=None):
         native = self._to_native(symbol)
         cancelled = asyncio.Event()
 
@@ -133,6 +133,11 @@ class KucoinSource(Source):
                     if cancelled.is_set():
                         return
                     log.warning("kucoin ws %s error: %s", symbol, e)
+                    if on_failure is not None:
+                        try:
+                            await on_failure()
+                        except Exception:
+                            pass
                     await asyncio.sleep(1.0)
 
         task = asyncio.create_task(runner())
