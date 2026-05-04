@@ -1,0 +1,4 @@
+{"time": 1700000000, "channel": "spot.order_book", "event": "update",
+ "result": {"t": 1700000000000, "lastUpdateId": 1, "s": "BTC_USDT",
+            "bids": [["60000","1.0"],["59999","2.0"]],
+            "asks": [["60001","1.5"],["60002","0.5"]]}}

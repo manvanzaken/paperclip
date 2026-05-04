@@ -1,14 +1,20 @@
 from __future__ import annotations
+import asyncio
+import json as _json
+import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
+import websockets
 
 from .base import Source
 from ..enumerator import Market
-from ..models import Quote, Book
+from ..models import Quote, Book, BookLevel
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,9 +64,50 @@ class GateSource(Source):
                     continue
         return out
 
-    async def subscribe_book(self, symbol, on_update):
-        raise NotImplementedError("WS implemented in Phase 5")
+    async def subscribe_book(self, symbol: str, on_update):
+        native = self._to_native(symbol)
+        cancelled = asyncio.Event()
+
+        async def runner():
+            while not cancelled.is_set():
+                try:
+                    async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10) as ws:
+                        sub = {"time": int(time.time()), "channel": "spot.order_book",
+                               "event": "subscribe", "payload": [native, "20", "100ms"]}
+                        await ws.send(_json.dumps(sub))
+                        while not cancelled.is_set():
+                            msg = _json.loads(await ws.recv())
+                            if msg.get("channel") != "spot.order_book" or msg.get("event") != "update":
+                                continue
+                            book = _book_from_gate_snapshot(self.name, symbol, msg["result"])
+                            await on_update(book)
+                except Exception as e:
+                    if cancelled.is_set():
+                        return
+                    log.warning("gate ws %s error: %s", symbol, e)
+                    await asyncio.sleep(1.0)
+
+        task = asyncio.create_task(runner())
+
+        async def cancel():
+            cancelled.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        return cancel
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+
+def _book_from_gate_snapshot(exchange: str, symbol: str, result: dict) -> Book:
+    bids = [BookLevel(Decimal(p), Decimal(q)) for p, q in result.get("bids", [])]
+    asks = [BookLevel(Decimal(p), Decimal(q)) for p, q in result.get("asks", [])]
+    bids.sort(key=lambda l: l.price, reverse=True)
+    asks.sort(key=lambda l: l.price)
+    return Book(exchange=exchange, symbol=symbol, bids=bids, asks=asks,
+                ts_ms=int(result.get("t", 0)), seq=int(result.get("lastUpdateId", 0)))
