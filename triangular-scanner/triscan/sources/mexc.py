@@ -1,15 +1,20 @@
 from __future__ import annotations
 import asyncio
+import json as _json
+import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
+import websockets
 
 from .base import Source
 from ..enumerator import Market
-from ..models import Quote, Book
+from ..models import Quote, Book, BookLevel
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,9 +70,50 @@ class MexcSource(Source):
                     continue
         return out
 
-    async def subscribe_book(self, symbol, on_update):
-        raise NotImplementedError("WS not implemented in Phase 2")
+    async def subscribe_book(self, symbol: str, on_update):
+        native = self._to_native(symbol)
+        chan = f"spot@public.limit.depth.v3.api@{native}@20"
+        cancelled = asyncio.Event()
+
+        async def runner():
+            while not cancelled.is_set():
+                try:
+                    async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10) as ws:
+                        await ws.send(_json.dumps({"method": "SUBSCRIPTION", "params": [chan]}))
+                        while not cancelled.is_set():
+                            msg = _json.loads(await ws.recv())
+                            if msg.get("c") != chan:
+                                continue
+                            book = _book_from_mexc_snapshot(self.name, symbol, msg)
+                            await on_update(book)
+                except Exception as e:
+                    if cancelled.is_set():
+                        return
+                    log.warning("mexc ws %s error: %s — reconnecting", symbol, e)
+                    await asyncio.sleep(1.0)
+
+        task = asyncio.create_task(runner())
+
+        async def cancel():
+            cancelled.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        return cancel
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+
+def _book_from_mexc_snapshot(exchange: str, symbol: str, msg: dict) -> Book:
+    d = msg["d"]
+    bids = [BookLevel(Decimal(b["p"]), Decimal(b["v"])) for b in d["bids"]]
+    asks = [BookLevel(Decimal(a["p"]), Decimal(a["v"])) for a in d["asks"]]
+    bids.sort(key=lambda l: l.price, reverse=True)
+    asks.sort(key=lambda l: l.price)
+    return Book(exchange=exchange, symbol=symbol, bids=bids, asks=asks,
+                ts_ms=int(msg.get("t", 0)), seq=int(msg.get("t", 0)))
