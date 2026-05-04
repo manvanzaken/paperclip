@@ -6,5 +6,6 @@ pydantic>=2.13
 ccxt>=4.4
 rich>=13
 PyYAML>=6.0.2
+flask>=3.0
 pytest>=8.2
 pytest-asyncio>=0.23
