@@ -20,7 +20,7 @@ Two limitations motivate this work:
 - **Placement = inline, early tap:** capture inside the live scan/execute cycle, reusing the trader's exact quote feed and WS OB cache, so mapped books are the same objects a trade would hit. No separate process.
 
 ### Resolved defaults
-- **Depth target** for the depth factor = `MAX_POSITION_USD` ($25).
+- **Depth target** for the depth factor = an explicit `OPP_DEPTH_TARGET_USD = 25` constant, representing the **live** order size we care about grabbing. NOT bound to the paper trader's `MAX_POSITION_USD` (which is 500); the goal is realism vs. the live strategy's $25 cap.
 - **Sync tolerance** for the sync factor = **250 ms** (the per-leg fill window).
 - **MEXC/BloFin reality (accepted):** these two (the live pair) do not stream WS L2, so every map there costs a REST call. Mapping draws from the REST budget **only after** real `entry_candidates` are served, so trading is never starved; mapping coverage on MEXC/BloFin may be partial on busy cycles. No reserved slice.
 
@@ -44,20 +44,25 @@ Explicitly OUT of scope (follow-ups):
 
 ### 1. Capture the wider opportunity set (`mappable_opps`)
 
-In the scan loop, immediately after the Def-2 gate passes (`paper_trader.py:~6700`, the `realistic_entry_spread >= min_spread_needed` check), append a lightweight record to a new per-cycle `mappable_opps` list:
+The capture must happen **early** in the scan loop — right after the raw executable spread, velocity, and `pair_key` are computed (`paper_trader.py:~6589`), and *before* the spread-threshold / reversion / confirmation-tick gates. Those gates `continue` out of the loop before the later fee check (`~6700`), so tapping at the fee check would only see the narrow, already-confirmed set and defeat the purpose. Def-2 mappability is fee-based (physics), independent of the strategy's entry threshold (a knob), so it is evaluated here on the raw `spread_pct`:
 
 ```
-mappable_opps.append({
-    "symbol": symbol, "q_high": q_high, "q_low": q_low,
-    "pair_key": pair_key,
-    "spread_pct": realistic_entry_spread,
-    "raw_spread_pct": spread_pct,
-    "velocity": velocity,
-    "total_fees": total_fees,
-})
+# after spread_pct, velocity, pair_key computed (~6589); before threshold gate
+if OPP_MAPPER and spread_pct <= MAX_SANE_SPREAD_PCT:
+    map_fees = trader.compute_fees(q_high.exchange, q_low.exchange,
+                                   q_high.instrument, q_low.instrument) * 2
+    if is_mappable_opportunity(spread_pct, map_fees):
+        mappable_opps.append({
+            "symbol": symbol, "q_high": q_high, "q_low": q_low,
+            "pair_key": pair_key,
+            "spread_pct": spread_pct,
+            "raw_spread_pct": spread_pct,
+            "velocity": velocity,
+            "total_fees": map_fees,
+        })
 ```
 
-This fires for **every** Def-2 opportunity, including ones later rejected by the reversion (`check_reversion_entry`), confirmation-tick (`count < ENTRY_MIN_TICKS`), or blacklist gates — those gates govern *when to trade*, not *whether the opportunity was real*. `entry_candidates` remains a strict subset of `mappable_opps`.
+This fires for **every** Def-2 opportunity, including ones later rejected by the threshold, reversion (`check_reversion_entry`), or confirmation-tick (`count < ENTRY_MIN_TICKS`) gates — those gates govern *when to trade*, not *whether the opportunity was real*. `entry_candidates` remains a strict subset of `mappable_opps`. Insanely-wide spreads (`> MAX_SANE_SPREAD_PCT`) are still excluded.
 
 ### 2. Synchronized OB pull pass
 
@@ -97,10 +102,10 @@ Each factor returns 0–100; composite = weighted blend (weights default-equal, 
 
 | Factor | Definition |
 |---|---|
-| `duration` | `clamp(duration_s / fill_window_s, 0, 1) * 100`, where `fill_window_s = POLL_INTERVAL + LEG_LATENCY_MAX_MS/1000`. Sub-window flashes → low. |
-| `depth` | `clamp(min(short_depth_usd, long_depth_usd) / target_size_usd, 0, 1) * 100`. |
+| `duration` | `clamp(duration_s / OPP_FILL_WINDOW_S, 0, 1) * 100` (`OPP_FILL_WINDOW_S = 0.85`s react+fill). Sub-window flashes → low. |
+| `depth` | `clamp(min(short_depth_usd, long_depth_usd) / OPP_DEPTH_TARGET_USD, 0, 1) * 100` (`OPP_DEPTH_TARGET_USD = 25`). |
 | `margin` | `clamp((spread_pct - total_fees) / total_fees, 0, 1) * 100` (cushion over breakeven; ≥100% excess saturates at full marks). |
-| `velocity` | widening (`velocity > 0`) scales up toward 100; collapsing (`velocity < 0`) scales toward 0. Define as `clamp(0.5 + velocity * K, 0, 1) * 100` with `K` chosen so a strong collapse → ~0 and strong widening → ~100. |
+| `velocity` | `clamp(0.5 + velocity * OPP_VELOCITY_K, 0, 1) * 100` (`OPP_VELOCITY_K = 1.0`): widening → toward 100, collapsing → toward 0, flat → 50. |
 | `sync` | `clamp(1 - ob_skew_ms / sync_tolerance_ms, 0, 1) * 100`. 0 ms → 100; ≥ tolerance → 0. |
 
 **Live vs. final:** `duration` grows over an opportunity's life, so the per-tick `grabbability` is a *live* estimate. `close_opportunity` recomputes a `final_grabbability` using the full `final_duration_s` (mirrors the existing `final_duration_s` / `final_tick_count` write-back) and stamps it on the last snapshot for that pair.
@@ -136,8 +141,11 @@ Log marker (grep-able, `OB_OK` style), emitted on a sampled cadence (e.g. every 
 
 ```
 OPP_MAPPER = 1                 # env/config override; 0 = feature off
-OPP_DEPTH_TARGET_USD = MAX_POSITION_USD   # = 25
+OPP_DEPTH_TARGET_USD = 25.0    # live order size we care about grabbing (NOT paper MAX_POSITION_USD=500)
+OPP_MIN_PROFIT_MARGIN = 0.05   # Def-2 margin over fees (matches trading's min_spread_needed)
+OPP_FILL_WINDOW_S = 0.85       # react+fill window = POLL_INTERVAL_FAST (0.5) + LEG_LATENCY_MAX_MS/1000 (0.35)
 OPP_SYNC_TOLERANCE_MS = 250
+OPP_VELOCITY_K = 1.0           # velocity factor: clamp(0.5 + velocity*K, 0, 1)*100
 OPP_GRAB_WEIGHTS = {"duration": 1, "depth": 1, "margin": 1, "velocity": 1, "sync": 1}  # equal default
 OPP_MAP_LOG_EVERY = 50         # sampled log cadence
 ```
