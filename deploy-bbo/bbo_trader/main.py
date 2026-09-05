@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -44,9 +45,24 @@ def legacy_bot_running(path: Path, max_age_s: float, now: float) -> bool:
         return now - path.stat().st_mtime < max_age_s
     except FileNotFoundError:
         return False
+    except OSError as e:                 # unreadable: assume the worst, a human decides
+        log.error("legacy heartbeat %s unreadable (%r) — treating the legacy bot as running", path, e)
+        return True
+
+
+def data_dir_collides(cfg: Config) -> bool:
+    """DATA_DIR must not be the legacy bot's data dir: our `real_state.json` would overwrite its position file."""
+    try:
+        return cfg.data_dir.resolve() == cfg.legacy_heartbeat_path.parent.resolve()
+    except OSError:
+        return False
 
 
 async def run(cfg: Config) -> int:
+    if data_dir_collides(cfg):
+        log.critical("REFUSED: DATA_DIR %s is the legacy bot's data dir (%s) — give the BBO trader its own DATA_DIR",
+                     cfg.data_dir, cfg.legacy_heartbeat_path.parent)
+        return 5
     if cfg.mode == "live" and legacy_bot_running(cfg.legacy_heartbeat_path, cfg.legacy_heartbeat_max_age_s, time.time()):
         log.critical("REFUSED: legacy bot heartbeat %s is fresh — stop realtrader.service first", cfg.legacy_heartbeat_path)
         return 2
@@ -64,7 +80,11 @@ async def run(cfg: Config) -> int:
             if a is not None:
                 a.on_bbo(bbo)
 
-        venues = build_venues(cfg, on_bbo, board, session)
+        try:
+            venues = build_venues(cfg, on_bbo, board, session)
+        except RuntimeError as e:
+            log.critical("REFUSED: %s", e)
+            return 6
         fees = {n: v.fees for n, v in venues.items()}
         evaluator = PairEvaluator(cfg, board, fees, {}, {}, risk, metrics.funnel)
         executor = Executor(cfg, venues, board, book, risk, metrics,
@@ -72,8 +92,18 @@ async def run(cfg: Config) -> int:
         app = App(cfg, venues, board, book, risk, metrics, executor, evaluator, store, telegram)
         app_ref["app"] = app
         loop = asyncio.get_running_loop()
+        signals = {"n": 0}
+
+        def on_signal() -> None:
+            signals["n"] += 1
+            if signals["n"] == 1:
+                log.info("SIGNAL received — shutting down (a second signal forces exit)")
+                app.running = False
+            else:
+                log.critical("SIGNAL received twice — forcing exit without a final save")
+                os._exit(130)
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: setattr(app, "running", False))
+            loop.add_signal_handler(sig, on_signal)
         log.info("=== BBO trader starting [%s] venues=%s ===", cfg.mode, list(venues))
         try:
             await app.run()

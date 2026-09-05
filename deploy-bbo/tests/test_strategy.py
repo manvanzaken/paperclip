@@ -332,3 +332,18 @@ def test_scan_skips_blacklisted_and_insane_pairs_and_sorts_by_edge(tmp_path, clo
     assert [r["symbol"] for r in rows] == ["BIGUSDT", "WIDEUSDT", SYM]     # by edge, not by TT spread
     assert rows[1]["spread_pct"] < rows[2]["spread_pct"] and rows[1]["edge_pct"] > rows[2]["edge_pct"]
     assert rows[2]["price_short"] == 1.0050 and rows[2]["price_long"] == 1.0008
+
+
+def test_halt_posts_no_new_exit_makers_and_cancels_resting_ones(tmp_path, clock):
+    cfg, board, risk, ev = build(tmp_path, clock)
+    now = clock()
+    book = PositionBook()
+    pos = book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, entry_spread_pct=0.45, entry_time=now)
+    board.set(mk_bbo("blofin", SYM, 1.0020, 1.0030, ts=now))
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0005, ts=now))
+    assert ev.evaluate_exit(pos, {}).kind == "TM_EXIT"
+    risk.halt("test")
+    assert ev.evaluate_exit(pos, {}).reason == "hold"                  # halted: no new orders at any venue
+    pos.status, pos.maker_venue, pos.maker_rest_price = EXIT_MAKER_RESTING, "blofin", 1.0015
+    it = ev.evaluate_exit(pos, {})
+    assert it.kind == "CANCEL" and it.reason == "halted"                # ...and resting exit makers come off

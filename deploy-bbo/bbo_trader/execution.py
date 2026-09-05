@@ -52,6 +52,7 @@ MAX_CLOSE_RETRIES = 40           # ~20 min of DEGRADED retries, then the positio
 HEDGING_SWEEP_AFTER_S = 2.0      # a HEDGING position whose maker order is still live this long gets its cancel retried
 #                                  (the sweep runs inside retry_degraded, which the App calls from its 500 ms sweep)
 MAX_CID_LEN = 32                 # MEXC externalOid / BloFin clientOrderId
+STALE_CANCEL_COOLDOWN_S = 5.0    # a maker cancelled for stale quotes must not be re-posted on the very next quote
 MAX_TRACKS = 5000                # maker tracks outlive their position (fill-after-cancel alerts); the OLDEST are dropped —
 #                                  a live position's tracks are always among the newest, so the bound is safe in practice
 
@@ -497,6 +498,8 @@ class Executor:
 
     async def cancel_maker(self, pos: Position, reason: str) -> None:
         log.info("TM_CANCEL #%d %s reason=%s", pos.id, pos.maker_venue, reason)
+        if reason == "stale":
+            self.risk.set_cooldown(pos.symbol, STALE_CANCEL_COOLDOWN_S)
         await self._cancel_maker_order(pos, priority=True)
 
     async def upgrade_to_tt(self, pos: Position) -> None:

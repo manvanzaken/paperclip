@@ -277,10 +277,10 @@ class PairEvaluator:
             reason = "stop"
         if reason:
             return Intent(kind="TT_EXIT", reason=reason, spread_pct=x, **base)
-        mv = self.exit_maker_venue(pos) if cfg.tm_exit_enabled else ""
-        if not mv:
+        mv = self.exit_maker_venue(pos) if (cfg.tm_exit_enabled and not self.risk.halted) else ""
+        if not mv:                                       # halted: no NEW orders at any venue, resting exit makers come off
             if resting:                                  # never orphan a resting exit maker
-                why = "tm_exit_disabled" if not cfg.tm_exit_enabled else "no_maker_venue"
+                why = "halted" if self.risk.halted else "tm_exit_disabled" if not cfg.tm_exit_enabled else "no_maker_venue"
                 return Intent(kind="CANCEL", reason=why, maker_venue=pos.maker_venue, **base)
             return none("hold")
         px = maker_exit_price(qa, qb, cfg.exit_spread_pct, mv, self.tick(mv, pos.symbol), cfg.improve_ticks)

@@ -1,35 +1,159 @@
 {
-  "mexc":   {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.00,
-             "rate_limits": {"orders": 18, "cancels": 18, "window_s": 2.0, "reserve": 4, "shared": false},
-             "max_topics": 30, "min_requote_ms": 500},
-  "blofin": {"role": "trade", "taker_fee_pct": 0.06, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 27, "cancels": 27, "window_s": 10.0, "reserve": 6, "shared": true},
-             "max_topics": 50, "min_requote_ms": 1000},
-  "okx":    {"role": "off", "taker_fee_pct": 0.05, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 60, "cancels": 60, "window_s": 2.0, "reserve": 6, "shared": false},
-             "max_topics": 50, "min_requote_ms": 500, "symbol_whitelist": []},
-  "gate":   {"role": "off", "taker_fee_pct": 0.05, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 4, "shared": false},
-             "max_topics": 25, "min_requote_ms": 500},
-  "bitget": {"role": "off", "taker_fee_pct": 0.06, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 10, "cancels": 10, "window_s": 1.0, "reserve": 3, "shared": false},
-             "max_topics": 50, "min_requote_ms": 500},
-  "bingx":  {"role": "off", "taker_fee_pct": 0.05, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 10, "cancels": 10, "window_s": 1.0, "reserve": 3, "shared": false},
-             "max_topics": 200, "min_requote_ms": 500},
-  "kucoin": {"role": "off", "taker_fee_pct": 0.06, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 30, "cancels": 30, "window_s": 3.0, "reserve": 4, "shared": false},
-             "max_topics": 50, "min_requote_ms": 500},
-  "htx":    {"role": "off", "taker_fee_pct": 0.05, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 20, "cancels": 20, "window_s": 3.0, "reserve": 4, "shared": false},
-             "max_topics": 30, "min_requote_ms": 500},
-  "bybit":  {"role": "off", "taker_fee_pct": 0.055, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 10, "cancels": 10, "window_s": 1.0, "reserve": 2, "shared": false},
-             "max_topics": 50, "min_requote_ms": 500},
-  "binance": {"role": "off", "taker_fee_pct": 0.05, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 10, "cancels": 10, "window_s": 1.0, "reserve": 2, "shared": false},
-             "max_topics": 50, "min_requote_ms": 500},
-  "hyperliquid": {"role": "off", "taker_fee_pct": 0.045, "maker_fee_pct": 0.015,
-             "rate_limits": {"orders": 10, "cancels": 10, "window_s": 1.0, "reserve": 2, "shared": false},
-             "max_topics": 0, "min_requote_ms": 500, "staleness_override_s": 10.0}
+  "mexc": {
+    "role": "trade",
+    "taker_fee_pct": 0.02,
+    "maker_fee_pct": 0.0,
+    "rate_limits": {
+      "orders": 18,
+      "cancels": 18,
+      "window_s": 2.0,
+      "reserve": 4,
+      "shared": false
+    },
+    "max_topics": 30,
+    "min_requote_ms": 500,
+    "staleness_override_s": 5.0
+  },
+  "blofin": {
+    "role": "trade",
+    "taker_fee_pct": 0.06,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 27,
+      "cancels": 27,
+      "window_s": 10.0,
+      "reserve": 6,
+      "shared": true
+    },
+    "max_topics": 50,
+    "min_requote_ms": 1000
+  },
+  "okx": {
+    "role": "off",
+    "taker_fee_pct": 0.05,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 60,
+      "cancels": 60,
+      "window_s": 2.0,
+      "reserve": 6,
+      "shared": false
+    },
+    "max_topics": 50,
+    "min_requote_ms": 500,
+    "symbol_whitelist": []
+  },
+  "gate": {
+    "role": "off",
+    "taker_fee_pct": 0.05,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 20,
+      "cancels": 20,
+      "window_s": 2.0,
+      "reserve": 4,
+      "shared": false
+    },
+    "max_topics": 25,
+    "min_requote_ms": 500
+  },
+  "bitget": {
+    "role": "off",
+    "taker_fee_pct": 0.06,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 10,
+      "cancels": 10,
+      "window_s": 1.0,
+      "reserve": 3,
+      "shared": false
+    },
+    "max_topics": 50,
+    "min_requote_ms": 500
+  },
+  "bingx": {
+    "role": "off",
+    "taker_fee_pct": 0.05,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 10,
+      "cancels": 10,
+      "window_s": 1.0,
+      "reserve": 3,
+      "shared": false
+    },
+    "max_topics": 200,
+    "min_requote_ms": 500
+  },
+  "kucoin": {
+    "role": "off",
+    "taker_fee_pct": 0.06,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 30,
+      "cancels": 30,
+      "window_s": 3.0,
+      "reserve": 4,
+      "shared": false
+    },
+    "max_topics": 50,
+    "min_requote_ms": 500
+  },
+  "htx": {
+    "role": "off",
+    "taker_fee_pct": 0.05,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 20,
+      "cancels": 20,
+      "window_s": 3.0,
+      "reserve": 4,
+      "shared": false
+    },
+    "max_topics": 30,
+    "min_requote_ms": 500
+  },
+  "bybit": {
+    "role": "off",
+    "taker_fee_pct": 0.055,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 10,
+      "cancels": 10,
+      "window_s": 1.0,
+      "reserve": 2,
+      "shared": false
+    },
+    "max_topics": 50,
+    "min_requote_ms": 500
+  },
+  "binance": {
+    "role": "off",
+    "taker_fee_pct": 0.05,
+    "maker_fee_pct": 0.02,
+    "rate_limits": {
+      "orders": 10,
+      "cancels": 10,
+      "window_s": 1.0,
+      "reserve": 2,
+      "shared": false
+    },
+    "max_topics": 50,
+    "min_requote_ms": 500
+  },
+  "hyperliquid": {
+    "role": "off",
+    "taker_fee_pct": 0.045,
+    "maker_fee_pct": 0.015,
+    "rate_limits": {
+      "orders": 10,
+      "cancels": 10,
+      "window_s": 1.0,
+      "reserve": 2,
+      "shared": false
+    },
+    "max_topics": 0,
+    "min_requote_ms": 500,
+    "staleness_override_s": 10.0
+  }
 }

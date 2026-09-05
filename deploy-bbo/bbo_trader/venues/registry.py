@@ -27,6 +27,7 @@ LIVE_ADAPTERS: dict[str, Callable] = {}
 def build_venues(cfg: Config, on_bbo: Callable[[BBO], None], board: QuoteBoard,
                  session: aiohttp.ClientSession, clock=time.time) -> dict[str, Venue]:
     out: dict[str, Venue] = {}
+    problems: list[str] = []
     for vc in cfg.venues:
         if vc.role == "off":
             continue
@@ -43,9 +44,12 @@ def build_venues(cfg: Config, on_bbo: Callable[[BBO], None], board: QuoteBoard,
                 v.trading, v.private = sim, sim
             else:
                 if vc.name not in LIVE_ADAPTERS:
-                    raise RuntimeError(f"no live trading adapter for {vc.name} (Plan 2)")
-                if not vc.api_key:
-                    raise RuntimeError(f"{vc.name}: API key missing for live mode")
-                v.trading, v.private = LIVE_ADAPTERS[vc.name](vc, session, clock)
+                    problems.append(f"no live trading adapter for {vc.name} (Plan 2)")
+                elif not (vc.api_key and vc.api_secret):
+                    problems.append(f"{vc.name}: API key/secret missing for live mode")
+                else:
+                    v.trading, v.private = LIVE_ADAPTERS[vc.name](vc, session, clock)
         out[vc.name] = v
+    if problems:                                  # every problem at once: one restart per finding is not acceptable
+        raise RuntimeError("live mode refused: " + "; ".join(problems))
     return out
