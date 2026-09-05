@@ -1136,7 +1136,8 @@ import pytest
 
 from bbo_trader.edge import (EdgeParams, evaluate_pair, maker_entry_price, maker_exit_price,
                              exit_spread_tt, needs_requote, best_fee_venue, round_up, round_down,
-                             tick_decimals, spread_pct)
+                             tick_decimals, spread_pct, tm_required_pct)
+from bbo_trader.models import Fees
 from tests.conftest import mk_bbo, MEXC_FEES, BLOFIN_FEES
 
 P = EdgeParams(min_edge_pct=0.05, tm_extra_edge_pct=0.05, exit_spread_pct=0.15, slip_pct=0.05)
@@ -1217,6 +1218,112 @@ def test_rounding_and_requote_helpers():
     assert not needs_requote(1.0000, 1.0001, 0.0001, 2)
     assert best_fee_venue("blofin", BLOFIN_FEES, "mexc", MEXC_FEES) == "blofin"   # 0.04 vs 0.02 saving
     assert best_fee_venue("mexc", MEXC_FEES, "blofin", BLOFIN_FEES) == "blofin"
+
+
+def test_degenerate_quote_never_yields_zero_peg():
+    # a glitched/near-zero quote on A must never round to a postable 0.0 peg on either side
+    qa = mk_bbo("blofin", "XYZUSDT", bid=1e-9, ask=2e-9)
+    qb = mk_bbo("mexc", "XYZUSDT", bid=1.0, ask=1.001)
+    assert maker_exit_price(qa, qb, 0.15, "blofin", tick=0.0001) is None
+    assert maker_entry_price(qa, qb, BLOFIN_FEES, MEXC_FEES, P, "mexc", tick=0.0001) is None
+
+
+def test_requote_detects_one_tick_at_high_price():
+    # absolute epsilon breaks down at 6-figure prices; tolerance must scale with tick, not price
+    assert needs_requote(105123.45, 105123.46, 0.01, 1) is True
+    assert needs_requote(105123.45, 105123.45, 0.01, 1) is False
+    with pytest.raises(ValueError):
+        needs_requote(105123.45, 105123.46, 0, 1)
+
+
+def test_tick_decimals_and_rounding_extremes():
+    assert tick_decimals(1e-8) == 8
+    assert tick_decimals(2.5e-7) == 8
+    assert tick_decimals(1e-13) == 13
+    assert tick_decimals(100.0) == 0
+    # on-grid prices must round-trip through round_up/round_down unchanged at tiny/large scales
+    assert round_up(0.00012345, 1e-8) == pytest.approx(0.00012345)
+    assert round_down(0.00012345, 1e-8) == pytest.approx(0.00012345)
+    assert round_up(1000.000123, 1e-6) == pytest.approx(1000.000123)
+    assert round_down(10000.0001, 0.0001) == pytest.approx(10000.0001)
+    with pytest.raises(ValueError):
+        tick_decimals(0)
+
+
+def test_tm_viable_when_tt_spread_negative():
+    # blofin book is 0.6% wide with an inverted (negative) TT spread: TT can't fire, but making
+    # on the wide side of blofin still clears the required edge against mexc's ask
+    qa = mk_bbo("blofin", "XYZUSDT", bid=0.9995, ask=1.0055)
+    qb = mk_bbo("mexc", "XYZUSDT", bid=1.0000, ask=1.0010)
+    pe = evaluate_pair(qa, qb, BLOFIN_FEES, MEXC_FEES, P)
+    assert pe.spread_tt < 0
+    assert pe.mode == "TM"
+    assert pe.maker_venue == "blofin"
+    px = maker_entry_price(qa, qb, BLOFIN_FEES, MEXC_FEES, P, "blofin", tick=0.0001)
+    assert px is not None and px > qa.bid
+
+
+def test_make_on_b_would_cross_guards():
+    # entry make-on-B (BUY on mexc): improving 1 tick inside a one-tick mexc book lands exactly on
+    # the ask -> would cross, must reject even though the edge-required cap is not binding here
+    qa = mk_bbo("blofin", "XYZUSDT", bid=1.0060, ask=1.0070)
+    qb = mk_bbo("mexc", "XYZUSDT", bid=1.0009, ask=1.0010)
+    assert maker_entry_price(qa, qb, BLOFIN_FEES, MEXC_FEES, P, "mexc", tick=0.0001, improve_ticks=1) is None
+    # exit make-on-B (SELL on mexc): improving 1 tick inside a one-tick mexc book lands exactly on
+    # the bid -> would cross, must reject even though the exit-target floor is not binding here
+    qa2 = mk_bbo("blofin", "XYZUSDT", bid=1.0020, ask=1.0025)
+    qb2 = mk_bbo("mexc", "XYZUSDT", bid=1.0014, ask=1.0015)
+    assert maker_exit_price(qa2, qb2, 0.15, "mexc", tick=0.0001, improve_ticks=1) is None
+
+
+def test_best_fee_venue_tie_goes_to_a():
+    assert best_fee_venue("x", Fees(0.05, 0.02), "y", Fees(0.06, 0.03)) == "x"
+
+
+def test_peg_properties_on_a_grid():
+    """Deterministic sweep (no randomness): every postable peg maker_entry_price/maker_exit_price
+    return must (a) sit strictly on the resting-order side of its own book (never cross) and
+    (b) actually realize the edge/exit target it was pegged to meet."""
+    ticks = (1e-6, 1e-4, 0.01)
+    mids = (0.001, 1.0, 250.0, 65000.0)
+    width_ticks_opts = (1, 3, 20)
+    offset_ticks_opts = (-30, -5, 0, 5, 30)
+    checked = 0
+    for tick in ticks:
+        for mid in mids:
+            if tick >= mid / 100:
+                continue
+            for width_ticks in width_ticks_opts:
+                qb = mk_bbo("mexc", "XYZUSDT", bid=mid, ask=mid + width_ticks * tick)
+                for offset_ticks in offset_ticks_opts:
+                    qa_bid = qb.bid + offset_ticks * tick
+                    qa_ask = qb.bid + (offset_ticks + width_ticks) * tick
+                    if qa_bid <= 0 or qa_ask <= 0 or qb.bid <= 0 or qb.ask <= 0:
+                        continue
+                    qa = mk_bbo("blofin", "XYZUSDT", bid=qa_bid, ask=qa_ask)
+                    for maker_venue in ("blofin", "mexc"):
+                        for improve_ticks in (0, 1):
+                            checked += 1
+                            entry_px = maker_entry_price(qa, qb, BLOFIN_FEES, MEXC_FEES, P,
+                                                          maker_venue, tick, improve_ticks)
+                            if entry_px is not None:
+                                if maker_venue == "blofin":
+                                    assert entry_px > qa.bid
+                                    req = tm_required_pct(BLOFIN_FEES, MEXC_FEES, P)
+                                    assert spread_pct(entry_px, qb.ask) >= req - 1e-9
+                                else:
+                                    assert entry_px < qb.ask
+                                    req = tm_required_pct(MEXC_FEES, BLOFIN_FEES, P)
+                                    assert spread_pct(qa.bid, entry_px) >= req - 1e-9
+                            exit_px = maker_exit_price(qa, qb, 0.15, maker_venue, tick, improve_ticks)
+                            if exit_px is not None:
+                                if maker_venue == "blofin":
+                                    assert exit_px < qa.ask
+                                    assert spread_pct(exit_px, qb.bid) <= 0.15 + 1e-9
+                                else:
+                                    assert exit_px > qb.bid
+                                    assert spread_pct(qa.ask, exit_px) <= 0.15 + 1e-9
+    assert checked > 0
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1230,11 +1337,14 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.edge'`
 """Pure edge math for the two execution modes, maker price pegs and tick rounding.
 
 All spreads, fees and edges are percent points. `qa` is the venue we SELL on (higher bid),
-`qb` the venue we BUY on. See the spec section "Strategy: edge math and mode selection"."""
+`qb` the venue we BUY on. See the spec section "Strategy: edge math and mode selection".
+
+All entry points assume qa.ok and qb.ok (positive, uncrossed quotes) and qa.symbol == qb.symbol."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from decimal import Decimal
 
 from .models import BBO, Fees
 
@@ -1312,38 +1422,48 @@ def choose_mode(pe: PairEval, p: EdgeParams) -> PairEval:
     return replace(pe, mode="", maker_venue="", edge=0.0)
 
 
-def tm_required_pct(maker_fees: Fees, taker_fees: Fees, fa: Fees, fb: Fees, p: EdgeParams) -> float:
+def tm_required_pct(maker_fees: Fees, taker_fees: Fees, p: EdgeParams) -> float:
     """Percent the maker fill must clear over the hedge touch to meet the TM edge."""
-    return (p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker
-            + _base_cost(fa, fb, p))
+    base = maker_fees.taker + taker_fees.taker + p.exit_spread_pct + p.slip_pct
+    return p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker + base
 
 
 def tick_decimals(tick: float) -> int:
-    s = f"{tick:.12f}".rstrip("0")
-    return len(s.split(".")[1]) if "." in s else 0
+    if tick <= 0:
+        raise ValueError(f"tick must be positive, got {tick!r}")
+    return max(0, -Decimal(repr(tick)).normalize().as_tuple().exponent)
 
 
 def round_up(px: float, tick: float) -> float:
-    return round(math.ceil(px / tick - 1e-9) * tick, tick_decimals(tick))
+    eps = max(1e-9, abs(px / tick) * 1e-12)
+    return round(math.ceil(px / tick - eps) * tick, tick_decimals(tick))
 
 
 def round_down(px: float, tick: float) -> float:
-    return round(math.floor(px / tick + 1e-9) * tick, tick_decimals(tick))
+    eps = max(1e-9, abs(px / tick) * 1e-12)
+    return round(math.floor(px / tick + eps) * tick, tick_decimals(tick))
+
+
+def _postable(px: float, lo: float, hi: float) -> float | None:
+    """A post-only price must sit strictly inside (lo, hi) and be positive."""
+    return px if 0.0 < px and lo < px < hi else None
 
 
 def maker_entry_price(qa: BBO, qb: BBO, fa: Fees, fb: Fees, p: EdgeParams, maker_venue: str,
                       tick: float, improve_ticks: int = 0) -> float | None:
-    """Resting price for a TM entry, or None when no post-only price meets the edge."""
+    """Resting price for a TM entry. Assumes the caller already confirmed mode == "TM" for this
+    maker venue (choose_mode); returns None only when no post-only price is available (it would
+    cross, or is not positive)."""
     if maker_venue == qa.venue:  # rest SELL on A, hedge BUY at ask_B
-        req = tm_required_pct(fa, fb, fa, fb, p)
+        req = tm_required_pct(fa, fb, p)
         floor_px = qb.ask * (1.0 + req / 100.0)
         px = round_up(max(qa.ask - improve_ticks * tick, floor_px), tick)
-        return px if px > qa.bid else None
+        return _postable(px, qa.bid, float("inf"))
     if maker_venue == qb.venue:  # rest BUY on B, hedge SELL at bid_A
-        req = tm_required_pct(fb, fa, fa, fb, p)
+        req = tm_required_pct(fb, fa, p)
         cap_px = qa.bid / (1.0 + req / 100.0)
         px = round_down(min(qb.bid + improve_ticks * tick, cap_px), tick)
-        return px if px < qb.ask else None
+        return _postable(px, 0.0, qb.ask)
     return None
 
 
@@ -1354,16 +1474,18 @@ def maker_exit_price(qa: BBO, qb: BBO, exit_spread_pct: float, maker_venue: str,
     if maker_venue == qa.venue:  # rest BUY on A; hedge SELL B at bid_B: (p - bid_B)/bid_B <= X
         cap_px = qb.bid * (1.0 + exit_spread_pct / 100.0)
         px = round_down(min(qa.bid + improve_ticks * tick, cap_px), tick)
-        return px if px < qa.ask else None
+        return _postable(px, 0.0, qa.ask)
     if maker_venue == qb.venue:  # rest SELL on B; hedge BUY A at ask_A: (ask_A - p)/p <= X
         floor_px = qa.ask / (1.0 + exit_spread_pct / 100.0)
         px = round_up(max(qb.ask - improve_ticks * tick, floor_px), tick)
-        return px if px > qb.bid else None
+        return _postable(px, qb.bid, float("inf"))
     return None
 
 
 def needs_requote(working_px: float, new_px: float, tick: float, requote_ticks: int) -> bool:
-    return abs(new_px - working_px) >= requote_ticks * tick - 1e-12
+    if tick <= 0:
+        raise ValueError(f"tick must be positive, got {tick!r}")
+    return abs(new_px - working_px) / tick >= requote_ticks - 1e-9
 
 
 def best_fee_venue(venue_a: str, fa: Fees, venue_b: str, fb: Fees) -> str:
@@ -1374,7 +1496,7 @@ def best_fee_venue(venue_a: str, fa: Fees, venue_b: str, fb: Fees) -> str:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_edge.py -q`
-Expected: `6 passed`
+Expected: `13 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -2795,7 +2917,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `52 passed`
+Expected: `59 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -3948,7 +4070,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `66 passed`
+Expected: `73 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -5046,7 +5168,7 @@ Expected: `10 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `79 passed`
+Expected: `86 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -5812,7 +5934,7 @@ Expected: `4 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `86 passed`
+Expected: `93 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -5935,7 +6057,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
