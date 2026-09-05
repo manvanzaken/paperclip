@@ -6200,7 +6200,7 @@ git commit -m "feat(bbo): latency histograms, funnel, loop-lag sampler, coverage
 
 This is the heart of the trader. Read the spec sections "Execution" and "Position state machine" first. The tests drive the executor with two `SimVenue`s (blofin contract size 1, mexc contract size 10 → $25 sizes to $20 matched), 1 ms simulated latency and no-op retry sleeps. `Harness` in the TT test file is reused by the TM tests and by the App test in Task 19.
 
-- [ ] **Step 1: Write the failing TT-flow tests**
+- [x] **Step 1: Write the failing TT-flow tests**
 
 `tests/test_execution_tt.py`:
 
@@ -6560,7 +6560,7 @@ async def test_in_doubt_order_with_a_known_partial_books_the_partial(tmp_path, m
     assert sum("ORDER_UNRESOLVED" in n for n in h.notes) == 2
 ```
 
-- [ ] **Step 2: Write the failing TM-flow tests**
+- [x] **Step 2: Write the failing TM-flow tests**
 
 `tests/test_execution_tm.py`:
 
@@ -6911,12 +6911,12 @@ async def test_desync_with_a_stray_on_the_failed_leg_degrades_instead_of_closing
     assert pos.status == CLOSED and await sim.positions() == [] and await h.sim("mexc").positions() == []
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_execution_tt.py tests/test_execution_tm.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.execution'`
 
-- [ ] **Step 4: Implement `bbo_trader/execution.py`**
+- [x] **Step 4: Implement `bbo_trader/execution.py`**
 
 ```python
 """Executor: turns Intents into orders and OrderEvents into position transitions.
@@ -7930,12 +7930,12 @@ class Executor:
             await self._cancel_maker_order(pos, priority=True)
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_execution_tt.py tests/test_execution_tm.py -q`
 Expected: `29 passed`
 
-- [ ] **Step 6: Run the whole suite and commit**
+- [x] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
 Expected: `146 passed`
