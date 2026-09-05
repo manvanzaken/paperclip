@@ -175,6 +175,9 @@ class Position:
     maker_avg_price: float = 0.0
     hedged_qty: float = 0.0         # maker contracts already hedged
     maker_fee_usd: float = 0.0      # cumulative fee on the resting order
+    maker_booked_qty: float = 0.0   # how much of the resting order's fill is already booked on the leg
+    maker_booked_fee: float = 0.0
+    pnl_adjust_usd: float = 0.0     # realized P&L from unwinds outside the booked legs (maker-fill flattens)
     maker_cancel_sent: bool = False
     requote_pending: bool = False   # cancel+new requote in flight (venues without amend)
     requote_price: float = 0.0

@@ -53,7 +53,7 @@ def finalize_pnl(pos: Position) -> None:
     if pos.entry_price_b > 0 and pos.exit_price_b > 0:
         gross += (pos.exit_price_b - pos.entry_price_b) / pos.entry_price_b * pos.size_usd
     pos.gross_pnl_usd = gross
-    pos.net_pnl_usd = gross - pos.entry_fees_usd - pos.exit_fees_usd
+    pos.net_pnl_usd = gross - pos.entry_fees_usd - pos.exit_fees_usd + pos.pnl_adjust_usd
     if pos.exit_price_a > 0 and pos.exit_price_b > 0:
         pos.exit_spread_pct = (pos.exit_price_a - pos.exit_price_b) / pos.exit_price_b * 100.0
 
