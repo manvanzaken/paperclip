@@ -160,15 +160,21 @@ def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
         # roles are compared verbatim (no case folding): venues.json is operator-authored and must be exact
         if role not in ("trade", "quote_only", "off"):
             raise ValueError(f"{name}: unknown role {role!r} (expected trade | quote_only | off)")
+        limits = RateLimits(
+            orders=int(rl.get("orders", 20)), cancels=int(rl.get("cancels", 20)),
+            window_s=float(rl.get("window_s", 2.0)), reserve=int(rl.get("reserve", 4)),
+            shared=_parse_bool(rl.get("shared", False), name))
+        if not (limits.window_s > 0) or limits.orders <= 0 or limits.cancels <= 0:
+            raise ValueError(f"{name}: rate_limits window_s, orders and cancels must be positive")
+        if not (0 <= limits.reserve < min(limits.orders, limits.cancels)):
+            raise ValueError(f"{name}: rate_limits.reserve must be in [0, min(orders, cancels)) — a reserve "
+                             f"equal to the capacity would silently block every entry")
         out.append(VenueConfig(
             name=name,
             role=role,
             taker_fee_pct=float(v["taker_fee_pct"]),
             maker_fee_pct=float(v["maker_fee_pct"]),
-            rate_limits=RateLimits(
-                orders=int(rl.get("orders", 20)), cancels=int(rl.get("cancels", 20)),
-                window_s=float(rl.get("window_s", 2.0)), reserve=int(rl.get("reserve", 4)),
-                shared=_parse_bool(rl.get("shared", False), name)),
+            rate_limits=limits,
             max_topics=int(v.get("max_topics", 50)),
             min_requote_ms=int(v.get("min_requote_ms", 500)),
             staleness_override_s=(float(v["staleness_override_s"]) if v.get("staleness_override_s") is not None else None),

@@ -220,3 +220,17 @@ def test_bad_mode_reported_before_missing_files(tmp_path):
         load_config(env={
             "MODE": "lve", "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(tmp_path / "nope.json"),
         })
+
+
+def test_rate_limits_are_validated(tmp_path):
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    venues = tmp_path / "venues.json"
+    base = {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0, "max_topics": 30, "min_requote_ms": 500}
+    env = {"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked)}
+    venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 20, "shared": False}}}))
+    with pytest.raises(ValueError, match="reserve must be in"):
+        load_config(env=env)
+    venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 20, "cancels": 20, "window_s": 0, "reserve": 4, "shared": False}}}))
+    with pytest.raises(ValueError, match="must be positive"):
+        load_config(env=env)
