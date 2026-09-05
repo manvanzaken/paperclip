@@ -97,15 +97,15 @@ Expected: pip finishes without errors; `.venv/bin/python -c "import aiohttp, pyt
 
 - [x] **Step 2: Write the venue registry and blocked-symbol seed**
 
-`config/venues.json` — only `mexc` and `blofin` are `trade` in this plan; every other venue is `off` until Plan 3 gives it an adapter. Fees are the SpreadWatch tables (percent per leg, verify against live accounts).
+`config/venues.json` — only `mexc` and `blofin` are `trade` in this plan; every other venue is `off` until Plan 3 gives it an adapter. Fees are the SpreadWatch tables (percent per leg, verify against live accounts). Rate limits carry ~10% headroom under the documented venue limits (MEXC 20/2 s → 18, BloFin 30/10 s → 27) because our window is measured at send time and the venue's at receive time.
 
 ```json
 {
   "mexc":   {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.00,
-             "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 4, "shared": false},
+             "rate_limits": {"orders": 18, "cancels": 18, "window_s": 2.0, "reserve": 4, "shared": false},
              "max_topics": 30, "min_requote_ms": 500},
   "blofin": {"role": "trade", "taker_fee_pct": 0.06, "maker_fee_pct": 0.02,
-             "rate_limits": {"orders": 30, "cancels": 30, "window_s": 10.0, "reserve": 6, "shared": true},
+             "rate_limits": {"orders": 27, "cancels": 27, "window_s": 10.0, "reserve": 6, "shared": true},
              "max_topics": 50, "min_requote_ms": 1000},
   "okx":    {"role": "off", "taker_fee_pct": 0.05, "maker_fee_pct": 0.02,
              "rate_limits": {"orders": 60, "cancels": 60, "window_s": 2.0, "reserve": 6, "shared": false},
@@ -380,12 +380,26 @@ def test_bad_mode_reported_before_missing_files(tmp_path):
         load_config(env={
             "MODE": "lve", "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(tmp_path / "nope.json"),
         })
+
+
+def test_rate_limits_are_validated(tmp_path):
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    venues = tmp_path / "venues.json"
+    base = {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0, "max_topics": 30, "min_requote_ms": 500}
+    env = {"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked)}
+    venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 20, "shared": False}}}))
+    with pytest.raises(ValueError, match="reserve must be in"):
+        load_config(env=env)
+    venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 20, "cancels": 20, "window_s": 0, "reserve": 4, "shared": False}}}))
+    with pytest.raises(ValueError, match="must be positive"):
+        load_config(env=env)
 ```
 
 - [x] **Step 4: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.config'` (14 tests collected, all erroring at import)
+Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.config'` (15 tests collected, all erroring at import)
 
 - [x] **Step 5: Implement `bbo_trader/config.py`**
 
@@ -552,15 +566,21 @@ def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
         # roles are compared verbatim (no case folding): venues.json is operator-authored and must be exact
         if role not in ("trade", "quote_only", "off"):
             raise ValueError(f"{name}: unknown role {role!r} (expected trade | quote_only | off)")
+        limits = RateLimits(
+            orders=int(rl.get("orders", 20)), cancels=int(rl.get("cancels", 20)),
+            window_s=float(rl.get("window_s", 2.0)), reserve=int(rl.get("reserve", 4)),
+            shared=_parse_bool(rl.get("shared", False), name))
+        if not (limits.window_s > 0) or limits.orders <= 0 or limits.cancels <= 0:
+            raise ValueError(f"{name}: rate_limits window_s, orders and cancels must be positive")
+        if not (0 <= limits.reserve < min(limits.orders, limits.cancels)):
+            raise ValueError(f"{name}: rate_limits.reserve must be in [0, min(orders, cancels)) — a reserve "
+                             f"equal to the capacity would silently block every entry")
         out.append(VenueConfig(
             name=name,
             role=role,
             taker_fee_pct=float(v["taker_fee_pct"]),
             maker_fee_pct=float(v["maker_fee_pct"]),
-            rate_limits=RateLimits(
-                orders=int(rl.get("orders", 20)), cancels=int(rl.get("cancels", 20)),
-                window_s=float(rl.get("window_s", 2.0)), reserve=int(rl.get("reserve", 4)),
-                shared=_parse_bool(rl.get("shared", False), name)),
+            rate_limits=limits,
             max_topics=int(v.get("max_topics", 50)),
             min_requote_ms=int(v.get("min_requote_ms", 500)),
             staleness_override_s=(float(v["staleness_override_s"]) if v.get("staleness_override_s") is not None else None),
@@ -623,7 +643,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
 - [x] **Step 6: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
-Expected: `14 passed`
+Expected: `15 passed`
 
 - [x] **Step 7: Commit**
 
@@ -1771,6 +1791,8 @@ git commit -m "feat(bbo): pure sizing — contracts per venue, matched legs, hed
 `tests/test_budget.py`:
 
 ```python
+import pytest
+
 from bbo_trader.budget import TokenBucket, RateBudget
 from bbo_trader.config import RateLimits
 
@@ -1793,6 +1815,27 @@ def test_bucket_penalty_halves_capacity():
     assert b.available(61.0) == 4
 
 
+def test_penalty_pauses_entries_but_never_priority_calls():
+    # BloFin-like: 30 per 10 s shared, reserve 6; entries used 24, then a 429 lands
+    b = TokenBucket(capacity=30, window_s=10.0, reserve=6)
+    for _ in range(24):
+        assert b.try_take(0.0)
+    b.penalize(now=0.0, seconds=60.0)
+    assert b.available(0.001) < 0 and not b.try_take(0.001)              # entries paused
+    assert all(b.try_take(0.001, priority=True) for _ in range(6))       # hedges/closes keep the reserve
+    assert not b.try_take(0.001, priority=True)                          # ... but never exceed the venue limit
+    assert b.penalized(0.001) and not b.penalized(60.0)
+
+
+def test_try_take_n_and_window_boundary():
+    b = TokenBucket(capacity=3, window_s=2.0, reserve=0)
+    assert b.try_take(0.0, n=2)
+    assert not b.try_take(0.0, n=2)                  # only one token left
+    assert b.try_take(0.0, n=1)
+    assert not b.try_take(2.0)                       # a token taken exactly window_s ago still counts
+    assert b.try_take(2.0000001)
+
+
 def test_rate_budget_shared_vs_separate():
     shared = RateBudget(RateLimits(orders=3, cancels=3, window_s=10.0, reserve=1, shared=True))
     assert shared.try_take("order", 0.0) and shared.try_take("cancel", 0.0)
@@ -1801,7 +1844,22 @@ def test_rate_budget_shared_vs_separate():
     separate = RateBudget(RateLimits(orders=1, cancels=1, window_s=10.0, reserve=0, shared=False))
     assert separate.try_take("order", 0.0) and separate.try_take("cancel", 0.0)
     assert not separate.try_take("amend", 0.0)                     # amend draws from orders
-    assert separate.to_dict(0.0) == {"orders_free": 0, "cancels_free": 0}
+    assert separate.to_dict(0.0) == {"orders_free": 0, "cancels_free": 0, "shared": False, "penalized": False}
+
+
+def test_unknown_kind_raises():
+    b = RateBudget(RateLimits(orders=5, cancels=5, window_s=1.0, reserve=0, shared=False))
+    with pytest.raises(ValueError, match="unknown budget kind"):
+        b.try_take("cancels", 0.0)
+
+
+def test_to_dict_after_penalty_clamps_and_flags():
+    b = RateBudget(RateLimits(orders=3, cancels=3, window_s=10.0, reserve=1, shared=True))
+    assert b.try_take("order", 0.0) and b.try_take("order", 0.0)
+    b.penalize(0.0)
+    d = b.to_dict(0.5)
+    assert d == {"orders_free": 1, "cancels_free": 1, "shared": True, "penalized": True}
+    assert b.available("order", 0.5) < 0                          # entries see the halved capacity
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1816,11 +1874,19 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.budget'`
 from __future__ import annotations
 
 from collections import deque
+from typing import Literal
 
 from .config import RateLimits
 
+Kind = Literal["order", "amend", "cancel"]
+
 
 class TokenBucket:
+    """Sliding-window budget. `reserve` tokens are only spendable by priority callers (hedges, closes,
+    flattens, cancels). A penalty (after a 429) halves the capacity for NON-priority callers only:
+    entries and requotes pause while risk-reducing calls keep the full window — the venue, not our
+    bucket, is the last line of defence for those."""
+
     def __init__(self, capacity: int, window_s: float, reserve: int = 0):
         self.capacity = capacity
         self.window_s = window_s
@@ -1829,15 +1895,22 @@ class TokenBucket:
         self._penalty_until = 0.0
 
     def _prune(self, now: float) -> None:
-        while self._stamps and self._stamps[0] <= now - self.window_s:
+        # strict: a token taken exactly window_s ago still counts against "N per window"
+        while self._stamps and self._stamps[0] < now - self.window_s:
             self._stamps.popleft()
 
+    def penalized(self, now: float) -> bool:
+        return now < self._penalty_until
+
     def available(self, now: float, priority: bool = False) -> int:
-        """Tokens a caller may take now. Non-priority callers cannot touch the reserve."""
+        """Tokens a caller may take now (may be negative after a penalty). Non-priority callers
+        cannot touch the reserve and see the halved capacity while penalized."""
         self._prune(now)
-        cap = self.capacity // 2 if now < self._penalty_until else self.capacity
-        free = cap - len(self._stamps)
-        return free if priority else free - self.reserve
+        used = len(self._stamps)
+        if priority:
+            return self.capacity - used
+        cap = self.capacity // 2 if self.penalized(now) else self.capacity
+        return cap - used - self.reserve
 
     def try_take(self, now: float, n: int = 1, priority: bool = False) -> bool:
         if self.available(now, priority) < n:
@@ -1847,7 +1920,7 @@ class TokenBucket:
         return True
 
     def penalize(self, now: float, seconds: float) -> None:
-        """Halve capacity for `seconds` (after a 429 / 'too frequent')."""
+        """Halve non-priority capacity for `seconds` (after a 429 / 'too frequent')."""
         self._penalty_until = now + seconds
 
 
@@ -1856,32 +1929,38 @@ class RateBudget:
     or the same bucket when the venue shares one limit across trading endpoints)."""
 
     def __init__(self, limits: RateLimits):
+        self.shared = limits.shared
         self._orders = TokenBucket(limits.orders, limits.window_s, limits.reserve)
         self._cancels = (self._orders if limits.shared
                          else TokenBucket(limits.cancels, limits.window_s, limits.reserve))
 
-    def _bucket(self, kind: str) -> TokenBucket:
-        return self._cancels if kind == "cancel" else self._orders
+    def _bucket(self, kind: Kind) -> TokenBucket:
+        if kind == "cancel":
+            return self._cancels
+        if kind in ("order", "amend"):
+            return self._orders
+        raise ValueError(f"unknown budget kind: {kind!r}")
 
-    def available(self, kind: str, now: float, priority: bool = False) -> int:
+    def available(self, kind: Kind, now: float, priority: bool = False) -> int:
         return self._bucket(kind).available(now, priority)
 
-    def try_take(self, kind: str, now: float, n: int = 1, priority: bool = False) -> bool:
+    def try_take(self, kind: Kind, now: float, n: int = 1, priority: bool = False) -> bool:
         return self._bucket(kind).try_take(now, n, priority)
 
     def penalize(self, now: float, seconds: float = 60.0) -> None:
         self._orders.penalize(now, seconds)
         self._cancels.penalize(now, seconds)
 
-    def to_dict(self, now: float) -> dict:
-        return {"orders_free": self._orders.available(now, priority=True),
-                "cancels_free": self._cancels.available(now, priority=True)}
+    def to_dict(self, now: float) -> dict[str, object]:
+        return {"orders_free": max(0, self._orders.available(now, priority=True)),
+                "cancels_free": max(0, self._cancels.available(now, priority=True)),
+                "shared": self.shared, "penalized": self._orders.penalized(now)}
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_budget.py -q`
-Expected: `3 passed`
+Expected: `7 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -3028,7 +3107,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `61 passed`
+Expected: `67 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -4181,7 +4260,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `75 passed`
+Expected: `81 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -5314,7 +5393,7 @@ Expected: `11 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `89 passed`
+Expected: `95 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -6080,7 +6159,7 @@ Expected: `4 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `96 passed`
+Expected: `102 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -6203,7 +6282,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
