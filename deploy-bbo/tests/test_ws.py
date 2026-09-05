@@ -125,8 +125,10 @@ async def test_quiet_but_ponging_socket_is_kept_at_shipped_defaults():
         return ws
 
     port, runner = await _serve(handler)
-    r = WSRunner(WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: []),
-                 on_items=lambda items: None)
+    a = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [])
+    # a receive timeout under the heartbeat churns idle sockets; above it PONGs reset it so it can never fire
+    assert a.receive_timeout is None and a.heartbeat == 20.0 and a.data_timeout == 120.0
+    r = WSRunner(a, on_items=lambda items: None)
     r.set_instruments(["A"])
     task = asyncio.create_task(r.run())
     assert await _until(lambda: r.connected)

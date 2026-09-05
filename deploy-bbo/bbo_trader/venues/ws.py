@@ -198,8 +198,9 @@ class WSRunner:
                                     await h
                         closes += 1      # escalating sparsity: a venue that starts flapping hours in stays visible
                         log.log(logging.INFO if closes in (1, 10, 100) or closes % 1000 == 0 else logging.DEBUG,
-                                "%s conn %d closed by server #%d (%d insts, lived %.0fs, %d bad frames total)",
-                                a.name, conn_id, closes, len(insts), loop.time() - opened, bad)
+                                "%s conn %d closed #%d (%d insts, lived %.0fs, %d bad frames total)%s",
+                                a.name, conn_id, closes, len(insts), loop.time() - opened, bad,
+                                f" — {ws.exception()!r}" if ws.exception() is not None else " by server")
                     finally:
                         # ws.close() restarts its ws_close timeout for every non-CLOSE frame,
                         # so a venue still streaming while we leave can park this task forever.
