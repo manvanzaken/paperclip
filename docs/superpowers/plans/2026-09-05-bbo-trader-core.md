@@ -960,6 +960,7 @@ class Position:
     entry_spread_pct: float = 0.0
     current_spread_pct: float = 0.0
     peak_spread_pct: float = 0.0
+    stop_ref_spread_pct: float = 0.0   # divergence-stop reference on the (bid_A − ask_B) basis; set on first fresh eval
     entry_time: float = 0.0
     exit_time: float = 0.0
     exit_spread_pct: float = 0.0
@@ -3257,7 +3258,7 @@ from bbo_trader.config import VenueConfig, RateLimits
 from bbo_trader.models import Fees, MAKER_RESTING, OPEN, EXIT_MAKER_RESTING
 from bbo_trader.positions import PositionBook
 from bbo_trader.quotes import QuoteBoard
-from bbo_trader.risk import RiskManager
+from bbo_trader.risk import RiskManager, route_key
 from bbo_trader.strategy import PairEvaluator
 from tests.conftest import make_cfg, mk_bbo, mk_spec, MEXC_FEES, BLOFIN_FEES
 
@@ -3316,9 +3317,9 @@ def test_insane_spread_and_mismatch_guard(tmp_path, clock):
     now = clock()
     board.set(mk_bbo("blofin", SYM, 2.0, 2.001, ts=now))
     board.set(mk_bbo("mexc", SYM, 1.0, 1.001, ts=now))
-    assert ev.evaluate_entry(SYM, 200.0, 0, {}).kind == "NONE" and ev.funnel["insane"] == 2
+    assert ev.evaluate_entry(SYM, 200.0, 0, {}).kind == "NONE" and ev.funnel["insane"] == 1   # once per pair
     assert ev.evaluate_entry(SYM, 200.0, 0, {}).kind == "NONE"
-    assert ev.funnel["mismatch_blacklisted"] == 1 and ev.funnel["mismatch"] == 2
+    assert ev.funnel["mismatch_blacklisted"] == 1 and ev.funnel["mismatch"] == 1
 
 
 def test_route_rule_takes_best_edge_across_three_venues(tmp_path, clock):
@@ -3411,14 +3412,19 @@ def test_exit_triggers_and_tm_exit(tmp_path, clock):
     board.set(mk_bbo("blofin", SYM, 1.0020, 1.0030, ts=clock()))
     board.set(mk_bbo("mexc", SYM, 1.0000, 1.0005, ts=clock()))
     assert ev.evaluate_exit(pos, {}).reason == "timeout"
-    # tm exit disabled -> hold
+    # tm exit disabled -> hold (OPEN) / cancel (a resting exit maker is never orphaned)
     ev3 = PairEvaluator(replace(cfg, tm_exit_enabled=False, max_hold_min=1e9), board, FEES, ev.specs, {}, risk, clock=clock)
     pos.status = OPEN
     assert ev3.evaluate_exit(pos, {}).reason == "hold"
-    # stale while resting -> cancel
     pos.status = EXIT_MAKER_RESTING
+    assert ev3.evaluate_exit(pos, {}) == ev3.evaluate_exit(pos, {})
+    assert ev3.evaluate_exit(pos, {}).kind == "CANCEL" and ev3.evaluate_exit(pos, {}).reason == "tm_exit_disabled"
+    ev4 = PairEvaluator(replace(cfg, exit_maker_venue_policy="gate", max_hold_min=1e9), board, FEES, ev.specs, {}, risk, clock=clock)
+    assert ev4.evaluate_exit(pos, {}).reason == "no_maker_venue"
+    # stale while resting -> cancel (with the time stop out of the way)
+    ev5 = PairEvaluator(replace(cfg, max_hold_min=1e9), board, FEES, ev.specs, {}, risk, clock=clock)
     clock.tick(5)
-    assert ev.evaluate_exit(pos, {}).reason == "stale"
+    assert ev5.evaluate_exit(pos, {}).reason == "stale"
 
 
 def test_scan_rows_for_dashboard(tmp_path, clock):
@@ -3432,6 +3438,136 @@ def test_scan_rows_for_dashboard(tmp_path, clock):
     r = rows[0]
     assert r["symbol"] == SYM and r["short_exchange"] == "blofin" and r["long_exchange"] == "mexc"
     assert r["fees_pct"] == pytest.approx(0.08) and r["is_candidate"] is True and r["mode"] == "TT"
+
+
+def test_timeout_exit_fires_on_stale_quotes_and_unknown_venue_never_raises(tmp_path, clock):
+    cfg, board, risk, ev = build(tmp_path, clock)
+    now = clock()
+    book = PositionBook()
+    pos = book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, entry_spread_pct=0.45, entry_time=now)
+    assert ev.evaluate_exit(pos, {}).reason == "stale"                  # no quotes at all
+    clock.tick(31 * 60)
+    it = ev.evaluate_exit(pos, {})
+    assert it.kind == "TT_EXIT" and it.reason == "timeout"              # a market close needs no quote
+    pos.status = EXIT_MAKER_RESTING
+    assert ev.evaluate_exit(pos, {}).reason == "timeout"                # the executor cancels the maker first
+    # a venue that left the registry: never a KeyError, never an intent the executor cannot carry out
+    ev2 = PairEvaluator(cfg, board, {"blofin": BLOFIN_FEES}, ev.specs, {}, risk, clock=clock)
+    pos.status = OPEN
+    assert ev2.evaluate_exit(pos, {}).reason == "venue_unknown"
+    pos.status = MAKER_RESTING
+    assert ev2.evaluate_resting(pos).reason == "venue_unknown"
+
+
+def test_upgrade_needs_touch_depth_and_requote_waits_for_inflight(tmp_path, clock):
+    cfg, board, risk, ev = build(tmp_path, clock)
+    now = clock()
+    book = PositionBook()
+    pos = book.new(SYM, "blofin", "mexc", MAKER_RESTING, "TM", size_usd=25.0, maker_venue="blofin",
+                   maker_rest_price=1.0061, maker_posted_ts=now)
+    board.set(mk_bbo("blofin", SYM, 1.0060, 1.0065, bq=1.0, ts=now))       # TT edge, but a $1 bid touch
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0010, ts=now))
+    it = ev.evaluate_resting(pos)
+    assert it.kind != "UPGRADE_TT" and ev.funnel["upgrade_depth"] == 1
+    board.set(mk_bbo("blofin", SYM, 1.0060, 1.0065, ts=now))
+    assert ev.evaluate_resting(pos).kind == "UPGRADE_TT"
+    board.set(mk_bbo("blofin", SYM, 1.0041, 1.0065, ts=now))               # peg moved by 4 ticks
+    pos.requote_pending = True                                             # cancel+new requote in flight
+    assert ev.evaluate_resting(pos).reason == "resting"
+    pos.requote_pending = False
+    assert ev.evaluate_resting(pos).kind == "REQUOTE"
+
+
+def test_route_rule_prefers_certain_tt_over_wide_book_tm(tmp_path, clock):
+    cfg = make_cfg(tmp_path)
+    cfg = replace(cfg, venues=cfg.venues + (VenueConfig("gate", "trade", 0.05, 0.02, RateLimits()),))
+    board = QuoteBoard(cfg.stale_quote_s)
+    specs = {v: {SYM: mk_spec(v, SYM)} for v in ("mexc", "blofin", "gate")}
+    ev = PairEvaluator(cfg, board, FEES, specs, {}, RiskManager(cfg, clock), clock=clock)
+    now = clock()
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0005, ts=now))
+    board.set(mk_bbo("gate", SYM, 1.0048, 1.0052, ts=now))                 # tight book: certain TT vs mexc
+    board.set(mk_bbo("blofin", SYM, 1.0030, 1.0075, ts=now))               # 0.45 % wide book: fat-looking TM edge
+    it = ev.evaluate_entry(SYM, 200.0, 0, {})
+    assert it.kind == "TT_ENTER" and (it.venue_a, it.venue_b) == ("gate", "mexc")
+
+
+def test_thin_tt_touch_falls_back_to_tm_and_depth_is_checked_per_side(tmp_path, clock):
+    cfg, board, risk, ev = build(tmp_path, clock)
+    now = clock()
+    board.set(mk_bbo("blofin", SYM, 1.0050, 1.0060, bq=1.0, ts=now))       # TT pays, but selling into a $1 bid
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0008, ts=now))
+    it = ev.evaluate_entry(SYM, 200.0, 0, {})
+    assert it.kind == "TM_ENTER" and it.maker_venue == "blofin" and ev.funnel["tt_depth_fallback"] == 1
+    assert it.spread_pct == pytest.approx((1.0060 - 1.0008) / 1.0008 * 100)   # the TM spread, not the TT one
+    ev_tt = PairEvaluator(replace(cfg, tm_entry_enabled=False), board, FEES, ev.specs, {}, risk, clock=clock)
+    assert ev_tt.evaluate_entry(SYM, 200.0, 0, {}).reason == "no_candidate" and ev_tt.funnel["touch_depth"] == 1
+    board.set(mk_bbo("blofin", SYM, 1.0050, 1.0060, aq=1.0, ts=now))       # thin ASK on the short venue is irrelevant
+    assert ev_tt.evaluate_entry(SYM, 200.0, 0, {}).kind == "TT_ENTER"
+    board.set(mk_bbo("blofin", SYM, 1.0050, 1.0060, ts=now))
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0008, aq=1.0, ts=now))         # buying a $1 ask on the long venue
+    assert ev_tt.evaluate_entry(SYM, 200.0, 0, {}).reason == "no_candidate" and ev_tt.funnel["touch_depth"] == 2
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0008, ts=now))
+    assert ev_tt.evaluate_entry(SYM, 1000.0, 0, {}).size_usd == 25.0       # capped at max_position_usd
+    # funding gate is wired: an unfavourable net inside the window blocks the route
+    risk.set_funding("blofin", {SYM: (0.0001, now + 300)})
+    risk.set_funding("mexc", {SYM: (0.0005, now + 300)})
+    assert ev_tt.evaluate_entry(SYM, 200.0, 0, {}).reason == "no_candidate" and ev_tt.funnel["funding"] == 1
+    # edge_gone timer resets when a price reappears
+    book = PositionBook()
+    pos = book.new(SYM, "blofin", "mexc", MAKER_RESTING, "TM", size_usd=25.0, maker_venue="blofin",
+                   maker_rest_price=1.0061, maker_posted_ts=now)
+    ev6 = PairEvaluator(replace(cfg, improve_ticks=1, tt_enabled=False), board, FEES, ev.specs, {}, risk, clock=clock)
+    board.set(mk_bbo("blofin", SYM, 1.0064, 1.0065, ts=now))               # one-tick book: no postable price
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0010, ts=now))
+    assert ev6.evaluate_resting(pos).reason == "edge_gone_wait" and pos.edge_gone_since == now
+    board.set(mk_bbo("blofin", SYM, 1.0041, 1.0065, ts=now))               # price back -> timer reset
+    ev6.evaluate_resting(pos)
+    assert pos.edge_gone_since == 0.0
+    clock.tick(0.35)
+    board.set(mk_bbo("blofin", SYM, 1.0064, 1.0065, ts=clock()))
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0010, ts=clock()))
+    assert ev6.evaluate_resting(pos).reason == "edge_gone_wait"            # not an immediate cancel
+
+
+def test_tm_exit_hedge_depth_and_stop_uses_tt_basis(tmp_path, clock):
+    cfg, board, risk, ev = build(tmp_path, clock)
+    now = clock()
+    book = PositionBook()
+    pos = book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, entry_spread_pct=0.45, entry_time=now)
+    board.set(mk_bbo("blofin", SYM, 1.0020, 1.0030, ts=now))
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0005, bq=1.0, ts=now))         # hedge = SELL mexc into a $1 bid
+    assert ev.evaluate_exit(pos, {}).reason == "hedge_depth"
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0005, ts=now))
+    assert ev.evaluate_exit(pos, {}).kind == "TM_EXIT"
+    # a TM-entered position: entry_spread_pct (0.75, maker basis) is one touch width above the TT basis
+    tm = book.new(SYM, "blofin", "mexc", OPEN, "TM", size_usd=25.0, entry_spread_pct=0.75, entry_time=now)
+    board.set(mk_bbo("blofin", SYM, 1.0050, 1.0070, ts=now))
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0005, ts=now))
+    assert ev.evaluate_exit(tm, {}).kind != "TT_EXIT"
+    assert tm.stop_ref_spread_pct == pytest.approx((1.0050 - 1.0005) / 1.0005 * 100)   # 0.4498 on the TT basis
+    board.set(mk_bbo("blofin", SYM, 1.0210, 1.0230, ts=now))               # s_now 2.049: >= 0.45 + 1.5, < 0.75 + 1.5
+    assert ev.evaluate_exit(tm, {}).reason == "stop"
+
+
+def test_scan_skips_blacklisted_and_insane_pairs_and_sorts_by_edge(tmp_path, clock):
+    cfg, board, risk, ev = build(tmp_path, clock)
+    now = clock()
+    for v in ("blofin", "mexc"):
+        for sym in ("BIGUSDT", "BADUSDT", "MISUSDT"):
+            ev.specs[v][sym] = mk_spec(v, sym)
+    board.set(mk_bbo("blofin", SYM, 1.0050, 1.0060, ts=now))
+    board.set(mk_bbo("mexc", SYM, 1.0000, 1.0008, ts=now))
+    board.set(mk_bbo("blofin", "BIGUSDT", 1.0500, 1.0510, ts=now))       # richer edge -> first row
+    board.set(mk_bbo("mexc", "BIGUSDT", 1.0000, 1.0008, ts=now))
+    board.set(mk_bbo("blofin", "BADUSDT", 2.0, 2.001, ts=now))           # insane 2x: never a scanner row
+    board.set(mk_bbo("mexc", "BADUSDT", 1.0, 1.001, ts=now))
+    board.set(mk_bbo("blofin", "MISUSDT", 1.0050, 1.0060, ts=now))
+    board.set(mk_bbo("mexc", "MISUSDT", 1.0000, 1.0008, ts=now))
+    risk.mismatch.blacklist(route_key("MISUSDT", "blofin", "mexc"))
+    rows = ev.scan([SYM, "BIGUSDT", "BADUSDT", "MISUSDT"])
+    assert [r["symbol"] for r in rows] == ["BIGUSDT", SYM]
+    assert rows[1]["price_short"] == 1.0050 and rows[1]["price_long"] == 1.0008 and rows[0]["edge_pct"] > rows[1]["edge_pct"]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3445,25 +3581,50 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.strategy'`
 """PairEvaluator: turns fresh quotes into Intents.
 
 - evaluate_entry: every ordered pair of TRADE venues with a fresh quote for the symbol; gates run
-  cheapest-first and every rejection increments the funnel; the best-edge route wins (spec "Route rule").
-- evaluate_resting: manage an entry maker order (upgrade to TT, requote, cancel on TTL/edge-gone/stale).
-- evaluate_exit: TT exit triggers (convergence/timeout/stop), TM exit posting and requoting.
-- scan: best route per symbol for the dashboard's spread_scanner section.
+  cheapest-first and every rejection increments the funnel. Routes are ranked TT before TM, then by
+  surplus over the mode's own bar (spec "Route rule" + TT priority): a certain taker/taker fill beats a
+  wider-looking maker edge, which is inflated by the maker venue's touch width and carries fill risk.
+  A TT route whose taker legs would sweep a thin touch falls back to TM on the same pair.
+- evaluate_resting: manage an entry maker order — upgrade to TT (same touch-depth gate as an entry),
+  requote (suppressed while a requote is in flight), cancel on TTL / edge gone / stale quotes.
+- evaluate_exit: the time stop fires even on stale quotes (a market close needs no quote); TT exit
+  triggers (convergence, divergence stop on the (bid_A − ask_B) basis); TM exit posting gated on the
+  hedge touch; requoting. Exit makers have no TTL by design: they rest until convergence/timeout/stop
+  or until the peg disappears.
+- scan: best route per symbol for the dashboard's spread_scanner (trade venues only in Plan 1;
+  quote-only venues join the scanner with Plan 3), skipping mismatch-blacklisted and insane pairs.
+Never raises on a position whose venue left the registry: returns NONE/"venue_unknown" and logs once
+(the App refuses to start live with such a position, see App.load_state).
 Side effects are limited to funnel counts and the mismatch guard (entry) and the position's
-current/peak spread and edge-gone timer (resting/exit)."""
+current/peak spread, stop reference and edge-gone timer (resting/exit)."""
 from __future__ import annotations
 
+import logging
 import time
 from collections import Counter
+from dataclasses import replace
+from functools import cached_property
 from itertools import permutations
 from typing import Iterable
 
 from .config import Config
-from .edge import (EdgeParams, evaluate_pair, maker_entry_price, maker_exit_price, exit_spread_tt,
-                   needs_requote, best_fee_venue, spread_pct)
-from .models import BBO, Fees, Intent, Position, VenueSpec, none, OPEN, EXIT_MAKER_RESTING
+from .edge import (EdgeParams, PairEval, evaluate_pair, choose_mode, maker_entry_price, maker_exit_price,
+                   exit_spread_tt, needs_requote, best_fee_venue, spread_pct)
+from .models import BBO, Fees, Intent, Position, VenueSpec, none, EXIT_MAKER_RESTING
 from .quotes import QuoteBoard
 from .risk import RiskManager, route_key
+
+log = logging.getLogger("bbo.strategy")
+
+DEFAULT_MIN_REQUOTE_MS = 500
+
+
+def raw_mid_spread_pct(qa: BBO, qb: BBO) -> float:
+    """Direction-free |mid_A − mid_B| / min(mid) in percent: the mismatch guard's and sanity gate's input."""
+    lo = min(qa.mid, qb.mid)
+    if not lo > 0.0:
+        return float("inf")
+    return abs(qa.mid - qb.mid) / lo * 100.0
 
 
 class PairEvaluator:
@@ -3480,12 +3641,18 @@ class PairEvaluator:
         self.funnel = funnel if funnel is not None else Counter()
         self.trade_venues = list(trade_venues if trade_venues is not None else cfg.trade_venues)
         self.clock = clock
+        self._venue_cfgs = {v.name: v for v in cfg.venues}
+        self._warned: set[int] = set()
 
-    @property
-    def params(self) -> EdgeParams:
+    @cached_property
+    def params(self) -> EdgeParams:          # cfg is frozen; an evaluator is never re-configured in place
         c = self.cfg
         return EdgeParams(c.min_edge_pct, c.tm_extra_edge_pct, c.exit_spread_pct, c.slip_pct,
                           c.tt_enabled, c.tm_entry_enabled, c.maker_venue_policy)
+
+    @cached_property
+    def _tm_params(self) -> EdgeParams:
+        return replace(self.params, tt_enabled=False)
 
     def spec(self, venue: str, symbol: str) -> VenueSpec | None:
         return self.specs.get(venue, {}).get(symbol)
@@ -3496,6 +3663,24 @@ class PairEvaluator:
 
     def size_for(self, equity: float) -> float:
         return min(self.cfg.max_position_usd, equity * self.cfg.position_size_pct)
+
+    def _min_gap_s(self, venue: str) -> float:
+        vc = self._venue_cfgs.get(venue)
+        return (vc.min_requote_ms if vc is not None else DEFAULT_MIN_REQUOTE_MS) / 1000.0
+
+    def _bar(self, pe: PairEval) -> float:
+        c = self.cfg
+        return c.min_edge_pct if pe.mode == "TT" else c.min_edge_pct + c.tm_extra_edge_pct
+
+    def _venue_unknown(self, pos: Position) -> bool:
+        missing = {v for v in (pos.venue_a, pos.venue_b, pos.maker_venue) if v and v not in self.fees}
+        if not missing:
+            return False
+        if pos.id not in self._warned:
+            self._warned.add(pos.id)
+            log.error("VENUE_UNKNOWN #%d %s: %s not in the registry — position cannot be managed",
+                      pos.id, pos.symbol, sorted(missing))
+        return True
 
     def _fresh_trade_quotes(self, symbol: str, now: float) -> list[BBO]:
         out = []
@@ -3509,6 +3694,7 @@ class PairEvaluator:
                        resting_counts: dict[str, int]) -> Intent:
         now = self.clock()
         cfg = self.cfg
+        self.funnel["evaluated"] += 1
         size = self.size_for(equity)
         if size < cfg.min_position_usd:
             self.funnel["size_below_min"] += 1
@@ -3517,29 +3703,36 @@ class PairEvaluator:
         if len(quotes) < 2:
             self.funnel["no_pair"] += 1
             return none("no_pair")
+        need = size * cfg.touch_depth_mult
         best: Intent | None = None
+        best_rank: tuple[int, float] | None = None
+        volume_unknown: set[str] = set()
         for qa, qb in permutations(quotes, 2):
-            raw = spread_pct(qa.mid, qb.mid)
+            first = qa.venue < qb.venue                 # pair-symmetric gates count once per unordered pair
             rk = route_key(symbol, qa.venue, qb.venue)
-            if qa.venue < qb.venue and self.risk.mismatch.observe(rk, raw):   # once per unordered pair
+            raw = raw_mid_spread_pct(qa, qb)
+            if first and self.risk.mismatch.observe(rk, raw):
                 self.funnel["mismatch_blacklisted"] += 1
             if self.risk.mismatch.is_blacklisted(rk):
-                self.funnel["mismatch"] += 1
+                if first:
+                    self.funnel["mismatch"] += 1
                 continue
-            if abs(raw) > cfg.max_sane_spread_pct:
-                self.funnel["insane"] += 1
+            if raw > cfg.max_sane_spread_pct:
+                if first:
+                    self.funnel["insane"] += 1
                 continue
             fa, fb = self.fees[qa.venue], self.fees[qb.venue]
             pe = evaluate_pair(qa, qb, fa, fb, self.params)
             if pe.mode == "":
                 self.funnel["below_edge"] += 1
                 continue
-            need = size * cfg.touch_depth_mult
-            if pe.mode == "TT":
-                if qa.touch_notional("sell") < need or qb.touch_notional("buy") < need:
+            if pe.mode == "TT" and (qa.touch_notional("sell") < need or qb.touch_notional("buy") < need):
+                pe = choose_mode(pe, self._tm_params)   # the taker legs would sweep a thin touch: try TM here
+                if pe.mode == "":
                     self.funnel["touch_depth"] += 1
                     continue
-            else:
+                self.funnel["tt_depth_fallback"] += 1
+            if pe.mode == "TM":
                 hedge_touch = qb.touch_notional("buy") if pe.maker_venue == qa.venue else qa.touch_notional("sell")
                 if hedge_touch < need:
                     self.funnel["touch_depth"] += 1
@@ -3550,8 +3743,11 @@ class PairEvaluator:
             thin = False
             for v in (qa.venue, qb.venue):
                 vol = self.volumes.get(v, {}).get(symbol)
-                if vol is not None and vol < cfg.min_volume_usd:
+                if vol is None:
+                    volume_unknown.add(v)                # the gate fails open, but visibly
+                elif vol < cfg.min_volume_usd:
                     thin = True
+                    break
             if thin:
                 self.funnel["volume"] += 1
                 continue
@@ -3569,11 +3765,18 @@ class PairEvaluator:
                 if px is None:
                     self.funnel["maker_price"] += 1
                     continue
-            if best is None or pe.edge > best.edge_pct:
+            rank = (1 if pe.mode == "TT" else 0, pe.edge - self._bar(pe))
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                if pe.mode == "TT":
+                    spread = pe.spread_tt
+                else:
+                    spread = pe.spread_tm_a if pe.maker_venue == qa.venue else pe.spread_tm_b
                 best = Intent(kind="TT_ENTER" if pe.mode == "TT" else "TM_ENTER",
                               reason=f"edge={pe.edge:.3f}", symbol=symbol,
                               venue_a=qa.venue, venue_b=qb.venue, maker_venue=pe.maker_venue,
-                              rest_price=px, size_usd=size, edge_pct=pe.edge, spread_pct=pe.spread_tt, ts=now)
+                              rest_price=px, size_usd=size, edge_pct=pe.edge, spread_pct=spread, ts=now)
+        self.funnel["volume_unknown"] += len(volume_unknown)
         if best is None:
             return none("no_candidate")
         self.funnel["candidate"] += 1
@@ -3583,6 +3786,8 @@ class PairEvaluator:
     def evaluate_resting(self, pos: Position) -> Intent:
         now = self.clock()
         cfg = self.cfg
+        if self._venue_unknown(pos):
+            return none("venue_unknown")
         qa = self.board.fresh(pos.venue_a, pos.symbol, now)
         qb = self.board.fresh(pos.venue_b, pos.symbol, now)
         base = dict(symbol=pos.symbol, venue_a=pos.venue_a, venue_b=pos.venue_b, maker_venue=pos.maker_venue, ts=now)
@@ -3593,8 +3798,11 @@ class PairEvaluator:
         fa, fb = self.fees[pos.venue_a], self.fees[pos.venue_b]
         pe = evaluate_pair(qa, qb, fa, fb, self.params)
         if cfg.tt_enabled and pe.edge_tt >= cfg.min_edge_pct:
-            return Intent(kind="UPGRADE_TT", reason=f"edge_tt={pe.edge_tt:.3f}", size_usd=pos.size_usd,
-                          edge_pct=pe.edge_tt, spread_pct=pe.spread_tt, **base)
+            need = pos.size_usd * cfg.touch_depth_mult
+            if qa.touch_notional("sell") >= need and qb.touch_notional("buy") >= need:
+                return Intent(kind="UPGRADE_TT", reason=f"edge_tt={pe.edge_tt:.3f}", size_usd=pos.size_usd,
+                              edge_pct=pe.edge_tt, spread_pct=pe.spread_tt, **base)
+            self.funnel["upgrade_depth"] += 1             # a TT edge on a thin touch: keep resting instead
         px = maker_entry_price(qa, qb, fa, fb, self.params, pos.maker_venue,
                                self.tick(pos.maker_venue, pos.symbol), cfg.improve_ticks)
         if px is None:
@@ -3605,9 +3813,9 @@ class PairEvaluator:
                 return Intent(kind="CANCEL", reason="edge_gone", **base)
             return none("edge_gone_wait")
         pos.edge_gone_since = 0.0
-        min_gap = cfg.venue(pos.maker_venue).min_requote_ms / 1000.0
-        if (needs_requote(pos.maker_rest_price, px, self.tick(pos.maker_venue, pos.symbol), cfg.requote_ticks)
-                and now - pos.maker_last_requote_ts >= min_gap):
+        if (not pos.requote_pending
+                and needs_requote(pos.maker_rest_price, px, self.tick(pos.maker_venue, pos.symbol), cfg.requote_ticks)
+                and now - pos.maker_last_requote_ts >= self._min_gap_s(pos.maker_venue)):
             return Intent(kind="REQUOTE", reason="peg_moved", rest_price=px, **base)
         return none("resting")
 
@@ -3621,44 +3829,57 @@ class PairEvaluator:
     def evaluate_exit(self, pos: Position, resting_counts: dict[str, int]) -> Intent:
         now = self.clock()
         cfg = self.cfg
+        base = dict(symbol=pos.symbol, venue_a=pos.venue_a, venue_b=pos.venue_b, ts=now)
+        resting = pos.status == EXIT_MAKER_RESTING
+        if self._venue_unknown(pos):
+            return none("venue_unknown")
+        if now - pos.entry_time >= cfg.max_hold_min * 60.0:   # a market close on both legs needs no quote
+            return Intent(kind="TT_EXIT", reason="timeout", spread_pct=pos.current_spread_pct, **base)
         qa = self.board.fresh(pos.venue_a, pos.symbol, now)
         qb = self.board.fresh(pos.venue_b, pos.symbol, now)
-        base = dict(symbol=pos.symbol, venue_a=pos.venue_a, venue_b=pos.venue_b, ts=now)
         if qa is None or qb is None:
-            if pos.status == EXIT_MAKER_RESTING:
+            if resting:
                 return Intent(kind="CANCEL", reason="stale", maker_venue=pos.maker_venue, **base)
             return none("stale")
         x = exit_spread_tt(qa, qb)
         s_now = spread_pct(qa.bid, qb.ask)
         pos.current_spread_pct = s_now
         pos.peak_spread_pct = max(pos.peak_spread_pct, s_now)
+        if pos.stop_ref_spread_pct == 0.0:
+            # the stop reference must sit on the same (bid_A − ask_B) basis as s_now: a TM fill's
+            # entry_spread_pct is one touch width higher and would loosen the stop by that width
+            pos.stop_ref_spread_pct = pos.entry_spread_pct if pos.mode == "TT" else s_now
         reason = ""
         if x <= cfg.exit_spread_pct:
             reason = "convergence"
-        elif now - pos.entry_time >= cfg.max_hold_min * 60.0:
-            reason = "timeout"
-        elif s_now >= pos.entry_spread_pct + cfg.stop_pct:
+        elif s_now >= pos.stop_ref_spread_pct + cfg.stop_pct:
             reason = "stop"
         if reason:
             return Intent(kind="TT_EXIT", reason=reason, spread_pct=x, **base)
-        if not cfg.tm_exit_enabled:
-            return none("hold")
-        mv = self.exit_maker_venue(pos)
+        mv = self.exit_maker_venue(pos) if cfg.tm_exit_enabled else ""
         if not mv:
+            if resting:                                  # never orphan a resting exit maker
+                why = "tm_exit_disabled" if not cfg.tm_exit_enabled else "no_maker_venue"
+                return Intent(kind="CANCEL", reason=why, maker_venue=pos.maker_venue, **base)
             return none("hold")
         px = maker_exit_price(qa, qb, cfg.exit_spread_pct, mv, self.tick(mv, pos.symbol), cfg.improve_ticks)
-        if pos.status == OPEN:
+        if not resting:                                  # OPEN: post a take-profit maker?
             if px is None:
                 return none("hold")
+            hedge_touch = qb.touch_notional("sell") if mv == pos.venue_a else qa.touch_notional("buy")
+            if hedge_touch < pos.size_usd * cfg.touch_depth_mult:
+                return none("hedge_depth")
             if resting_counts.get(mv, 0) >= cfg.max_resting_makers_per_venue:
                 return none("maker_slots")
             return Intent(kind="TM_EXIT", reason="take_profit", maker_venue=mv, rest_price=px, spread_pct=x, **base)
         # EXIT_MAKER_RESTING: keep the peg current
-        if px is None or mv != pos.maker_venue:
+        if mv != pos.maker_venue:
+            return Intent(kind="CANCEL", reason="venue_changed", maker_venue=pos.maker_venue, **base)
+        if px is None:
             return Intent(kind="CANCEL", reason="edge_gone", maker_venue=pos.maker_venue, **base)
-        min_gap = cfg.venue(mv).min_requote_ms / 1000.0
-        if (needs_requote(pos.maker_rest_price, px, self.tick(mv, pos.symbol), cfg.requote_ticks)
-                and now - pos.maker_last_requote_ts >= min_gap):
+        if (not pos.requote_pending
+                and needs_requote(pos.maker_rest_price, px, self.tick(mv, pos.symbol), cfg.requote_ticks)
+                and now - pos.maker_last_requote_ts >= self._min_gap_s(mv)):
             return Intent(kind="REQUOTE", reason="peg_moved", maker_venue=mv, rest_price=px, **base)
         return none("resting")
 
@@ -3670,35 +3891,39 @@ class PairEvaluator:
             quotes = self._fresh_trade_quotes(symbol, now)
             best = None
             for qa, qb in permutations(quotes, 2):
+                if self.risk.mismatch.is_blacklisted(route_key(symbol, qa.venue, qb.venue)):
+                    continue
+                if raw_mid_spread_pct(qa, qb) > self.cfg.max_sane_spread_pct:
+                    continue
                 pe = evaluate_pair(qa, qb, self.fees[qa.venue], self.fees[qb.venue], self.params)
                 score = max(pe.edge_tt, pe.edge_tm_a, pe.edge_tm_b)
                 if best is None or score > best[0]:
                     best = (score, pe, qa, qb)
             if best is None:
                 continue
-            _score, pe, qa, qb = best
+            score, pe, qa, qb = best
             fees = self.fees[qa.venue].taker + self.fees[qb.venue].taker
             rows.append({"symbol": symbol, "short_exchange": qa.venue, "long_exchange": qb.venue,
                          "short_instrument": "PERP", "long_instrument": "PERP",
                          "spread_pct": round(pe.spread_tt, 4), "fees_pct": round(fees, 4),
                          "net_spread_pct": round(pe.spread_tt - fees, 4),
                          "price_short": qa.bid, "price_long": qb.ask,
-                         "edge_tt_pct": round(pe.edge_tt, 4),
+                         "edge_pct": round(score, 4), "edge_tt_pct": round(pe.edge_tt, 4),
                          "edge_tm_pct": round(max(pe.edge_tm_a, pe.edge_tm_b), 4),
                          "mode": pe.mode, "is_candidate": pe.mode != ""})
-        rows.sort(key=lambda r: r["spread_pct"], reverse=True)
+        rows.sort(key=lambda r: r["edge_pct"], reverse=True)
         return rows[:limit]
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_strategy.py -q`
-Expected: `7 passed`
+Expected: `13 passed`
 
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `74 passed`
+Expected: `80 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -4851,7 +5076,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `88 passed`
+Expected: `94 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -5599,7 +5824,7 @@ class Executor:
             return None
         return pos
 
-    async def _post_maker(self, pos: Position, reduce_only: bool) -> bool:
+    async def _post_maker(self, pos: Position, reduce_only: bool, keep_posted_ts: bool = False) -> bool:
         v = self.venues[pos.maker_venue]
         now = self.clock()
         if not v.budget.try_take("order", now):
@@ -5609,7 +5834,8 @@ class Executor:
         self._tracks[cid] = LegTrack(pos.id, "maker", v.name, pos.symbol, pos.maker_qty, now)
         pos.maker_client_id = cid
         pos.client_ids["maker"] = cid
-        pos.maker_posted_ts = now
+        if not (keep_posted_ts and pos.maker_posted_ts > 0.0):
+            pos.maker_posted_ts = now          # a cancel+new requote keeps the original TTL clock
         pos.maker_last_requote_ts = now
         pos.maker_cancel_sent = False
         pos.maker_filled_qty = 0.0
@@ -5643,13 +5869,14 @@ class Executor:
         if v.trading.supports_amend:
             if not v.budget.try_take("amend", now):
                 return
+            pos.maker_last_requote_ts = now    # stamped on the attempt: a failing amend must not retry every quote
             ack = await v.trading.amend(pos.symbol, pos.maker_client_id, pos.maker_order_id, new_price)
             if ack.ok:
                 log.info("TM_REQUOTE #%d %s %s -> %s", pos.id, v.name, pos.maker_rest_price, new_price)
                 pos.maker_rest_price = new_price
-                pos.maker_last_requote_ts = now
             else:
                 self._note_rate_limit(v.name, ack.error)
+                log.info("TM_REQUOTE_FAILED #%d %s: %s", pos.id, v.name, ack.error)
             return
         if v.budget.available("cancel", now) < 1 or v.budget.available("order", now) < 1:
             return
@@ -5821,7 +6048,7 @@ class Executor:
                 if pos.requote_pending and pos.status == MAKER_RESTING:
                     pos.requote_pending = False
                     pos.maker_rest_price = pos.requote_price
-                    if await self._post_maker(pos, reduce_only=False):
+                    if await self._post_maker(pos, reduce_only=False, keep_posted_ts=True):
                         return
                 if pos.upgrade_pending and pos.status == MAKER_RESTING:
                     pos.upgrade_pending = False
@@ -5984,7 +6211,7 @@ Expected: `11 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `102 passed`
+Expected: `108 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -6204,10 +6431,11 @@ git commit -m "feat(bbo): Telegram send + /stop /start /close_all /status comman
 import asyncio
 import json
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
-from bbo_trader.app import App
+from bbo_trader.app import App, VenueMissing
 from bbo_trader.main import legacy_bot_running
 from bbo_trader.models import OPEN, CLOSED, MAKER_RESTING
 from bbo_trader.positions import StateStore, StateCorrupt
@@ -6308,6 +6536,23 @@ async def test_live_refuses_corrupt_state_and_paper_falls_back_to_backup(tmp_pat
     live = build_app(tmp_path, mode="live")
     with pytest.raises(StateCorrupt):
         live.load_state()
+
+
+async def test_venue_missing_check_and_drive_guard(tmp_path, caplog):
+    app = build_app(tmp_path)
+    pos = app.book.new(SYM, "gate", "mexc", OPEN, "TT", size_usd=25.0, entry_time=app.clock())
+    app._check_position_venues()                                   # paper: booked closed, not counted as a trade
+    assert pos.status == CLOSED and pos.exit_reason == "venue_removed" and app.book.total_trades == 0
+    app.book.new(SYM, "gate", "mexc", OPEN, "TT", size_usd=25.0, entry_time=app.clock())
+    app.cfg = replace(app.cfg, mode="live")
+    with pytest.raises(VenueMissing):
+        app._check_position_venues()                               # live: refuse to start, the venue holds it
+    app.cfg = replace(app.cfg, mode="paper")
+    app._check_position_venues()
+    app.book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, entry_time=app.clock())
+    app.evaluator.evaluate_exit = lambda *a, **k: 1 / 0            # one broken position...
+    await app.sweep_once()                                         # ...stops neither the sweep nor the heartbeat
+    assert (tmp_path / "heartbeat_paper").exists() and "DRIVE_ERROR" in caplog.text
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -6397,6 +6642,10 @@ from .venues.sim import SimVenue
 log = logging.getLogger("bbo.app")
 
 
+class VenueMissing(RuntimeError):
+    """A restored open position references a venue the registry cannot trade on."""
+
+
 class App:
     def __init__(self, cfg: Config, venues: dict[str, Venue], board: QuoteBoard, book: PositionBook,
                  risk: RiskManager, metrics: Metrics, executor: Executor, evaluator: PairEvaluator,
@@ -6464,6 +6713,12 @@ class App:
             self._pending_entries.discard(intent.symbol)
 
     def _drive(self, pos: Position) -> None:
+        try:
+            self._drive_unguarded(pos)
+        except Exception:  # noqa: BLE001 — one bad position must not stop the sweep, the feed or the heartbeat
+            log.exception("DRIVE_ERROR #%d %s", pos.id, pos.symbol)
+
+    def _drive_unguarded(self, pos: Position) -> None:
         if pos.status == MAKER_RESTING:
             it = self.evaluator.evaluate_resting(pos)
         elif pos.status in (OPEN, EXIT_MAKER_RESTING):
@@ -6580,7 +6835,23 @@ class App:
             return
         self.book.load(d)
         self.risk.load(d.get("risk") or {})
+        self._check_position_venues()
         log.info("STATE loaded: %d open, %d closed, pnl=$%.2f", len(self.book.open), len(self.book.closed), self.book.total_pnl_usd)
+
+    def _check_position_venues(self) -> None:
+        """An open position on a venue that is no longer tradeable (role changed to off/quote_only, keys
+        removed) cannot be managed. Live: refuse to start — the venue still holds it. Paper: book it closed."""
+        now = self.clock()
+        for pos in list(self.book.open):
+            bad = sorted({v for v in (pos.venue_a, pos.venue_b, pos.maker_venue)
+                          if v and not (v in self.venues and self.venues[v].tradeable)})
+            if not bad:
+                continue
+            if self.cfg.mode == "live":
+                raise VenueMissing(f"open position #{pos.id} {pos.symbol} on non-tradeable venue(s) {bad}: "
+                                   f"re-enable the venue or flatten it by hand")
+            log.error("VENUE_MISSING #%d %s on %s — paper mode: booked closed", pos.id, pos.symbol, bad)
+            self.book.close(pos, "venue_removed", now, counts_as_trade=False)
 
     # ---- operator commands ---------------------------------------------------------------
     async def handle_command(self, cmd: str) -> None:
@@ -6687,7 +6958,7 @@ from pathlib import Path
 
 import aiohttp
 
-from .app import App
+from .app import App, VenueMissing
 from .config import Config, load_config
 from .execution import Executor
 from .metrics import Metrics
@@ -6756,6 +7027,9 @@ async def run(cfg: Config) -> int:
         except StateCorrupt as e:
             log.critical("REFUSED: state file corrupt (%s) — inspect real_state.json / .bak, repair, then restart", e)
             return 3
+        except VenueMissing as e:
+            log.error("VENUE_MISSING %s", e)
+            return 4
     return 0
 
 
@@ -6772,12 +7046,12 @@ if __name__ == "__main__":
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_app.py -q`
-Expected: `5 passed`
+Expected: `6 passed`
 
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `110 passed`
+Expected: `117 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -6900,7 +7174,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
