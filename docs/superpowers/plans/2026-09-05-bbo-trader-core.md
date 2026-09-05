@@ -2538,7 +2538,7 @@ git commit -m "feat(bbo): position state machine, PositionBook, atomic StateStor
 - Modify: `deploy-bbo/tests/conftest.py` (append `make_cfg`)
 - Test: `deploy-bbo/tests/test_risk.py`
 
-- [ ] **Step 1: Append the `make_cfg` helper to `tests/conftest.py`**
+- [x] **Step 1: Append the `make_cfg` helper to `tests/conftest.py`**
 
 Append at the end of the file:
 
@@ -2557,7 +2557,7 @@ def make_cfg(tmp_path=None, **over):
     return Config(**kw)
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 `tests/test_risk.py`:
 
@@ -2694,6 +2694,9 @@ def test_non_file_and_undeletable_flags(tmp_path, clock, caplog):
         assert r.check_flags() is None and r.halted                     # ...then ignored: it must not undo a later halt
     finally:
         tmp_path.chmod(0o755)
+    os.symlink(tmp_path / "nope", tmp_path / "stop.flag")               # a dangling symlink is still a stop
+    r.resume()
+    assert r.check_flags() == "halt" and r.halted and not (tmp_path / "stop.flag").is_symlink()
 
 
 def test_funding_gate_net_of_both_legs(tmp_path, clock):
@@ -2767,26 +2770,29 @@ def test_load_tolerates_corrupt_and_legacy_state(tmp_path, clock):
     r = RiskManager(make_cfg(tmp_path), clock)
     now = clock()
     r.load({"pair_blacklist": {"k": "soon", "ok": now + 100},
-            "pair_strikes": {"k": None, "old": 1, "immortal": {"n": 1, "ts": float("inf")}},
+            "pair_strikes": {"k": None, "old": 1, "immortal": {"n": 1, "ts": float("inf")}, "inf": float("inf")},
             "cooldowns": None,
             "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1},
                            "r": {"wins": 1, "losses": 4, "total_pnl": float("inf"),
-                                 "recent": [[now, False], [float("inf"), False], ["x", 1, 2], [now, True]]}},
+                                 "recent": [[now, False], [float("inf"), False], ["x", 1, 2], [now, True]]},
+                           "s": {"wins": 1, "losses": 4, "recent": 5},          # non-iterable: entry dropped, route kept
+                           "t": {"wins": float("inf")}},                        # int(inf): OverflowError must not escape
             "mismatch_blacklist": ["legacy|a|b"], "venue_symbol_blacklist": "notalist", "halted": 1})
     assert r.pair_blacklist == {"ok": now + 100} and r.pair_strikes == {"old": {"n": 1, "ts": now}}
     assert r.cooldowns == {} and "p" not in r.pair_stats and r.pair_stats["q"]["recent"] == []
     assert r.pair_stats["r"]["recent"] == [[now, False], [now, True]] and r.pair_stats["r"]["total_pnl"] == 0.0
+    assert r.pair_stats["s"]["recent"] == [] and r.pair_stats["s"]["losses"] == 4 and "t" not in r.pair_stats
     assert r.mismatch.is_blacklisted("legacy|a|b") and r.venue_symbol_blacklist == set() and r.halted
     r.load("garbage")                                                   # not even an object: fresh state, no raise
     assert not r.halted and r.pair_blacklist == {}
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_risk.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.risk'`
 
-- [ ] **Step 4: Implement `bbo_trader/risk.py`**
+- [x] **Step 4: Implement `bbo_trader/risk.py`**
 
 ```python
 """Risk: manual halt, blacklists and strikes, mismatch guard, balances, funding gate.
@@ -2854,7 +2860,7 @@ def _strikes_from(raw: object, now: float, decay_s: float) -> dict[str, dict]:
                 n, ts = int(v.get("n", 0)), float(v.get("ts", now))
             else:
                 n, ts = int(v), now            # legacy bare count: starts decaying from this load
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):   # OverflowError: int(inf) from a JSON `Infinity`
             log.warning("RISK_STATE_DROP pair_strikes %r=%r", k, v)
             continue
         if n > 0 and math.isfinite(ts) and now - ts <= decay_s:   # an inf/NaN stamp would make a strike immortal
@@ -2870,7 +2876,11 @@ def _stats_from(raw: object) -> dict[str, dict]:
     for k, v in raw.items():
         try:
             recent = []
-            for item in (v.get("recent") or []):
+            raw_recent = v.get("recent") or []
+            if not isinstance(raw_recent, (list, tuple)):
+                log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, raw_recent)
+                raw_recent = []
+            for item in raw_recent:
                 try:
                     ts, won = item
                     ts = float(ts)
@@ -2878,12 +2888,12 @@ def _stats_from(raw: object) -> dict[str, dict]:
                         recent.append([ts, bool(won)])
                     else:
                         log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
             total = float(v.get("total_pnl", 0.0))
             out[str(k)] = {"wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
                            "total_pnl": total if math.isfinite(total) else 0.0, "recent": recent[-RECENT_OUTCOMES_KEEP:]}
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError, OverflowError):
             log.warning("RISK_STATE_DROP pair_stats %r=%r", k, v)
     return out
 
@@ -2978,7 +2988,7 @@ class RiskManager:
     @staticmethod
     def _signature(p: Path) -> tuple[int, int] | None:
         try:
-            st = p.stat()
+            st = p.lstat()             # lstat: a dangling symlink named stop.flag is still a stop
         except OSError:
             return None
         return st.st_ino, st.st_mtime_ns
@@ -3213,12 +3223,12 @@ class RiskManager:
         self.mismatch.blacklisted = _mismatch_from(d.get("mismatch_blacklist"))
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_risk.py -q`
 Expected: `9 passed`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/risk.py deploy-bbo/tests/test_risk.py deploy-bbo/tests/conftest.py
@@ -6890,7 +6900,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

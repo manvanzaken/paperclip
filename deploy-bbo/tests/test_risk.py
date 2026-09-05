@@ -130,6 +130,9 @@ def test_non_file_and_undeletable_flags(tmp_path, clock, caplog):
         assert r.check_flags() is None and r.halted                     # ...then ignored: it must not undo a later halt
     finally:
         tmp_path.chmod(0o755)
+    os.symlink(tmp_path / "nope", tmp_path / "stop.flag")               # a dangling symlink is still a stop
+    r.resume()
+    assert r.check_flags() == "halt" and r.halted and not (tmp_path / "stop.flag").is_symlink()
 
 
 def test_funding_gate_net_of_both_legs(tmp_path, clock):
@@ -203,15 +206,18 @@ def test_load_tolerates_corrupt_and_legacy_state(tmp_path, clock):
     r = RiskManager(make_cfg(tmp_path), clock)
     now = clock()
     r.load({"pair_blacklist": {"k": "soon", "ok": now + 100},
-            "pair_strikes": {"k": None, "old": 1, "immortal": {"n": 1, "ts": float("inf")}},
+            "pair_strikes": {"k": None, "old": 1, "immortal": {"n": 1, "ts": float("inf")}, "inf": float("inf")},
             "cooldowns": None,
             "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1},
                            "r": {"wins": 1, "losses": 4, "total_pnl": float("inf"),
-                                 "recent": [[now, False], [float("inf"), False], ["x", 1, 2], [now, True]]}},
+                                 "recent": [[now, False], [float("inf"), False], ["x", 1, 2], [now, True]]},
+                           "s": {"wins": 1, "losses": 4, "recent": 5},          # non-iterable: entry dropped, route kept
+                           "t": {"wins": float("inf")}},                        # int(inf): OverflowError must not escape
             "mismatch_blacklist": ["legacy|a|b"], "venue_symbol_blacklist": "notalist", "halted": 1})
     assert r.pair_blacklist == {"ok": now + 100} and r.pair_strikes == {"old": {"n": 1, "ts": now}}
     assert r.cooldowns == {} and "p" not in r.pair_stats and r.pair_stats["q"]["recent"] == []
     assert r.pair_stats["r"]["recent"] == [[now, False], [now, True]] and r.pair_stats["r"]["total_pnl"] == 0.0
+    assert r.pair_stats["s"]["recent"] == [] and r.pair_stats["s"]["losses"] == 4 and "t" not in r.pair_stats
     assert r.mismatch.is_blacklisted("legacy|a|b") and r.venue_symbol_blacklist == set() and r.halted
     r.load("garbage")                                                   # not even an object: fresh state, no raise
     assert not r.halted and r.pair_blacklist == {}

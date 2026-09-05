@@ -63,7 +63,7 @@ def _strikes_from(raw: object, now: float, decay_s: float) -> dict[str, dict]:
                 n, ts = int(v.get("n", 0)), float(v.get("ts", now))
             else:
                 n, ts = int(v), now            # legacy bare count: starts decaying from this load
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):   # OverflowError: int(inf) from a JSON `Infinity`
             log.warning("RISK_STATE_DROP pair_strikes %r=%r", k, v)
             continue
         if n > 0 and math.isfinite(ts) and now - ts <= decay_s:   # an inf/NaN stamp would make a strike immortal
@@ -79,7 +79,11 @@ def _stats_from(raw: object) -> dict[str, dict]:
     for k, v in raw.items():
         try:
             recent = []
-            for item in (v.get("recent") or []):
+            raw_recent = v.get("recent") or []
+            if not isinstance(raw_recent, (list, tuple)):
+                log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, raw_recent)
+                raw_recent = []
+            for item in raw_recent:
                 try:
                     ts, won = item
                     ts = float(ts)
@@ -87,12 +91,12 @@ def _stats_from(raw: object) -> dict[str, dict]:
                         recent.append([ts, bool(won)])
                     else:
                         log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
             total = float(v.get("total_pnl", 0.0))
             out[str(k)] = {"wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
                            "total_pnl": total if math.isfinite(total) else 0.0, "recent": recent[-RECENT_OUTCOMES_KEEP:]}
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError, OverflowError):
             log.warning("RISK_STATE_DROP pair_stats %r=%r", k, v)
     return out
 
@@ -187,7 +191,7 @@ class RiskManager:
     @staticmethod
     def _signature(p: Path) -> tuple[int, int] | None:
         try:
-            st = p.stat()
+            st = p.lstat()             # lstat: a dangling symlink named stop.flag is still a stop
         except OSError:
             return None
         return st.st_ino, st.st_mtime_ns
