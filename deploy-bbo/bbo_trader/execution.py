@@ -50,7 +50,9 @@ FLATTEN_LADDER_S = (1.0, 2.0, 5.0, 10.0, 10.0, 10.0)
 DEGRADED_RETRY_S = 30.0
 MAX_CLOSE_RETRIES = 40           # ~20 min of DEGRADED retries, then the position waits for a human
 HEDGING_SWEEP_AFTER_S = 2.0      # a HEDGING position whose maker order is still live this long gets its cancel retried
+#                                  (the sweep runs inside retry_degraded, which the App calls from its 500 ms sweep)
 MAX_CID_LEN = 32                 # MEXC externalOid / BloFin clientOrderId
+MAX_TRACKS = 5000                # maker tracks outlive their position (fill-after-cancel alerts); oldest are dropped
 
 
 @dataclass
@@ -66,6 +68,7 @@ class LegTrack:
     acked: bool = False       # the venue accepted the order at some point (a later "rejected" is post-rest)
     filled_seen: float = 0.0  # cumulative fill already processed for THIS order (stray-fill deltas)
     fee_seen: float = 0.0
+    phase: str = ""           # maker orders: "entry" | "exit" as posted — survives pos.maker_venue being cleared
 
 
 class Executor:
@@ -94,9 +97,12 @@ class Executor:
         return cid[:MAX_CID_LEN]
 
     def _forget(self, pos: Position) -> None:
-        """Drop the per-position bookkeeping once nothing can arrive for it any more."""
-        for cid in [c for c, t in self._tracks.items() if t.pos_id == pos.id]:
+        """Drop the taker tracks and the lock of a finished position. Maker tracks are kept (bounded) so a
+        fill-after-cancel on a closed position is still recognised and raised to a human."""
+        for cid in [c for c, t in self._tracks.items() if t.pos_id == pos.id and t.leg != "maker"]:
             del self._tracks[cid]
+        while len(self._tracks) > MAX_TRACKS:
+            self._tracks.pop(next(iter(self._tracks)))
         self._locks.pop(pos.id, None)
 
     @staticmethod
@@ -135,13 +141,22 @@ class Executor:
     def on_order_event(self, ev: OrderEvent) -> None:
         tr = self._tracks.get(ev.client_id)
         if tr is None:
-            log.log(logging.WARNING if ev.filled_qty > 0 else logging.INFO,
-                    "ORDER_EVENT_UNKNOWN %s %s %s filled=%s", ev.venue, ev.client_id, ev.state, ev.filled_qty)
+            if ev.filled_qty > 0:
+                log.error("ORDER_EVENT_UNKNOWN %s %s %s filled=%s — an order we do not track has filled: reconcile by hand",
+                          ev.venue, ev.client_id, ev.state, ev.filled_qty)
+                self._say(f"UNKNOWN_FILL {ev.venue} {ev.client_id}: {ev.filled_qty} contracts")
+            else:
+                log.info("ORDER_EVENT_UNKNOWN %s %s %s", ev.venue, ev.client_id, ev.state)
             return
         tr.last = ev
         if ev.state != "rejected":
             tr.acked = True
-        pos = self.book.get(tr.pos_id)
+        pos = self.book.get(tr.pos_id, include_closed=True)
+        if pos is None and ev.filled_qty > tr.filled_seen + 1e-12:      # a discarded position's order filled after all
+            log.error("STRAY_FILL_NO_POSITION #%d %s %s: %s contracts on %s — reconcile by hand",
+                      tr.pos_id, tr.symbol, tr.venue, ev.filled_qty - tr.filled_seen, ev.client_id)
+            self._say(f"STRAY_FILL_NO_POSITION #{tr.pos_id} {tr.symbol} {tr.venue}: {ev.filled_qty - tr.filled_seen} contracts")
+            tr.filled_seen = ev.filled_qty
         if pos is not None:
             if ev.order_id:
                 pos.order_ids[tr.leg] = ev.order_id
@@ -179,6 +194,7 @@ class Executor:
             ack = await v.trading.place_market(pos.symbol, side, qty, reduce_only, cid)
         except Exception as e:  # noqa: BLE001 — the venue may or may not hold this order
             log.error("ORDER_IN_DOUBT #%d %s %s: %r — polling the venue", pos.id, venue, leg, e)
+            self._note_rate_limit(venue, repr(e))
             ack = OrderAck(True, "", error=f"in_doubt: {e!r}")
             in_doubt = True
         ack_ms = (asyncio.get_running_loop().time() - t0) * 1000.0
@@ -220,6 +236,13 @@ class Executor:
         if tr.done.done():
             return tr.done.result()
         if not assume_filled:
+            last = tr.last
+            if last is not None and last.filled_qty > 0:      # the feed showed a partial: book what we know
+                log.error("ORDER_UNRESOLVED %s %s: in doubt, %s filled so far — booking that, the rest is unknown",
+                          v.name, cid, last.filled_qty)
+                self._say(f"ORDER_UNRESOLVED {v.name} {cid}: {last.filled_qty} filled, remainder unknown — check the venue")
+                return OrderEvent(v.name, cid, order_id, "filled", filled_qty=last.filled_qty, avg_price=last.avg_price,
+                                  fee=last.fee, liquidity="taker", ts=self.clock(), error="in_doubt")
             log.error("ORDER_UNRESOLVED %s %s: in doubt and unknown to the venue after %.1fs — treated as rejected; "
                       "reconcile by hand if the venue shows it", v.name, cid, POLL_MAX_S)
             self._say(f"ORDER_UNRESOLVED {v.name} {cid}: check the venue for a stray {tr.leg} order")
@@ -269,12 +292,16 @@ class Executor:
         ok_a = ev_a.state == "filled" and ev_a.filled_qty > 0
         ok_b = ev_b.state == "filled" and ev_b.filled_qty > 0
         now = self.clock()
+        if ok_a:                                   # accumulate: a stray maker fill may already sit on the leg
+            self._accumulate_leg(pos, a, "entry", ev_a)
+        if ok_b:
+            self._accumulate_leg(pos, b, "entry", ev_b)
+        if pos.status == DEGRADED:                 # degraded while the legs were in flight: retry_degraded owns it
+            self._resize_from_legs(pos, spec_a, spec_b)
+            self.book.dirty = True
+            return None
         if ok_a and ok_b:
-            pos.filled_a, pos.filled_b = ev_a.filled_qty, ev_b.filled_qty
-            pos.entry_price_a, pos.entry_price_b = ev_a.avg_price, ev_b.avg_price
-            pos.entry_fees_usd = ev_a.fee + ev_b.fee
-            pos.size_usd = min(notional(pos.filled_a, pos.entry_price_a, spec_a),
-                               notional(pos.filled_b, pos.entry_price_b, spec_b))
+            self._resize_from_legs(pos, spec_a, spec_b)
             pos.entry_spread_pct = (spread_pct(pos.entry_price_a, pos.entry_price_b)
                                     if pos.entry_price_a > 0 and pos.entry_price_b > 0 else pos.detect_spread_pct)
             pos.peak_spread_pct = abs(pos.entry_spread_pct)
@@ -299,25 +326,28 @@ class Executor:
             ev = ev_a if ok_a else ev_b
             log.warning("LEG_DESYNC #%d %s: leg %s filled, other failed (%s)", pos.id, sym, leg,
                         (ev_b if ok_a else ev_a).error)
-            if leg == "a":
-                pos.filled_a, pos.entry_price_a = ev.filled_qty, ev.avg_price
-                pos.size_usd = notional(ev.filled_qty, ev.avg_price, spec_a)
-            else:
-                pos.filled_b, pos.entry_price_b = ev.filled_qty, ev.avg_price
-                pos.size_usd = notional(ev.filled_qty, ev.avg_price, spec_b)
-            pos.entry_fees_usd = ev.fee
+            self._resize_from_legs(pos, spec_a, spec_b)
             self.risk.record_strike(sym, a, b)
             self.risk.set_cooldown(sym)
-            if await self._flatten_leg(pos, leg, ev.filled_qty):
+            rem = round((pos.filled_a - pos.exit_filled_a) if leg == "a" else (pos.filled_b - pos.exit_filled_b), 10)
+            if await self._flatten_leg(pos, leg, rem) and pos.status != DEGRADED:
                 self._close(pos, "failed_entry")
-            else:
+            elif pos.status != DEGRADED:
                 transition(pos, DEGRADED)
                 pos.degraded_leg = leg
                 pos.last_close_attempt = self.clock()
+                self.book.dirty = True
             return None
         log.warning("ENTRY_FAILED #%d %s both legs: %s / %s", pos.id, sym, ev_a.error, ev_b.error)
         self.risk.record_strike(sym, a, b)
         self.risk.set_cooldown(sym)
+        if pos.filled_a > 1e-12 or pos.filled_b > 1e-12:       # something (a stray maker fill) is on the books
+            if pos.status != DEGRADED:
+                transition(pos, DEGRADED)
+                pos.degraded_leg = "a" if pos.filled_a > 1e-12 else "b"
+                pos.last_close_attempt = self.clock()
+                self.book.dirty = True
+            return None
         self.book.discard(pos)
         self._forget(pos)
         return None
@@ -379,7 +409,8 @@ class Executor:
             self.metrics.funnel["budget"] += 1
             return False
         cid = self._new_cid(pos, "maker")
-        self._tracks[cid] = LegTrack(pos.id, "maker", v.name, pos.symbol, pos.maker_qty, now)
+        self._tracks[cid] = LegTrack(pos.id, "maker", v.name, pos.symbol, pos.maker_qty, now,
+                                     phase="exit" if reduce_only else "entry")
         pos.maker_client_id = cid
         pos.client_ids["maker"] = cid
         if not (keep_posted_ts and pos.maker_posted_ts > 0.0):
@@ -503,22 +534,22 @@ class Executor:
         tr.filled_seen, tr.fee_seen = max(tr.filled_seen, ev.filled_qty), max(tr.fee_seen, ev.fee)
         if ev.client_id != pos.maker_client_id or pos.status not in (MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, EXIT_HEDGING):
             # fill-after-cancel on a superseded order, or a position no longer in the maker flow: never write it
-            # onto the live order's counters — book the real exposure on the leg and hand it to retry_degraded
+            # onto the live order's counters — book the real exposure on the leg (the track remembers the venue
+            # and the phase the order was posted in) and hand the position to retry_degraded
             if delta > 1e-12 and pos.status != CLOSED:
-                phase = self._maker_phase(pos)
+                leg = "a" if tr.venue == pos.venue_a else "b"
                 why = "superseded order" if ev.client_id != pos.maker_client_id else pos.status
-                log.error("TM_STRAY_FILL #%d %s %s: %s contracts @%s on %s (%s) — booked on the %s leg for unwinding",
-                          pos.id, pos.symbol, pos.maker_venue, delta, ev.avg_price, ev.client_id, why, phase)
-                if pos.status in (MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, EXIT_HEDGING):
-                    self._apply_maker_leg(pos, phase)          # the live order's own fill goes on the books first
-                self._accumulate_leg(pos, pos.maker_venue, phase,
+                log.error("TM_STRAY_FILL #%d %s %s: %s contracts @%s on %s (%s) — booked on the %s %s leg for unwinding",
+                          pos.id, pos.symbol, tr.venue, delta, ev.avg_price, ev.client_id, why, tr.phase, leg)
+                self._accumulate_leg(pos, tr.venue, tr.phase,
                                      OrderEvent(ev.venue, ev.client_id, ev.order_id, ev.state, delta, ev.avg_price, fee_delta))
+                self.book.dirty = True
                 if pos.status != DEGRADED:
-                    self._spawn(self._degrade(pos, "a" if pos.maker_venue == pos.venue_a else "b", "stray maker fill"))
+                    self._spawn(self._degrade(pos, leg, "stray maker fill"))
             elif delta > 1e-12:
                 log.error("TM_STRAY_FILL_AFTER_CLOSE #%d %s %s: %s contracts on %s — reconcile by hand",
-                          pos.id, pos.symbol, pos.maker_venue, delta, ev.client_id)
-                self._say(f"STRAY_FILL_AFTER_CLOSE #{pos.id} {pos.symbol} {pos.maker_venue}: {delta} contracts")
+                          pos.id, pos.symbol, tr.venue, delta, ev.client_id)
+                self._say(f"STRAY_FILL_AFTER_CLOSE #{pos.id} {pos.symbol} {tr.venue}: {delta} contracts")
             return
         if ev.state == "rejected":
             log.warning("TM_REJECTED_WHILE_RESTING #%d %s %s: %s", pos.id, pos.symbol, pos.maker_venue, ev.error)
@@ -550,6 +581,7 @@ class Executor:
                 transition(pos, DEGRADED)
             pos.degraded_leg = leg
             pos.last_close_attempt = self.clock()
+            self.book.dirty = True
             self._say(f"DEGRADED #{pos.id} {pos.symbol}: {why}")
 
     def _hedge_side(self, pos: Position, phase: str) -> str:
@@ -644,7 +676,16 @@ class Executor:
         for i, delay in enumerate(FLATTEN_LADDER_S[:3]):
             ev = await self._place_taker(pos, pos.maker_venue, f"mflat{i}", side, remaining, True, priority=True)
             if ev.state == "filled" and ev.filled_qty > 0:
-                pos.pnl_adjust_usd += sign * (pos.maker_avg_price - ev.avg_price) * ev.filled_qty * cs
+                # the part of the fill never booked on the leg is realized here; a part already booked (a degrade
+                # or stray-fill path ran meanwhile) is booked as the leg's exit fill so the legs stay consistent
+                unbooked = max(0.0, min(ev.filled_qty, round(pos.maker_filled_qty - pos.maker_booked_qty, 10)))
+                booked_part = round(ev.filled_qty - unbooked, 10)
+                if unbooked > 0:
+                    pos.pnl_adjust_usd += sign * (pos.maker_avg_price - ev.avg_price) * unbooked * cs
+                if booked_part > 1e-12:
+                    self._accumulate_leg(pos, pos.maker_venue, "exit",
+                                         OrderEvent(ev.venue, ev.client_id, ev.order_id, "filled", booked_part, ev.avg_price, 0.0, "taker"))
+                    pos.maker_booked_qty = round(pos.maker_booked_qty - booked_part, 10)
                 pos.exit_fees_usd += ev.fee
                 pos.maker_filled_qty = round(pos.maker_filled_qty - ev.filled_qty, 10)   # netted out
                 remaining = round(remaining - ev.filled_qty, 10)
@@ -662,6 +703,7 @@ class Executor:
             transition(pos, DEGRADED)
         pos.degraded_leg = "a" if pos.maker_venue == pos.venue_a else "b"
         pos.last_close_attempt = self.clock()
+        self.book.dirty = True
 
     def _accumulate_leg(self, pos: Position, venue: str, phase: str, ev: OrderEvent) -> None:
         is_a = venue == pos.venue_a
@@ -704,9 +746,18 @@ class Executor:
                 self._resize_from_legs(pos, spec_a, spec_b)
                 return
             if pos.maker_filled_qty <= 1e-12:
-                if pos.status == HEDGING:                   # the fill was flattened: a round trip, not a discard
+                if pos.status == HEDGING:                   # the fill was flattened: a round trip, not a discard...
                     self._apply_maker_leg(pos, "entry")
-                    self._close(pos, "hedge_unwound")
+                    rem_a = round(pos.filled_a - pos.exit_filled_a, 10)
+                    rem_b = round(pos.filled_b - pos.exit_filled_b, 10)
+                    if rem_a <= 1e-9 and rem_b <= 1e-9:
+                        self._close(pos, "hedge_unwound")
+                    else:                                   # ...unless something else (a stray fill) sits on a leg
+                        log.error("UNWOUND_BUT_NOT_FLAT #%d %s rem_a=%s rem_b=%s — DEGRADED", pos.id, pos.symbol, rem_a, rem_b)
+                        transition(pos, DEGRADED)
+                        pos.degraded_leg = "a" if rem_a > 1e-9 else "b"
+                        pos.last_close_attempt = self.clock()
+                        self.book.dirty = True
                     return
                 if pos.requote_pending and pos.status == MAKER_RESTING:
                     pos.requote_pending = False
@@ -816,6 +867,8 @@ class Executor:
 
     async def exit_tt(self, pos: Position, reason: str) -> None:
         if pos.status not in (OPEN, EXIT_MAKER_RESTING):
+            log.info("EXIT_IGNORED #%d %s status=%s reason=%s (in flight; the next evaluation retries)",
+                     pos.id, pos.symbol, pos.status, reason)
             return
         pos.exit_reason = reason
         if pos.status == EXIT_MAKER_RESTING:
@@ -852,10 +905,12 @@ class Executor:
                 failed += leg
         if failed:
             log.warning("CLOSE_DEGRADED #%d %s legs=%s", pos.id, pos.symbol, failed)
-            transition(pos, DEGRADED)
+            if pos.status != DEGRADED:
+                transition(pos, DEGRADED)
             pos.degraded_leg = "both" if failed == "ab" else failed
             pos.close_retry_count += 1
             pos.last_close_attempt = self.clock()
+            self.book.dirty = True
             return
         self._close(pos, pos.exit_reason or "convergence")
 

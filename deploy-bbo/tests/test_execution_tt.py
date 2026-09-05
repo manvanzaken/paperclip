@@ -333,3 +333,21 @@ async def test_close_is_idempotent_for_risk_stats(tmp_path):
     h.ex._close(pos, "convergence")                                           # a racing second close
     assert h.risk.pair_stats["XYZUSDT|blofin>mexc"] == st and h.book.total_trades == 1
     assert pos.id not in h.ex._locks and not any(t.pos_id == pos.id for t in h.ex._tracks.values())
+
+
+async def test_in_doubt_order_with_a_known_partial_books_the_partial(tmp_path, monkeypatch):
+    from bbo_trader import execution
+    from bbo_trader.execution import LegTrack
+    monkeypatch.setattr(execution, "EVENT_GRACE_S", 0.01)
+    monkeypatch.setattr(execution, "POLL_MAX_S", 0.02)
+    h = Harness(tmp_path)
+    loop = asyncio.get_running_loop()
+    tr = LegTrack(1, "entry_b", "mexc", SYM, 2.0, 0.0, done=loop.create_future())
+    tr.last = OrderEvent("mexc", "cid", "", "partial", filled_qty=1.0, avg_price=1.0008, fee=0.002)
+    ev = await h.ex._await_terminal(tr, h.venues["mexc"], "cid", "", 2.0, assume_filled=False)
+    assert ev.state == "filled" and ev.filled_qty == 1.0 and ev.error == "in_doubt"          # book what the feed showed
+    tr2 = LegTrack(1, "entry_b", "mexc", SYM, 2.0, 0.0, done=loop.create_future())
+    ev2 = await h.ex._await_terminal(tr2, h.venues["mexc"], "cid2", "", 2.0, assume_filled=False)
+    assert ev2.state == "rejected" and ev2.error == "in_doubt"                               # nothing known: never assumed filled
+    await asyncio.sleep(0.01)
+    assert sum("ORDER_UNRESOLVED" in n for n in h.notes) == 2

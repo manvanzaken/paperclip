@@ -191,3 +191,117 @@ async def test_exit_maker_rejected_when_venue_is_flat_books_the_leg_and_closes(t
     await settle()
     assert pos.status == CLOSED and pos.exit_reason == "venue_flat" and pos.exit_filled_a == pos.filled_a
     assert await h.sim("mexc").positions() == [] and pos.exit_filled_b == pos.filled_b
+
+
+async def test_stray_fill_during_a_flatten_does_not_close_the_position(tmp_path, monkeypatch):
+    from bbo_trader import execution
+    from bbo_trader.models import OrderEvent
+    from bbo_trader.quotes import QuoteBoard
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0041, 1.0061)
+    h.quote("mexc", 1.0000, 1.0010)
+    sim = h.sim("blofin")
+    sim.supports_amend = False
+    pos = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                     rest_price=1.0061, size_usd=25.0))
+    old_cid = pos.maker_client_id
+    await h.ex.requote(pos, 1.0063)
+    await settle()
+    await asyncio.sleep(0.005)
+    h.sim("mexc").board = QuoteBoard(2.0)                          # hedge venue unreachable: the fill will be flattened
+    h.quote("blofin", 1.0063, 1.0064, bq=100.0)                    # the live order fills 20 (flatten now in flight)
+    sim._pos[SYM] = sim._pos.get(SYM, 0.0) - 12.0                  # ...and the cancelled order's fill lands at the venue
+    h.ex.on_order_event(OrderEvent("blofin", old_cid, "sim-1", "filled", filled_qty=12.0, avg_price=1.0061,
+                                   fee=0.0024, liquidity="maker", ts=h.ex.clock()))
+    await settle()
+    assert pos.status == "DEGRADED" and pos.filled_a - pos.exit_filled_a == pytest.approx(12.0)   # not hedge_unwound
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    await h.ex.retry_degraded()
+    assert pos.status == CLOSED and await sim.positions() == [] and h.book.open == []
+
+
+async def test_stray_fill_during_the_tt_upgrade_is_not_clobbered(tmp_path, monkeypatch):
+    from bbo_trader import execution
+    from bbo_trader.models import OrderEvent
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0041, 1.0061)
+    h.quote("mexc", 1.0000, 1.0010)
+    sim = h.sim("blofin")
+    pos = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                     rest_price=1.0061, size_usd=25.0))
+    old_cid = pos.maker_client_id
+    h.quote("blofin", 1.0060, 1.0065)                              # a TT edge: upgrade
+    await h.ex.upgrade_to_tt(pos)
+    for _ in range(50):                                            # the cancel finalizes into TT legs in flight
+        if pos.status == "TT_ENTERING":
+            break
+        await asyncio.sleep(0.001)
+    assert pos.status == "TT_ENTERING"
+    sim._pos[SYM] = sim._pos.get(SYM, 0.0) - 12.0                  # the cancelled maker order filled after all
+    h.ex.on_order_event(OrderEvent("blofin", old_cid, "sim-1", "filled", filled_qty=12.0, avg_price=1.0061,
+                                   fee=0.0024, liquidity="maker", ts=h.ex.clock()))
+    await settle()
+    assert pos.status == "DEGRADED" and pos.filled_a >= 12.0       # the TT fill was ADDED to the stray, not written over it
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    for _ in range(3):
+        await h.ex.retry_degraded()
+        await settle()
+    assert pos.status == CLOSED and await sim.positions() == [] and await h.sim("mexc").positions() == []
+
+
+async def test_straggler_on_a_cancelled_exit_maker_is_booked_as_an_exit_fill(tmp_path, monkeypatch):
+    from bbo_trader import execution
+    from bbo_trader.models import OrderEvent
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    pos = await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0))
+    h.quote("blofin", 1.0020, 1.0030)
+    h.quote("mexc", 1.0000, 1.0005)
+    assert await h.ex.exit_tm(pos, Intent("TM_EXIT", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                          rest_price=1.0015))
+    cid = pos.maker_client_id
+    await h.ex.cancel_maker(pos, "test")
+    await settle()
+    assert pos.status == OPEN and pos.maker_venue == ""
+    sim = h.sim("blofin")
+    sim._pos[SYM] += 12.0                                          # the venue filled the cancelled reduce-only buy: short 20 -> 8
+    h.ex.on_order_event(OrderEvent("blofin", cid, "sim-2", "filled", filled_qty=12.0, avg_price=1.0015,
+                                   fee=0.0024, liquidity="maker", ts=h.ex.clock()))
+    await settle()
+    assert pos.status == "DEGRADED" and pos.exit_filled_a == 12.0 and pos.filled_a == 20.0 and pos.filled_b == 2.0
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    await h.ex.retry_degraded()
+    assert pos.status == CLOSED and await sim.positions() == [] and await h.sim("mexc").positions() == []
+    assert abs(pos.gross_pnl_usd) < 0.2                            # no fabricated P&L from a mis-booked leg
+
+
+async def test_stray_fills_after_close_or_discard_alert_a_human(tmp_path):
+    from bbo_trader.models import OrderEvent
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0041, 1.0061)
+    h.quote("mexc", 1.0000, 1.0010)
+    pos = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                     rest_price=1.0061, size_usd=25.0))
+    cid = pos.maker_client_id
+    await h.ex.cancel_maker(pos, "test")
+    await settle()
+    assert pos not in h.book.open                                   # nothing filled: discarded
+    h.ex.on_order_event(OrderEvent("blofin", cid, "sim-1", "filled", filled_qty=25.0, avg_price=1.0061, fee=0.005,
+                                   liquidity="maker", ts=h.ex.clock()))
+    await asyncio.sleep(0.01)
+    assert any("STRAY_FILL_NO_POSITION" in n for n in h.notes)
+    pos2 = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                      rest_price=1.0061, size_usd=25.0))
+    cid2 = pos2.maker_client_id
+    await asyncio.sleep(0.005)
+    h.quote("blofin", 1.0061, 1.0062, bq=100.0)
+    await settle()
+    h.quote("blofin", 1.0010, 1.0012)
+    h.quote("mexc", 1.0009, 1.0011)
+    await h.ex.exit_tt(pos2, "convergence")
+    assert pos2.status == CLOSED
+    h.ex.on_order_event(OrderEvent("blofin", cid2, "sim-2", "filled", filled_qty=25.0, avg_price=1.0061, fee=0.005,
+                                   liquidity="maker", ts=h.ex.clock()))               # 5 more than we ever booked
+    await asyncio.sleep(0.01)
+    assert any("STRAY_FILL_AFTER_CLOSE" in n for n in h.notes) and pos2.filled_a == 20.0   # books untouched, human alerted
