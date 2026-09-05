@@ -694,7 +694,11 @@ def clock():
 `tests/test_models.py`:
 
 ```python
-from bbo_trader.models import (BBO, OrderEvent, Intent, Position, OPEN, TT_ENTERING, none)
+import json
+
+import pytest
+
+from bbo_trader.models import (BBO, OrderEvent, Intent, Position, OPEN, TT_ENTERING, CLOSED, NON_TERMINAL, none)
 from tests.conftest import mk_bbo
 
 
@@ -733,6 +737,32 @@ def test_position_round_trip_and_dashboard_keys():
     assert d["entry_time"].startswith("2023-11-14T22:13:20")
     back = Position.from_dict(d)
     assert back == p
+
+
+def test_touch_notional_rejects_unknown_side():
+    q = mk_bbo("mexc", "XYZUSDT", 1.0, 1.001)
+    with pytest.raises(ValueError, match="side must be"):
+        q.touch_notional("SELL")
+
+
+def test_position_json_round_trip_iso_fallback_and_unknown_keys():
+    p = Position(id=1, symbol="XYZUSDT", venue_a="blofin", venue_b="mexc", status=OPEN, mode="TM",
+                 entry_time=1_700_000_000.0)
+    p.client_ids["maker"] = "c1"
+    p.venue_position_ids["mexc"] = "12345"
+    d = json.loads(json.dumps(p.to_dict()))
+    back = Position.from_dict(d)
+    assert back == p and back.client_ids is not d["client_ids"]        # no aliasing with the source dict
+    assert d["exit_time"] is None                                       # open position: dashboard shows a dash
+    d.pop("_entry_ts")
+    d.pop("_exit_ts")                                                   # hand-repaired state file without shadow keys
+    back2 = Position.from_dict(d)
+    assert back2.entry_time == 1_700_000_000.0 and back2.exit_time == 0.0
+    assert Position.from_dict({**d, "future_key": 1}).id == 1          # unknown keys ignored
+
+
+def test_state_constants():
+    assert CLOSED not in NON_TERMINAL and OPEN in NON_TERMINAL and len(NON_TERMINAL) == 8
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -759,7 +789,7 @@ TT_EXITING = "TT_EXITING"
 EXIT_HEDGING = "EXIT_HEDGING"
 DEGRADED = "DEGRADED"
 CLOSED = "CLOSED"
-NON_TERMINAL = {TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING, TT_EXITING, EXIT_HEDGING, DEGRADED}
+NON_TERMINAL = frozenset({TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING, TT_EXITING, EXIT_HEDGING, DEGRADED})
 
 
 @dataclass(frozen=True)
@@ -790,7 +820,9 @@ class BBO:
         """USD resting at the touch we would CROSS: 'sell' hits the bid, 'buy' lifts the ask."""
         if side == "sell":
             return self.bid * self.bid_qty * self.contract_size
-        return self.ask * self.ask_qty * self.contract_size
+        if side == "buy":
+            return self.ask * self.ask_qty * self.contract_size
+        raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
 
 @dataclass(frozen=True)
@@ -860,8 +892,21 @@ def _iso(ts: float) -> str | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
 
 
+def _ts_from(d: dict, private: str, iso_key: str) -> float:
+    """Machine timestamp from the private shadow key, falling back to the dashboard's ISO string
+    (a hand-repaired state file may carry only the latter; 0.0 would trigger an instant timeout exit)."""
+    v = d.get(private)
+    if v:
+        return float(v)
+    s = d.get(iso_key)
+    return datetime.fromisoformat(s).timestamp() if isinstance(s, str) and s else 0.0
+
+
 @dataclass
 class Position:
+    """One two-leg position through its whole life. `to_dict()` is the DASHBOARD view (legacy aliases,
+    ISO times); the machine-readable timestamps travel in the private `_entry_ts`/`_exit_ts` keys and
+    `from_dict()` prefers them. Unknown keys are ignored on load (forward compatibility)."""
     id: int
     symbol: str
     venue_a: str          # short leg venue
@@ -943,16 +988,16 @@ class Position:
     @classmethod
     def from_dict(cls, d: dict) -> "Position":
         names = {f for f in cls.__dataclass_fields__}
-        kw = {k: v for k, v in d.items() if k in names}
-        kw["entry_time"] = float(d.get("_entry_ts") or 0.0)
-        kw["exit_time"] = float(d.get("_exit_ts") or 0.0)
+        kw = {k: (dict(v) if isinstance(v, dict) else v) for k, v in d.items() if k in names}  # no aliasing
+        kw["entry_time"] = _ts_from(d, "_entry_ts", "entry_time")
+        kw["exit_time"] = _ts_from(d, "_exit_ts", "exit_time")
         return cls(**kw)
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_models.py -q`
-Expected: `4 passed`
+Expected: `7 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -2720,7 +2765,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `48 passed`
+Expected: `51 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -3873,7 +3918,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `62 passed`
+Expected: `65 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -4971,7 +5016,7 @@ Expected: `10 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `75 passed`
+Expected: `78 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -5737,7 +5782,7 @@ Expected: `4 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `82 passed`
+Expected: `85 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -5860,7 +5905,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

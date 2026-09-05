@@ -14,7 +14,7 @@ TT_EXITING = "TT_EXITING"
 EXIT_HEDGING = "EXIT_HEDGING"
 DEGRADED = "DEGRADED"
 CLOSED = "CLOSED"
-NON_TERMINAL = {TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING, TT_EXITING, EXIT_HEDGING, DEGRADED}
+NON_TERMINAL = frozenset({TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING, TT_EXITING, EXIT_HEDGING, DEGRADED})
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,9 @@ class BBO:
         """USD resting at the touch we would CROSS: 'sell' hits the bid, 'buy' lifts the ask."""
         if side == "sell":
             return self.bid * self.bid_qty * self.contract_size
-        return self.ask * self.ask_qty * self.contract_size
+        if side == "buy":
+            return self.ask * self.ask_qty * self.contract_size
+        raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
 
 @dataclass(frozen=True)
@@ -115,8 +117,21 @@ def _iso(ts: float) -> str | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
 
 
+def _ts_from(d: dict, private: str, iso_key: str) -> float:
+    """Machine timestamp from the private shadow key, falling back to the dashboard's ISO string
+    (a hand-repaired state file may carry only the latter; 0.0 would trigger an instant timeout exit)."""
+    v = d.get(private)
+    if v:
+        return float(v)
+    s = d.get(iso_key)
+    return datetime.fromisoformat(s).timestamp() if isinstance(s, str) and s else 0.0
+
+
 @dataclass
 class Position:
+    """One two-leg position through its whole life. `to_dict()` is the DASHBOARD view (legacy aliases,
+    ISO times); the machine-readable timestamps travel in the private `_entry_ts`/`_exit_ts` keys and
+    `from_dict()` prefers them. Unknown keys are ignored on load (forward compatibility)."""
     id: int
     symbol: str
     venue_a: str          # short leg venue
@@ -198,7 +213,7 @@ class Position:
     @classmethod
     def from_dict(cls, d: dict) -> "Position":
         names = {f for f in cls.__dataclass_fields__}
-        kw = {k: v for k, v in d.items() if k in names}
-        kw["entry_time"] = float(d.get("_entry_ts") or 0.0)
-        kw["exit_time"] = float(d.get("_exit_ts") or 0.0)
+        kw = {k: (dict(v) if isinstance(v, dict) else v) for k, v in d.items() if k in names}  # no aliasing
+        kw["entry_time"] = _ts_from(d, "_entry_ts", "entry_time")
+        kw["exit_time"] = _ts_from(d, "_exit_ts", "exit_time")
         return cls(**kw)

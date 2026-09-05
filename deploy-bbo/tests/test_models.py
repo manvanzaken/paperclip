@@ -1,4 +1,8 @@
-from bbo_trader.models import (BBO, OrderEvent, Intent, Position, OPEN, TT_ENTERING, none)
+import json
+
+import pytest
+
+from bbo_trader.models import (BBO, OrderEvent, Intent, Position, OPEN, TT_ENTERING, CLOSED, NON_TERMINAL, none)
 from tests.conftest import mk_bbo
 
 
@@ -37,3 +41,29 @@ def test_position_round_trip_and_dashboard_keys():
     assert d["entry_time"].startswith("2023-11-14T22:13:20")
     back = Position.from_dict(d)
     assert back == p
+
+
+def test_touch_notional_rejects_unknown_side():
+    q = mk_bbo("mexc", "XYZUSDT", 1.0, 1.001)
+    with pytest.raises(ValueError, match="side must be"):
+        q.touch_notional("SELL")
+
+
+def test_position_json_round_trip_iso_fallback_and_unknown_keys():
+    p = Position(id=1, symbol="XYZUSDT", venue_a="blofin", venue_b="mexc", status=OPEN, mode="TM",
+                 entry_time=1_700_000_000.0)
+    p.client_ids["maker"] = "c1"
+    p.venue_position_ids["mexc"] = "12345"
+    d = json.loads(json.dumps(p.to_dict()))
+    back = Position.from_dict(d)
+    assert back == p and back.client_ids is not d["client_ids"]        # no aliasing with the source dict
+    assert d["exit_time"] is None                                       # open position: dashboard shows a dash
+    d.pop("_entry_ts")
+    d.pop("_exit_ts")                                                   # hand-repaired state file without shadow keys
+    back2 = Position.from_dict(d)
+    assert back2.entry_time == 1_700_000_000.0 and back2.exit_time == 0.0
+    assert Position.from_dict({**d, "future_key": 1}).id == 1          # unknown keys ignored
+
+
+def test_state_constants():
+    assert CLOSED not in NON_TERMINAL and OPEN in NON_TERMINAL and len(NON_TERMINAL) == 8
