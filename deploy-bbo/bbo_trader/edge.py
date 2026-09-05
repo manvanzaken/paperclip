@@ -1,11 +1,14 @@
 """Pure edge math for the two execution modes, maker price pegs and tick rounding.
 
 All spreads, fees and edges are percent points. `qa` is the venue we SELL on (higher bid),
-`qb` the venue we BUY on. See the spec section "Strategy: edge math and mode selection"."""
+`qb` the venue we BUY on. See the spec section "Strategy: edge math and mode selection".
+
+All entry points assume qa.ok and qb.ok (positive, uncrossed quotes) and qa.symbol == qb.symbol."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from decimal import Decimal
 
 from .models import BBO, Fees
 
@@ -83,38 +86,48 @@ def choose_mode(pe: PairEval, p: EdgeParams) -> PairEval:
     return replace(pe, mode="", maker_venue="", edge=0.0)
 
 
-def tm_required_pct(maker_fees: Fees, taker_fees: Fees, fa: Fees, fb: Fees, p: EdgeParams) -> float:
+def tm_required_pct(maker_fees: Fees, taker_fees: Fees, p: EdgeParams) -> float:
     """Percent the maker fill must clear over the hedge touch to meet the TM edge."""
-    return (p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker
-            + _base_cost(fa, fb, p))
+    base = maker_fees.taker + taker_fees.taker + p.exit_spread_pct + p.slip_pct
+    return p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker + base
 
 
 def tick_decimals(tick: float) -> int:
-    s = f"{tick:.12f}".rstrip("0")
-    return len(s.split(".")[1]) if "." in s else 0
+    if tick <= 0:
+        raise ValueError(f"tick must be positive, got {tick!r}")
+    return max(0, -Decimal(repr(tick)).normalize().as_tuple().exponent)
 
 
 def round_up(px: float, tick: float) -> float:
-    return round(math.ceil(px / tick - 1e-9) * tick, tick_decimals(tick))
+    eps = max(1e-9, abs(px / tick) * 1e-12)
+    return round(math.ceil(px / tick - eps) * tick, tick_decimals(tick))
 
 
 def round_down(px: float, tick: float) -> float:
-    return round(math.floor(px / tick + 1e-9) * tick, tick_decimals(tick))
+    eps = max(1e-9, abs(px / tick) * 1e-12)
+    return round(math.floor(px / tick + eps) * tick, tick_decimals(tick))
+
+
+def _postable(px: float, lo: float, hi: float) -> float | None:
+    """A post-only price must sit strictly inside (lo, hi) and be positive."""
+    return px if 0.0 < px and lo < px < hi else None
 
 
 def maker_entry_price(qa: BBO, qb: BBO, fa: Fees, fb: Fees, p: EdgeParams, maker_venue: str,
                       tick: float, improve_ticks: int = 0) -> float | None:
-    """Resting price for a TM entry, or None when no post-only price meets the edge."""
+    """Resting price for a TM entry. Assumes the caller already confirmed mode == "TM" for this
+    maker venue (choose_mode); returns None only when no post-only price is available (it would
+    cross, or is not positive)."""
     if maker_venue == qa.venue:  # rest SELL on A, hedge BUY at ask_B
-        req = tm_required_pct(fa, fb, fa, fb, p)
+        req = tm_required_pct(fa, fb, p)
         floor_px = qb.ask * (1.0 + req / 100.0)
         px = round_up(max(qa.ask - improve_ticks * tick, floor_px), tick)
-        return px if px > qa.bid else None
+        return _postable(px, qa.bid, float("inf"))
     if maker_venue == qb.venue:  # rest BUY on B, hedge SELL at bid_A
-        req = tm_required_pct(fb, fa, fa, fb, p)
+        req = tm_required_pct(fb, fa, p)
         cap_px = qa.bid / (1.0 + req / 100.0)
         px = round_down(min(qb.bid + improve_ticks * tick, cap_px), tick)
-        return px if px < qb.ask else None
+        return _postable(px, 0.0, qb.ask)
     return None
 
 
@@ -125,16 +138,18 @@ def maker_exit_price(qa: BBO, qb: BBO, exit_spread_pct: float, maker_venue: str,
     if maker_venue == qa.venue:  # rest BUY on A; hedge SELL B at bid_B: (p - bid_B)/bid_B <= X
         cap_px = qb.bid * (1.0 + exit_spread_pct / 100.0)
         px = round_down(min(qa.bid + improve_ticks * tick, cap_px), tick)
-        return px if px < qa.ask else None
+        return _postable(px, 0.0, qa.ask)
     if maker_venue == qb.venue:  # rest SELL on B; hedge BUY A at ask_A: (ask_A - p)/p <= X
         floor_px = qa.ask / (1.0 + exit_spread_pct / 100.0)
         px = round_up(max(qb.ask - improve_ticks * tick, floor_px), tick)
-        return px if px > qb.bid else None
+        return _postable(px, qb.bid, float("inf"))
     return None
 
 
 def needs_requote(working_px: float, new_px: float, tick: float, requote_ticks: int) -> bool:
-    return abs(new_px - working_px) >= requote_ticks * tick - 1e-12
+    if tick <= 0:
+        raise ValueError(f"tick must be positive, got {tick!r}")
+    return abs(new_px - working_px) / tick >= requote_ticks - 1e-9
 
 
 def best_fee_venue(venue_a: str, fa: Fees, venue_b: str, fb: Fees) -> str:
