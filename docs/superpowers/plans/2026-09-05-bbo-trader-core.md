@@ -1127,7 +1127,7 @@ git commit -m "feat(bbo): QuoteBoard with per-venue staleness"
 
 The formulas are the spec's, verbatim. Read the spec section "Strategy: edge math and mode selection" before this task; the worked example (0.41% TT floor, 0.42% TM floor on MEXC↔BloFin) is encoded in the tests.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_edge.py`:
 
@@ -1221,7 +1221,8 @@ def test_rounding_and_requote_helpers():
 
 
 def test_degenerate_quote_never_yields_zero_peg():
-    # a glitched/near-zero quote on A must never round to a postable 0.0 peg on either side
+    # a glitched/near-zero quote on A must never yield a postable 0.0 peg: the lo=0.0 bound of the BUY
+    # branches rejects it (the extra `0.0 < px` clause in _postable is belt-and-braces for the SELL branches)
     qa = mk_bbo("blofin", "XYZUSDT", bid=1e-9, ask=2e-9)
     qb = mk_bbo("mexc", "XYZUSDT", bid=1.0, ask=1.001)
     assert maker_exit_price(qa, qb, 0.15, "blofin", tick=0.0001) is None
@@ -1246,8 +1247,18 @@ def test_tick_decimals_and_rounding_extremes():
     assert round_down(0.00012345, 1e-8) == pytest.approx(0.00012345)
     assert round_up(1000.000123, 1e-6) == pytest.approx(1000.000123)
     assert round_down(10000.0001, 0.0001) == pytest.approx(10000.0001)
+    # these discriminate the relative epsilon from a fixed 1e-9 (which mis-rounds them by a full tick)
+    assert round_up(963.443702, 1e-6) == pytest.approx(963.443702)
+    assert round_up(306776.34, 0.01) == pytest.approx(306776.34)
+    assert round_down(82940652.27, 0.01) == pytest.approx(82940652.27)
+    # ...and the epsilon cap keeps extreme px/tick ratios from flipping the rounding direction
+    assert round_up(65000.0, 1e-8) == pytest.approx(65000.0) and round_down(65000.0, 1e-8) == pytest.approx(65000.0)
     with pytest.raises(ValueError):
         tick_decimals(0)
+    with pytest.raises(ValueError):
+        tick_decimals(float("nan"))
+    with pytest.raises(ValueError):
+        needs_requote(1.0, 1.1, float("nan"), 1)
 
 
 def test_tm_viable_when_tt_spread_negative():
@@ -1289,6 +1300,7 @@ def test_peg_properties_on_a_grid():
     width_ticks_opts = (1, 3, 20)
     offset_ticks_opts = (-30, -5, 0, 5, 30)
     checked = 0
+    produced: dict[tuple, int] = {}
     for tick in ticks:
         for mid in mids:
             if tick >= mid / 100:
@@ -1307,6 +1319,7 @@ def test_peg_properties_on_a_grid():
                             entry_px = maker_entry_price(qa, qb, BLOFIN_FEES, MEXC_FEES, P,
                                                           maker_venue, tick, improve_ticks)
                             if entry_px is not None:
+                                produced[("entry", maker_venue, improve_ticks)] = produced.get(("entry", maker_venue, improve_ticks), 0) + 1
                                 if maker_venue == "blofin":
                                     assert entry_px > qa.bid
                                     req = tm_required_pct(BLOFIN_FEES, MEXC_FEES, P)
@@ -1317,6 +1330,7 @@ def test_peg_properties_on_a_grid():
                                     assert spread_pct(qa.bid, entry_px) >= req - 1e-9
                             exit_px = maker_exit_price(qa, qb, 0.15, maker_venue, tick, improve_ticks)
                             if exit_px is not None:
+                                produced[("exit", maker_venue, improve_ticks)] = produced.get(("exit", maker_venue, improve_ticks), 0) + 1
                                 if maker_venue == "blofin":
                                     assert exit_px < qa.ask
                                     assert spread_pct(exit_px, qb.bid) <= 0.15 + 1e-9
@@ -1324,14 +1338,16 @@ def test_peg_properties_on_a_grid():
                                     assert exit_px > qb.bid
                                     assert spread_pct(qa.ask, exit_px) <= 0.15 + 1e-9
     assert checked > 0
+    # every (phase, venue, improve) cell must have produced pegs, or the invariants above were vacuous
+    assert len(produced) == 8 and min(produced.values()) > 0
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_edge.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.edge'`
 
-- [ ] **Step 3: Implement `bbo_trader/edge.py`**
+- [x] **Step 3: Implement `bbo_trader/edge.py`**
 
 ```python
 """Pure edge math for the two execution modes, maker price pegs and tick rounding.
@@ -1424,23 +1440,29 @@ def choose_mode(pe: PairEval, p: EdgeParams) -> PairEval:
 
 def tm_required_pct(maker_fees: Fees, taker_fees: Fees, p: EdgeParams) -> float:
     """Percent the maker fill must clear over the hedge touch to meet the TM edge."""
-    base = maker_fees.taker + taker_fees.taker + p.exit_spread_pct + p.slip_pct
-    return p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker + base
+    return (p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker
+            + _base_cost(maker_fees, taker_fees, p))
 
 
 def tick_decimals(tick: float) -> int:
-    if tick <= 0:
+    if not (tick > 0):   # also rejects NaN
         raise ValueError(f"tick must be positive, got {tick!r}")
     return max(0, -Decimal(repr(tick)).normalize().as_tuple().exponent)
 
 
+def _eps(px: float, tick: float) -> float:
+    """Rounding tolerance in ticks: scales with px/tick (float error grows with the ratio) but is capped
+    well below one tick so it can never flip a rounding direction."""
+    return min(1e-3, max(1e-9, abs(px / tick) * 1e-12))
+
+
 def round_up(px: float, tick: float) -> float:
-    eps = max(1e-9, abs(px / tick) * 1e-12)
+    eps = _eps(px, tick)
     return round(math.ceil(px / tick - eps) * tick, tick_decimals(tick))
 
 
 def round_down(px: float, tick: float) -> float:
-    eps = max(1e-9, abs(px / tick) * 1e-12)
+    eps = _eps(px, tick)
     return round(math.floor(px / tick + eps) * tick, tick_decimals(tick))
 
 
@@ -1483,7 +1505,7 @@ def maker_exit_price(qa: BBO, qb: BBO, exit_spread_pct: float, maker_venue: str,
 
 
 def needs_requote(working_px: float, new_px: float, tick: float, requote_ticks: int) -> bool:
-    if tick <= 0:
+    if not (tick > 0):   # also rejects NaN
         raise ValueError(f"tick must be positive, got {tick!r}")
     return abs(new_px - working_px) / tick >= requote_ticks - 1e-9
 
@@ -1493,12 +1515,12 @@ def best_fee_venue(venue_a: str, fa: Fees, venue_b: str, fb: Fees) -> str:
     return venue_a if (fa.taker - fa.maker) >= (fb.taker - fb.maker) else venue_b
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_edge.py -q`
 Expected: `13 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/edge.py deploy-bbo/tests/test_edge.py

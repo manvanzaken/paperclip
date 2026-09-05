@@ -87,7 +87,8 @@ def test_rounding_and_requote_helpers():
 
 
 def test_degenerate_quote_never_yields_zero_peg():
-    # a glitched/near-zero quote on A must never round to a postable 0.0 peg on either side
+    # a glitched/near-zero quote on A must never yield a postable 0.0 peg: the lo=0.0 bound of the BUY
+    # branches rejects it (the extra `0.0 < px` clause in _postable is belt-and-braces for the SELL branches)
     qa = mk_bbo("blofin", "XYZUSDT", bid=1e-9, ask=2e-9)
     qb = mk_bbo("mexc", "XYZUSDT", bid=1.0, ask=1.001)
     assert maker_exit_price(qa, qb, 0.15, "blofin", tick=0.0001) is None
@@ -112,8 +113,18 @@ def test_tick_decimals_and_rounding_extremes():
     assert round_down(0.00012345, 1e-8) == pytest.approx(0.00012345)
     assert round_up(1000.000123, 1e-6) == pytest.approx(1000.000123)
     assert round_down(10000.0001, 0.0001) == pytest.approx(10000.0001)
+    # these discriminate the relative epsilon from a fixed 1e-9 (which mis-rounds them by a full tick)
+    assert round_up(963.443702, 1e-6) == pytest.approx(963.443702)
+    assert round_up(306776.34, 0.01) == pytest.approx(306776.34)
+    assert round_down(82940652.27, 0.01) == pytest.approx(82940652.27)
+    # ...and the epsilon cap keeps extreme px/tick ratios from flipping the rounding direction
+    assert round_up(65000.0, 1e-8) == pytest.approx(65000.0) and round_down(65000.0, 1e-8) == pytest.approx(65000.0)
     with pytest.raises(ValueError):
         tick_decimals(0)
+    with pytest.raises(ValueError):
+        tick_decimals(float("nan"))
+    with pytest.raises(ValueError):
+        needs_requote(1.0, 1.1, float("nan"), 1)
 
 
 def test_tm_viable_when_tt_spread_negative():
@@ -155,6 +166,7 @@ def test_peg_properties_on_a_grid():
     width_ticks_opts = (1, 3, 20)
     offset_ticks_opts = (-30, -5, 0, 5, 30)
     checked = 0
+    produced: dict[tuple, int] = {}
     for tick in ticks:
         for mid in mids:
             if tick >= mid / 100:
@@ -173,6 +185,7 @@ def test_peg_properties_on_a_grid():
                             entry_px = maker_entry_price(qa, qb, BLOFIN_FEES, MEXC_FEES, P,
                                                           maker_venue, tick, improve_ticks)
                             if entry_px is not None:
+                                produced[("entry", maker_venue, improve_ticks)] = produced.get(("entry", maker_venue, improve_ticks), 0) + 1
                                 if maker_venue == "blofin":
                                     assert entry_px > qa.bid
                                     req = tm_required_pct(BLOFIN_FEES, MEXC_FEES, P)
@@ -183,6 +196,7 @@ def test_peg_properties_on_a_grid():
                                     assert spread_pct(qa.bid, entry_px) >= req - 1e-9
                             exit_px = maker_exit_price(qa, qb, 0.15, maker_venue, tick, improve_ticks)
                             if exit_px is not None:
+                                produced[("exit", maker_venue, improve_ticks)] = produced.get(("exit", maker_venue, improve_ticks), 0) + 1
                                 if maker_venue == "blofin":
                                     assert exit_px < qa.ask
                                     assert spread_pct(exit_px, qb.bid) <= 0.15 + 1e-9
@@ -190,3 +204,5 @@ def test_peg_properties_on_a_grid():
                                     assert exit_px > qb.bid
                                     assert spread_pct(qa.ask, exit_px) <= 0.15 + 1e-9
     assert checked > 0
+    # every (phase, venue, improve) cell must have produced pegs, or the invariants above were vacuous
+    assert len(produced) == 8 and min(produced.values()) > 0

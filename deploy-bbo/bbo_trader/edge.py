@@ -88,23 +88,29 @@ def choose_mode(pe: PairEval, p: EdgeParams) -> PairEval:
 
 def tm_required_pct(maker_fees: Fees, taker_fees: Fees, p: EdgeParams) -> float:
     """Percent the maker fill must clear over the hedge touch to meet the TM edge."""
-    base = maker_fees.taker + taker_fees.taker + p.exit_spread_pct + p.slip_pct
-    return p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker + base
+    return (p.min_edge_pct + p.tm_extra_edge_pct + maker_fees.maker + taker_fees.taker
+            + _base_cost(maker_fees, taker_fees, p))
 
 
 def tick_decimals(tick: float) -> int:
-    if tick <= 0:
+    if not (tick > 0):   # also rejects NaN
         raise ValueError(f"tick must be positive, got {tick!r}")
     return max(0, -Decimal(repr(tick)).normalize().as_tuple().exponent)
 
 
+def _eps(px: float, tick: float) -> float:
+    """Rounding tolerance in ticks: scales with px/tick (float error grows with the ratio) but is capped
+    well below one tick so it can never flip a rounding direction."""
+    return min(1e-3, max(1e-9, abs(px / tick) * 1e-12))
+
+
 def round_up(px: float, tick: float) -> float:
-    eps = max(1e-9, abs(px / tick) * 1e-12)
+    eps = _eps(px, tick)
     return round(math.ceil(px / tick - eps) * tick, tick_decimals(tick))
 
 
 def round_down(px: float, tick: float) -> float:
-    eps = max(1e-9, abs(px / tick) * 1e-12)
+    eps = _eps(px, tick)
     return round(math.floor(px / tick + eps) * tick, tick_decimals(tick))
 
 
@@ -147,7 +153,7 @@ def maker_exit_price(qa: BBO, qb: BBO, exit_spread_pct: float, maker_venue: str,
 
 
 def needs_requote(working_px: float, new_px: float, tick: float, requote_ticks: int) -> bool:
-    if tick <= 0:
+    if not (tick > 0):   # also rejects NaN
         raise ValueError(f"tick must be positive, got {tick!r}")
     return abs(new_px - working_px) / tick >= requote_ticks - 1e-9
 
