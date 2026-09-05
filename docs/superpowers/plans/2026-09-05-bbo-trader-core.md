@@ -302,7 +302,8 @@ def test_unknown_bot_config_keys_are_ignored_and_secrets_hidden(tmp_path):
     assert cfg.trade_venues == ["mexc", "blofin"]
     assert cfg.blocked_symbols == frozenset()
     assert "secret-value" not in repr(cfg.venue("mexc"))
-    assert "TELEGRAM-SECRET" not in repr(cfg)
+    assert cfg.telegram_token == "TELEGRAM-SECRET"        # loaded from env...
+    assert "TELEGRAM-SECRET" not in repr(cfg)              # ...but never printed
 
 
 def test_venue_lookup_keyerror(tmp_path):
@@ -483,6 +484,7 @@ class Config:
     maker_top_level_frac: float = 0.5
     legacy_heartbeat_path: Path = Path("/app/data/heartbeat_live")
     legacy_heartbeat_max_age_s: float = 120.0
+    # bearer token: excluded from repr; asdict() still exposes it — whitelist fields when serializing Config
     telegram_token: str = field(default="", repr=False)
     telegram_chat_id: str = ""
     venues: tuple[VenueConfig, ...] = ()
@@ -590,6 +592,8 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     bot_cfg = data_dir / "bot_config.json"
     if bot_cfg.exists():
         for k, v in _read_json(bot_cfg).items():
+            # venues/blocked_symbols are overwritten from their files below anyway; skipping them here is
+            # belt-and-braces so the dashboard file can never feed the registry, even after a reordering
             if k.upper() in _PROCESS_ONLY or k.lower() not in types or k.lower() in ("venues", "blocked_symbols"):
                 continue
             overrides[k.lower()] = _coerce(v, field_type(k.lower()))

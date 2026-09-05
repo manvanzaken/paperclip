@@ -142,7 +142,8 @@ def test_unknown_bot_config_keys_are_ignored_and_secrets_hidden(tmp_path):
     assert cfg.trade_venues == ["mexc", "blofin"]
     assert cfg.blocked_symbols == frozenset()
     assert "secret-value" not in repr(cfg.venue("mexc"))
-    assert "TELEGRAM-SECRET" not in repr(cfg)
+    assert cfg.telegram_token == "TELEGRAM-SECRET"        # loaded from env...
+    assert "TELEGRAM-SECRET" not in repr(cfg)              # ...but never printed
 
 
 def test_venue_lookup_keyerror(tmp_path):
