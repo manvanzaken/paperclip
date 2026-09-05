@@ -1,0 +1,16 @@
+[Unit]
+Description=BBO taker/maker trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/app/deploy-bbo
+EnvironmentFile=/app/deploy-bbo/.env
+Environment=DATA_DIR=/app/data_bbo
+ExecStart=/app/deploy-bbo/.venv/bin/python -m bbo_trader.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
