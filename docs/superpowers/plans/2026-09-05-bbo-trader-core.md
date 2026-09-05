@@ -394,6 +394,9 @@ def test_rate_limits_are_validated(tmp_path):
     venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 20, "cancels": 20, "window_s": 0, "reserve": 4, "shared": False}}}))
     with pytest.raises(ValueError, match="must be positive"):
         load_config(env=env)
+    venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 27, "cancels": 5, "window_s": 10, "reserve": 4, "shared": True}}}))
+    with pytest.raises(ValueError, match="orders == cancels"):
+        load_config(env=env)
 ```
 
 - [x] **Step 4: Run the tests to verify they fail**
@@ -572,6 +575,8 @@ def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
             shared=_parse_bool(rl.get("shared", False), name))
         if not (limits.window_s > 0) or limits.orders <= 0 or limits.cancels <= 0:
             raise ValueError(f"{name}: rate_limits window_s, orders and cancels must be positive")
+        if limits.shared and limits.orders != limits.cancels:
+            raise ValueError(f"{name}: shared rate limits must set orders == cancels (cancels is ignored)")
         if not (0 <= limits.reserve < min(limits.orders, limits.cancels)):
             raise ValueError(f"{name}: rate_limits.reserve must be in [0, min(orders, cancels)) — a reserve "
                              f"equal to the capacity would silently block every entry")
@@ -1786,7 +1791,7 @@ git commit -m "feat(bbo): pure sizing — contracts per venue, matched legs, hed
 - Create: `deploy-bbo/bbo_trader/budget.py`
 - Test: `deploy-bbo/tests/test_budget.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_budget.py`:
 
@@ -1844,7 +1849,8 @@ def test_rate_budget_shared_vs_separate():
     separate = RateBudget(RateLimits(orders=1, cancels=1, window_s=10.0, reserve=0, shared=False))
     assert separate.try_take("order", 0.0) and separate.try_take("cancel", 0.0)
     assert not separate.try_take("amend", 0.0)                     # amend draws from orders
-    assert separate.to_dict(0.0) == {"orders_free": 0, "cancels_free": 0, "shared": False, "penalized": False}
+    assert separate.to_dict(0.0) == {"orders_free": 0, "cancels_free": 0, "orders_entry_free": 0, "cancels_entry_free": 0,
+                                     "shared": False, "penalized": False}
 
 
 def test_unknown_kind_raises():
@@ -1858,16 +1864,17 @@ def test_to_dict_after_penalty_clamps_and_flags():
     assert b.try_take("order", 0.0) and b.try_take("order", 0.0)
     b.penalize(0.0)
     d = b.to_dict(0.5)
-    assert d == {"orders_free": 1, "cancels_free": 1, "shared": True, "penalized": True}
+    assert d == {"orders_free": 1, "cancels_free": 1, "orders_entry_free": 0, "cancels_entry_free": 0,
+                 "shared": True, "penalized": True}
     assert b.available("order", 0.5) < 0                          # entries see the halved capacity
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_budget.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.budget'`
 
-- [ ] **Step 3: Implement `bbo_trader/budget.py`**
+- [x] **Step 3: Implement `bbo_trader/budget.py`**
 
 ```python
 """Pure rate budgets: sliding-window token buckets with a reserve for risk-reducing calls."""
@@ -1926,7 +1933,8 @@ class TokenBucket:
 
 class RateBudget:
     """Per-venue budget. kind: 'order' | 'amend' (orders bucket) | 'cancel' (cancels bucket,
-    or the same bucket when the venue shares one limit across trading endpoints)."""
+    or the same bucket when the venue shares one limit across trading endpoints — then `cancels` is
+    ignored and config requires orders == cancels)."""
 
     def __init__(self, limits: RateLimits):
         self.shared = limits.shared
@@ -1952,17 +1960,22 @@ class RateBudget:
         self._cancels.penalize(now, seconds)
 
     def to_dict(self, now: float) -> dict[str, object]:
+        """`*_free` = what a priority call (hedge/close/cancel) may still take; `*_entry_free` = what an
+        entry/requote may take (net of the reserve and any penalty) — the number that explains why entries stop."""
         return {"orders_free": max(0, self._orders.available(now, priority=True)),
                 "cancels_free": max(0, self._cancels.available(now, priority=True)),
-                "shared": self.shared, "penalized": self._orders.penalized(now)}
+                "orders_entry_free": max(0, self._orders.available(now)),
+                "cancels_entry_free": max(0, self._cancels.available(now)),
+                "shared": self.shared,
+                "penalized": self._orders.penalized(now) or self._cancels.penalized(now)}
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_budget.py -q`
 Expected: `7 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/budget.py deploy-bbo/tests/test_budget.py

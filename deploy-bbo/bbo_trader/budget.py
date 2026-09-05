@@ -54,7 +54,8 @@ class TokenBucket:
 
 class RateBudget:
     """Per-venue budget. kind: 'order' | 'amend' (orders bucket) | 'cancel' (cancels bucket,
-    or the same bucket when the venue shares one limit across trading endpoints)."""
+    or the same bucket when the venue shares one limit across trading endpoints — then `cancels` is
+    ignored and config requires orders == cancels)."""
 
     def __init__(self, limits: RateLimits):
         self.shared = limits.shared
@@ -80,6 +81,11 @@ class RateBudget:
         self._cancels.penalize(now, seconds)
 
     def to_dict(self, now: float) -> dict[str, object]:
+        """`*_free` = what a priority call (hedge/close/cancel) may still take; `*_entry_free` = what an
+        entry/requote may take (net of the reserve and any penalty) — the number that explains why entries stop."""
         return {"orders_free": max(0, self._orders.available(now, priority=True)),
                 "cancels_free": max(0, self._cancels.available(now, priority=True)),
-                "shared": self.shared, "penalized": self._orders.penalized(now)}
+                "orders_entry_free": max(0, self._orders.available(now)),
+                "cancels_entry_free": max(0, self._cancels.available(now)),
+                "shared": self.shared,
+                "penalized": self._orders.penalized(now) or self._cancels.penalized(now)}

@@ -166,6 +166,8 @@ def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
             shared=_parse_bool(rl.get("shared", False), name))
         if not (limits.window_s > 0) or limits.orders <= 0 or limits.cancels <= 0:
             raise ValueError(f"{name}: rate_limits window_s, orders and cancels must be positive")
+        if limits.shared and limits.orders != limits.cancels:
+            raise ValueError(f"{name}: shared rate limits must set orders == cancels (cancels is ignored)")
         if not (0 <= limits.reserve < min(limits.orders, limits.cancels)):
             raise ValueError(f"{name}: rate_limits.reserve must be in [0, min(orders, cancels)) — a reserve "
                              f"equal to the capacity would silently block every entry")

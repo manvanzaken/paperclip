@@ -234,3 +234,6 @@ def test_rate_limits_are_validated(tmp_path):
     venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 20, "cancels": 20, "window_s": 0, "reserve": 4, "shared": False}}}))
     with pytest.raises(ValueError, match="must be positive"):
         load_config(env=env)
+    venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 27, "cancels": 5, "window_s": 10, "reserve": 4, "shared": True}}}))
+    with pytest.raises(ValueError, match="orders == cancels"):
+        load_config(env=env)

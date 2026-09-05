@@ -51,7 +51,8 @@ def test_rate_budget_shared_vs_separate():
     separate = RateBudget(RateLimits(orders=1, cancels=1, window_s=10.0, reserve=0, shared=False))
     assert separate.try_take("order", 0.0) and separate.try_take("cancel", 0.0)
     assert not separate.try_take("amend", 0.0)                     # amend draws from orders
-    assert separate.to_dict(0.0) == {"orders_free": 0, "cancels_free": 0, "shared": False, "penalized": False}
+    assert separate.to_dict(0.0) == {"orders_free": 0, "cancels_free": 0, "orders_entry_free": 0, "cancels_entry_free": 0,
+                                     "shared": False, "penalized": False}
 
 
 def test_unknown_kind_raises():
@@ -65,5 +66,6 @@ def test_to_dict_after_penalty_clamps_and_flags():
     assert b.try_take("order", 0.0) and b.try_take("order", 0.0)
     b.penalize(0.0)
     d = b.to_dict(0.5)
-    assert d == {"orders_free": 1, "cancels_free": 1, "shared": True, "penalized": True}
+    assert d == {"orders_free": 1, "cancels_free": 1, "orders_entry_free": 0, "cancels_entry_free": 0,
+                 "shared": True, "penalized": True}
     assert b.available("order", 0.5) < 0                          # entries see the halved capacity
