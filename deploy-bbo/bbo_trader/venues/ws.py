@@ -4,9 +4,11 @@ app-level keepalive, non-JSON frames ignored, server closes logged with the sock
 
 Unlike SpreadWatch's pure bookstore write, `on_items` here is the trading brain (App.on_bbo → evaluate
 → spawn), so the runner never lets a consumer or parse exception take the socket down: a bad frame
-costs one quote and is logged with escalating sparsity. A socket that goes silent for `receive_timeout`
-is dropped and reconnected (the venue may never send a CLOSE), a failing keepalive drops the socket
-visibly, and teardown is bounded so a venue that keeps streaming while we leave cannot park a shard."""
+costs one quote and is logged with escalating sparsity. Liveness has two layers: aiohttp's protocol
+heartbeat (default 20 s; a missing PONG drops a wedged TCP socket within ~30 s) and a data watchdog
+(no frame that parsed to items for `data_timeout` → the subscription is dead even though the socket
+pongs → reconnect). A failing keepalive drops the socket visibly, and teardown is bounded so a venue
+that keeps streaming while we leave cannot park a shard."""
 from __future__ import annotations
 
 import asyncio
@@ -52,8 +54,10 @@ class WSAdapter:
     max_topics: int = 0
     ping: tuple[float, object] | None = None      # (interval_s, message) app-level keepalive
     text_ping_reply: tuple[str, str] | None = None  # (server text frame, our reply)
-    heartbeat: float | None = 20.0                # aiohttp protocol ping
-    receive_timeout: float | None = 10.0          # drop a socket that goes silent this long
+    heartbeat: float | None = 20.0                # aiohttp protocol ping; a missing PONG drops the socket in ~1.5×
+    receive_timeout: float | None = None          # per-frame receive timeout — only meaningful with heartbeat=None
+    #                                               (PONG frames reset it, so above the heartbeat it can never fire)
+    data_timeout: float | None = 120.0            # no parsed data frame for this long → dead subscription: reconnect
 
 
 async def _send(ws, msg) -> None:
@@ -110,6 +114,18 @@ class WSRunner:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 self._connected.clear()
 
+    async def _watchdog(self, ws, conn_id: int, timeout: float, last_data: list[float]) -> None:
+        """Dead-subscription detector: the socket may keep ponging while the venue stopped pushing."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(timeout / 4.0)
+            idle = loop.time() - last_data[0]
+            if idle >= timeout:
+                log.warning("%s conn %d no data for %.0fs — reconnecting", self.adapter.name, conn_id, idle)
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                return
+
     async def _pinger(self, ws, conn_id: int, interval: float, msg) -> None:
         """Keepalive. A failure must be visible AND must drop the socket: a silently dead
         pinger means MEXC kills the connection 60 s later for no logged reason."""
@@ -127,7 +143,7 @@ class WSRunner:
     async def _run_conn(self, conn_id: int, insts: list[str]) -> None:
         backoff = Backoff()
         a = self.adapter
-        closes = 0
+        closes = bad = 0                 # cumulative for the shard: the log sparsity below self-throttles
         while not self._stop:
             opened = None
             loop = asyncio.get_running_loop()
@@ -139,14 +155,16 @@ class WSRunner:
                     try:
                         for m in a.subscribe(insts):
                             await _send(ws, m)
-                        pinger = None
+                        helpers = []
                         if a.ping:
                             interval, msg = a.ping
-                            pinger = asyncio.create_task(self._pinger(ws, conn_id, interval, msg))
+                            helpers.append(asyncio.create_task(self._pinger(ws, conn_id, interval, msg)))
+                        last_data = [loop.time()]
+                        if a.data_timeout:
+                            helpers.append(asyncio.create_task(self._watchdog(ws, conn_id, a.data_timeout, last_data)))
                         self._connected.add(conn_id)
                         opened = loop.time()
                         state: dict = {}
-                        bad = 0
                         try:
                             async for msg in ws:
                                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -166,19 +184,21 @@ class WSRunner:
                                 try:
                                     items = a.parse(raw, state)
                                     if items:
+                                        last_data[0] = loop.time()
                                         self.on_items(items)
                                 except Exception:  # noqa: BLE001 — a bad frame or a consumer
                                     bad += 1     # bug costs one quote, never the socket
                                     if bad in (1, 10, 100) or bad % 1000 == 0:
                                         log.exception("%s conn %d dropped frame #%d", a.name, conn_id, bad)
                         finally:
-                            if pinger:
-                                pinger.cancel()
+                            for h in helpers:
+                                h.cancel()
+                            for h in helpers:
                                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                                    await pinger
-                        closes += 1      # first close per shard at INFO, a flapping venue at DEBUG
-                        log.log(logging.INFO if closes == 1 else logging.DEBUG,
-                                "%s conn %d closed by server #%d (%d insts, lived %.0fs, %d bad frames)",
+                                    await h
+                        closes += 1      # escalating sparsity: a venue that starts flapping hours in stays visible
+                        log.log(logging.INFO if closes in (1, 10, 100) or closes % 1000 == 0 else logging.DEBUG,
+                                "%s conn %d closed by server #%d (%d insts, lived %.0fs, %d bad frames total)",
                                 a.name, conn_id, closes, len(insts), loop.time() - opened, bad)
                     finally:
                         # ws.close() restarts its ws_close timeout for every non-CLOSE frame,

@@ -4212,7 +4212,29 @@ async def test_consumer_exception_costs_one_frame_not_the_socket(caplog):
     await _shutdown(r, task, runner)
 
 
-async def test_silent_socket_and_dead_keepalive_are_dropped_and_reconnected(caplog):
+async def test_quiet_but_ponging_socket_is_kept_at_shipped_defaults():
+    conns = []
+
+    async def handler(request):                                    # answers protocol pings, pushes nothing
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        conns.append(1)
+        async for _ in ws:
+            pass
+        return ws
+
+    port, runner = await _serve(handler)
+    r = WSRunner(WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: []),
+                 on_items=lambda items: None)
+    r.set_instruments(["A"])
+    task = asyncio.create_task(r.run())
+    assert await _until(lambda: r.connected)
+    await asyncio.sleep(0.5)
+    assert len(conns) == 1 and r.connected                        # no receive-timeout churn on an idle healthy shard
+    await _shutdown(r, task, runner)
+
+
+async def test_dead_subscription_and_dead_keepalive_are_dropped_and_reconnected(caplog):
     conns = []
 
     async def handler(request):
@@ -4221,17 +4243,19 @@ async def test_silent_socket_and_dead_keepalive_are_dropped_and_reconnected(capl
         conns.append(1)
         await ws.receive()
         await ws.send_json({"v": len(conns)})
-        await asyncio.sleep(30)                                   # then silence: no frames, no CLOSE
+        async for _ in ws:                                        # socket stays alive and pongs, data stops
+            pass
         return ws
 
     port, runner = await _serve(handler)
     delays, got = [], []
-    a = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [raw["v"]],
-                  receive_timeout=0.1, heartbeat=None)
+    a = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [raw["v"]], data_timeout=0.1)
     r = WSRunner(a, on_items=got.extend, sleep=_fast_sleep(delays))
     r.set_instruments(["A"])
     task = asyncio.create_task(r.run())
-    assert await _until(lambda: len(conns) >= 3)                  # silent sockets are dropped and reopened
+    with caplog.at_level(logging.WARNING, logger="bbo.ws"):
+        assert await _until(lambda: len(conns) >= 3)              # dead subscriptions are dropped and reopened
+    assert "no data for" in caplog.text
     assert [d for d in delays if d != 0.5][:2] == [1.0, 2.0]      # the backoff ladder, not a hot loop
     await _shutdown(r, task, runner)
     conns.clear()
@@ -4245,7 +4269,7 @@ async def test_silent_socket_and_dead_keepalive_are_dropped_and_reconnected(capl
         return ws
     port, runner = await _serve(listening)
     a2 = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [raw["v"]],
-                   ping=(0.01, object()), receive_timeout=None, heartbeat=None)   # unserializable keepalive
+                   ping=(0.01, object()))                         # unserializable keepalive
     r2 = WSRunner(a2, on_items=got.extend, sleep=_fast_sleep([]))
     r2.set_instruments(["A"])
     task2 = asyncio.create_task(r2.run())
@@ -4290,9 +4314,11 @@ app-level keepalive, non-JSON frames ignored, server closes logged with the sock
 
 Unlike SpreadWatch's pure bookstore write, `on_items` here is the trading brain (App.on_bbo → evaluate
 → spawn), so the runner never lets a consumer or parse exception take the socket down: a bad frame
-costs one quote and is logged with escalating sparsity. A socket that goes silent for `receive_timeout`
-is dropped and reconnected (the venue may never send a CLOSE), a failing keepalive drops the socket
-visibly, and teardown is bounded so a venue that keeps streaming while we leave cannot park a shard."""
+costs one quote and is logged with escalating sparsity. Liveness has two layers: aiohttp's protocol
+heartbeat (default 20 s; a missing PONG drops a wedged TCP socket within ~30 s) and a data watchdog
+(no frame that parsed to items for `data_timeout` → the subscription is dead even though the socket
+pongs → reconnect). A failing keepalive drops the socket visibly, and teardown is bounded so a venue
+that keeps streaming while we leave cannot park a shard."""
 from __future__ import annotations
 
 import asyncio
@@ -4338,8 +4364,10 @@ class WSAdapter:
     max_topics: int = 0
     ping: tuple[float, object] | None = None      # (interval_s, message) app-level keepalive
     text_ping_reply: tuple[str, str] | None = None  # (server text frame, our reply)
-    heartbeat: float | None = 20.0                # aiohttp protocol ping
-    receive_timeout: float | None = 10.0          # drop a socket that goes silent this long
+    heartbeat: float | None = 20.0                # aiohttp protocol ping; a missing PONG drops the socket in ~1.5×
+    receive_timeout: float | None = None          # per-frame receive timeout — only meaningful with heartbeat=None
+    #                                               (PONG frames reset it, so above the heartbeat it can never fire)
+    data_timeout: float | None = 120.0            # no parsed data frame for this long → dead subscription: reconnect
 
 
 async def _send(ws, msg) -> None:
@@ -4396,6 +4424,18 @@ class WSRunner:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 self._connected.clear()
 
+    async def _watchdog(self, ws, conn_id: int, timeout: float, last_data: list[float]) -> None:
+        """Dead-subscription detector: the socket may keep ponging while the venue stopped pushing."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(timeout / 4.0)
+            idle = loop.time() - last_data[0]
+            if idle >= timeout:
+                log.warning("%s conn %d no data for %.0fs — reconnecting", self.adapter.name, conn_id, idle)
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                return
+
     async def _pinger(self, ws, conn_id: int, interval: float, msg) -> None:
         """Keepalive. A failure must be visible AND must drop the socket: a silently dead
         pinger means MEXC kills the connection 60 s later for no logged reason."""
@@ -4413,7 +4453,7 @@ class WSRunner:
     async def _run_conn(self, conn_id: int, insts: list[str]) -> None:
         backoff = Backoff()
         a = self.adapter
-        closes = 0
+        closes = bad = 0                 # cumulative for the shard: the log sparsity below self-throttles
         while not self._stop:
             opened = None
             loop = asyncio.get_running_loop()
@@ -4425,14 +4465,16 @@ class WSRunner:
                     try:
                         for m in a.subscribe(insts):
                             await _send(ws, m)
-                        pinger = None
+                        helpers = []
                         if a.ping:
                             interval, msg = a.ping
-                            pinger = asyncio.create_task(self._pinger(ws, conn_id, interval, msg))
+                            helpers.append(asyncio.create_task(self._pinger(ws, conn_id, interval, msg)))
+                        last_data = [loop.time()]
+                        if a.data_timeout:
+                            helpers.append(asyncio.create_task(self._watchdog(ws, conn_id, a.data_timeout, last_data)))
                         self._connected.add(conn_id)
                         opened = loop.time()
                         state: dict = {}
-                        bad = 0
                         try:
                             async for msg in ws:
                                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -4452,19 +4494,21 @@ class WSRunner:
                                 try:
                                     items = a.parse(raw, state)
                                     if items:
+                                        last_data[0] = loop.time()
                                         self.on_items(items)
                                 except Exception:  # noqa: BLE001 — a bad frame or a consumer
                                     bad += 1     # bug costs one quote, never the socket
                                     if bad in (1, 10, 100) or bad % 1000 == 0:
                                         log.exception("%s conn %d dropped frame #%d", a.name, conn_id, bad)
                         finally:
-                            if pinger:
-                                pinger.cancel()
+                            for h in helpers:
+                                h.cancel()
+                            for h in helpers:
                                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                                    await pinger
-                        closes += 1      # first close per shard at INFO, a flapping venue at DEBUG
-                        log.log(logging.INFO if closes == 1 else logging.DEBUG,
-                                "%s conn %d closed by server #%d (%d insts, lived %.0fs, %d bad frames)",
+                                    await h
+                        closes += 1      # escalating sparsity: a venue that starts flapping hours in stays visible
+                        log.log(logging.INFO if closes in (1, 10, 100) or closes % 1000 == 0 else logging.DEBUG,
+                                "%s conn %d closed by server #%d (%d insts, lived %.0fs, %d bad frames total)",
                                 a.name, conn_id, closes, len(insts), loop.time() - opened, bad)
                     finally:
                         # ws.close() restarts its ws_close timeout for every non-CLOSE frame,
@@ -4484,7 +4528,7 @@ class WSRunner:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_ws.py -q`
-Expected: `5 passed`
+Expected: `6 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -5328,7 +5372,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `99 passed`
+Expected: `100 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py deploy-bbo/tests/test_venue_protocols.py
@@ -6500,7 +6544,7 @@ Expected: `12 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `114 passed`
+Expected: `115 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -7340,7 +7384,7 @@ Expected: `6 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `123 passed`
+Expected: `124 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -7463,7 +7507,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round (approved): nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Re-review round (approved): nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

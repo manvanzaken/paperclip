@@ -113,7 +113,29 @@ async def test_consumer_exception_costs_one_frame_not_the_socket(caplog):
     await _shutdown(r, task, runner)
 
 
-async def test_silent_socket_and_dead_keepalive_are_dropped_and_reconnected(caplog):
+async def test_quiet_but_ponging_socket_is_kept_at_shipped_defaults():
+    conns = []
+
+    async def handler(request):                                    # answers protocol pings, pushes nothing
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        conns.append(1)
+        async for _ in ws:
+            pass
+        return ws
+
+    port, runner = await _serve(handler)
+    r = WSRunner(WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: []),
+                 on_items=lambda items: None)
+    r.set_instruments(["A"])
+    task = asyncio.create_task(r.run())
+    assert await _until(lambda: r.connected)
+    await asyncio.sleep(0.5)
+    assert len(conns) == 1 and r.connected                        # no receive-timeout churn on an idle healthy shard
+    await _shutdown(r, task, runner)
+
+
+async def test_dead_subscription_and_dead_keepalive_are_dropped_and_reconnected(caplog):
     conns = []
 
     async def handler(request):
@@ -122,17 +144,19 @@ async def test_silent_socket_and_dead_keepalive_are_dropped_and_reconnected(capl
         conns.append(1)
         await ws.receive()
         await ws.send_json({"v": len(conns)})
-        await asyncio.sleep(30)                                   # then silence: no frames, no CLOSE
+        async for _ in ws:                                        # socket stays alive and pongs, data stops
+            pass
         return ws
 
     port, runner = await _serve(handler)
     delays, got = [], []
-    a = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [raw["v"]],
-                  receive_timeout=0.1, heartbeat=None)
+    a = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [raw["v"]], data_timeout=0.1)
     r = WSRunner(a, on_items=got.extend, sleep=_fast_sleep(delays))
     r.set_instruments(["A"])
     task = asyncio.create_task(r.run())
-    assert await _until(lambda: len(conns) >= 3)                  # silent sockets are dropped and reopened
+    with caplog.at_level(logging.WARNING, logger="bbo.ws"):
+        assert await _until(lambda: len(conns) >= 3)              # dead subscriptions are dropped and reopened
+    assert "no data for" in caplog.text
     assert [d for d in delays if d != 0.5][:2] == [1.0, 2.0]      # the backoff ladder, not a hot loop
     await _shutdown(r, task, runner)
     conns.clear()
@@ -146,7 +170,7 @@ async def test_silent_socket_and_dead_keepalive_are_dropped_and_reconnected(capl
         return ws
     port, runner = await _serve(listening)
     a2 = WSAdapter("t", f"ws://127.0.0.1:{port}/ws", lambda i: ["sub"], lambda raw, st: [raw["v"]],
-                   ping=(0.01, object()), receive_timeout=None, heartbeat=None)   # unserializable keepalive
+                   ping=(0.01, object()))                         # unserializable keepalive
     r2 = WSRunner(a2, on_items=got.extend, sleep=_fast_sleep([]))
     r2.set_instruments(["A"])
     task2 = asyncio.create_task(r2.run())
