@@ -96,7 +96,7 @@ class Executor:
         self._tasks: set[asyncio.Task] = set()
         self._notify_tasks: set[asyncio.Task] = set()   # never in the shutdown drain: a hung Telegram must not hold up order legs
         self.stopping = False          # set by App.shutdown(): no NEW order may rest or open once we are going down
-        self._naked_alerted: set[int] = set()
+        self._naked_alerted: set[tuple[int, str]] = set()   # (position id, entry|exit): once per naked window
         self._last_query: dict[int, float] = {}
         self._fee_alert_ts: dict[str, float] = {}
 
@@ -115,7 +115,7 @@ class Executor:
         while len(self._tracks) > MAX_TRACKS:
             self._tracks.pop(next(iter(self._tracks)))
         self._locks.pop(pos.id, None)
-        self._naked_alerted.discard(pos.id)
+        self._naked_alerted = {k for k in self._naked_alerted if k[0] != pos.id}
         self._last_query.pop(pos.id, None)
 
     @staticmethod
@@ -267,7 +267,7 @@ class Executor:
         last = tr.last
         return OrderEvent(v.name, cid, order_id, "filled", filled_qty=qty,
                           avg_price=last.avg_price if last else 0.0, fee=last.fee if last else 0.0,
-                          liquidity="taker", ts=self.clock())
+                          liquidity="taker", ts=self.clock(), error="assumed")   # `error`: synthetic, skips the fee check
 
     def _as_event(self, result, venue: str) -> OrderEvent:
         if isinstance(result, OrderEvent):
@@ -717,7 +717,7 @@ class Executor:
                     pos.pnl_adjust_usd += sign * (pos.maker_avg_price - ev.avg_price) * unbooked * cs
                 if booked_part > 1e-12:
                     self._accumulate_leg(pos, pos.maker_venue, "exit",
-                                         OrderEvent(ev.venue, ev.client_id, ev.order_id, "filled", booked_part, ev.avg_price, 0.0, "taker"))
+                                         OrderEvent(ev.venue, ev.client_id, ev.order_id, "filled", booked_part, ev.avg_price, 0.0, ""))
                     pos.maker_booked_qty = round(pos.maker_booked_qty - booked_part, 10)
                 pos.exit_fees_usd += ev.fee
                 pos.maker_filled_qty = round(pos.maker_filled_qty - ev.filled_qty, 10)   # netted out
@@ -742,12 +742,12 @@ class Executor:
         """Spec: a fill whose fee is more than FEE_MISMATCH_TOL off the configured rate for its liquidity type is a
         FEE_MISMATCH — the edge math runs on those rates, so a changed schedule must be seen, not absorbed."""
         spec = self._spec(venue, pos.symbol)
-        if spec is None or ev.filled_qty <= 0 or ev.avg_price <= 0 or ev.liquidity not in ("maker", "taker"):
-            return
+        if spec is None or ev.error or ev.filled_qty <= 0 or ev.avg_price <= 0 or ev.liquidity not in ("maker", "taker"):
+            return                                # `error` marks synthetic events (assumed / in-doubt fills): not a venue fee
         fees = self.venues[venue].fees
         rate = fees.maker if ev.liquidity == "maker" else fees.taker
         expected = notional(ev.filled_qty, ev.avg_price, spec) * rate / 100.0
-        if abs(ev.fee - expected) <= max(FEE_MISMATCH_TOL * expected, 1e-6):
+        if abs(ev.fee - expected) <= max(FEE_MISMATCH_TOL * abs(expected), 1e-6):     # abs: rebate schedules are negative
             return
         self.metrics.funnel["fee_mismatch"] += 1
         log.warning("FEE_MISMATCH %s %s %s fill: fee $%.6f, configured %.3f%% => $%.6f (%s)", venue, pos.symbol, ev.liquidity,
@@ -1017,11 +1017,13 @@ class Executor:
         """Spec: naked exposure is bounded by MAX_NAKED_MS — alert (once per position) when a maker fill has sat
         unhedged longer than that; the hedge/flatten ladder keeps running, this is the operator's signal."""
         unhedged = round(pos.maker_filled_qty - pos.hedged_qty, 10)
-        if unhedged <= 1e-12 or not pos.maker_fill_ts or pos.id in self._naked_alerted:
+        key = (pos.id, "exit" if pos.status == EXIT_HEDGING else "entry")
+        dust = unhedged <= pos.hedged_qty * self.cfg.max_leg_mismatch_pct / 100.0   # the residual _hedge_delta accepts
+        if unhedged <= 1e-12 or dust or not pos.maker_fill_ts or key in self._naked_alerted:
             return
         naked_ms = (now - pos.maker_fill_ts) * 1000.0
         if naked_ms > self.cfg.max_naked_ms:
-            self._naked_alerted.add(pos.id)
+            self._naked_alerted.add(key)
             self.metrics.funnel["naked_exposure"] += 1
             log.warning("NAKED_EXPOSURE #%d %s: %s maker contracts on %s unhedged for %.0f ms (> %d ms)", pos.id, pos.symbol,
                         unhedged, pos.maker_venue, naked_ms, self.cfg.max_naked_ms)
@@ -1052,11 +1054,12 @@ class Executor:
                 except Exception as e:  # noqa: BLE001
                     log.debug("query_order failed %s %s: %r", v.name, pos.maker_client_id, e)
                     ev = None
-                if ev is not None and ev.terminal:
-                    log.warning("HEDGING_SWEEP #%d %s: no terminal event for %s — pulled %s from the venue", pos.id, pos.symbol,
-                                pos.maker_client_id, ev.state)
+                if ev is not None:                # a partial that kept filling while the feed was dead is hedged, not stranded
+                    log.warning("HEDGING_SWEEP #%d %s: no event for %s — pulled %s (filled %s) from the venue", pos.id,
+                                pos.symbol, pos.maker_client_id, ev.state, ev.filled_qty)
                     self.on_order_event(ev)
-                    continue
+                    if ev.terminal:
+                        continue
             if now - since >= HEDGING_STUCK_S:
                 log.error("HEDGING_STUCK #%d %s: maker order %s on %s reported nothing for %.0fs — DEGRADED, closing what the books show",
                           pos.id, pos.symbol, pos.maker_client_id, pos.maker_venue, now - since)

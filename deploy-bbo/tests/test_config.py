@@ -247,3 +247,12 @@ def test_max_topics_must_be_non_negative(tmp_path):
     venues.write_text(json.dumps({"mexc": {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0, "max_topics": -1}}))
     with pytest.raises(ValueError, match="max_topics must be >= 0"):
         load_config(env=env)
+
+
+def test_negative_fee_rates_are_rejected():
+    from bbo_trader.config import VenueConfig, RateLimits
+    import pytest
+    with pytest.raises(ValueError, match="rebates unsupported"):
+        VenueConfig("blofin", "trade", 0.06, -0.01, RateLimits())     # v1 books fees as costs; a rebate would be mis-booked as zero
+    with pytest.raises(ValueError):
+        VenueConfig("blofin", "trade", float("nan"), 0.02, RateLimits())

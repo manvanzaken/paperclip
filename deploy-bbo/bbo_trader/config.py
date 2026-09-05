@@ -36,6 +36,13 @@ class VenueConfig:
     api_secret: str = field(default="", repr=False)
     passphrase: str = field(default="", repr=False)
 
+    def __post_init__(self) -> None:
+        # rebate schedules (negative maker rates) are not supported in v1: the maker-leg fee booking and the
+        # FEE_MISMATCH check assume fees are costs. Fail closed rather than mis-book a rebate as zero.
+        for label, rate in (("taker_fee_pct", self.taker_fee_pct), ("maker_fee_pct", self.maker_fee_pct)):
+            if not isinstance(rate, (int, float)) or rate != rate or rate < 0 or rate > 5:
+                raise ValueError(f"{self.name}: {label}={rate!r} must be a percentage in [0, 5] (rebates unsupported)")
+
 
 @dataclass(frozen=True)
 class Config:

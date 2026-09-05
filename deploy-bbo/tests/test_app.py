@@ -585,7 +585,14 @@ async def test_naked_exposure_alert_fires_once(tmp_path, caplog):
     assert f"NAKED_EXPOSURE #{pos.id}" in caplog.text and app.metrics.funnel["naked_exposure"] == 1
     assert any("NAKED_EXPOSURE" in n for n in app.harness.notes)
     await app.executor.retry_degraded()
-    assert app.metrics.funnel["naked_exposure"] == 1                 # once per position
+    assert app.metrics.funnel["naked_exposure"] == 1                 # once per naked window...
+    pos.status, pos.maker_filled_qty, pos.hedged_qty, pos.maker_fill_ts = "EXIT_HEDGING", 5.0, 0.0, now - 2.0
+    await app.executor.retry_degraded()
+    assert app.metrics.funnel["naked_exposure"] == 2                 # ...the exit phase is its own window
+    dust = app.book.new(SYM, "blofin", "mexc", "HEDGING", "TM", size_usd=25.0, maker_venue="blofin", maker_side="sell",
+                        maker_client_id="m-2", maker_filled_qty=10.02, hedged_qty=10.0, maker_fill_ts=now - 2.0, entry_time=now)
+    await app.executor.retry_degraded()
+    assert app.metrics.funnel["naked_exposure"] == 2                 # a residual inside the mismatch tolerance is not naked exposure
 
 
 async def test_fee_mismatch_is_logged_and_alerted_once_per_venue_per_hour(tmp_path, caplog):
@@ -664,3 +671,46 @@ async def test_book_leg_flat_accumulates_a_partial_exit(tmp_path):
                        entry_time=app.clock())
     app.executor._book_leg_flat(pos, "a", "blofin")
     assert pos.exit_filled_a == 20.0 and pos.exit_price_a == pytest.approx((1.0010 * 5 + 1.0055 * 15) / 20)   # mark = mid
+
+
+async def test_stuck_hedging_sweep_feeds_partial_progress(tmp_path, caplog):
+    """The feed is dead and the cancel was acked but never took effect: the order keeps filling. The sweep's venue query
+    must feed that (non-terminal) state in so the new fill is hedged, not stranded when the position degrades."""
+    import time
+    app = build_app(tmp_path)
+    sim = app.harness.sim("blofin")
+    real_cancel = sim.cancel
+
+    async def acked_but_ineffective(symbol, client_id, order_id):
+        from bbo_trader.models import OrderAck
+        return OrderAck(True, order_id)                              # the venue says yes and leaves the order live
+    sim.cancel = acked_but_ineffective
+    orig = sim._handler
+    seen = []
+
+    def dead_after_first_partial(ev):
+        if seen:
+            return                                                   # nothing reaches us any more
+        if ev.state == "partial":
+            seen.append(ev)
+        orig(ev)
+    sim._handler = dead_after_first_partial
+    pos = await _resting_tm(app)
+    await asyncio.sleep(0.005)
+    app.on_bbo(bbo("blofin", 1.0061, 1.0062, 1.0, bq=10.0))        # first partial: 5 of 20 — under one $10 hedge lot
+    await settle()
+    assert pos.status == "HEDGING" and pos.maker_cancel_sent and pos.maker_filled_qty == 5.0 and pos.hedged_qty == 0.0
+    await asyncio.sleep(0.005)
+    app.on_bbo(bbo("blofin", 1.0061, 1.0062, 1.0, bq=20.0))        # the still-live order fills 10 more; we never hear it
+    await settle()
+    assert pos.maker_filled_qty == 5.0 and (await sim.positions())[0].qty == 15.0
+    app.executor.clock = lambda: time.time() + 3.0
+    await app.executor.retry_degraded()                             # the sweep pulls `partial filled 15` and feeds it in
+    await settle()
+    assert pos.maker_filled_qty == 15.0 and pos.hedged_qty >= 9.9 and "pulled partial (filled 15.0)" in caplog.text
+    sim.cancel = real_cancel
+    app.executor.clock = lambda: time.time() + 61.0
+    await app.executor.retry_degraded()                             # still no event: DEGRADED with all 15 on the books
+    await settle()
+    assert pos.status == "DEGRADED" and pos.filled_a == 15.0
+
