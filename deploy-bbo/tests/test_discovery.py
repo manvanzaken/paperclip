@@ -14,3 +14,7 @@ def test_universe_requires_two_trade_venues_and_applies_filters():
     assert symbols_for_venue(uni, "mexc") == ["AUSDT", "BUSDT", "CUSDT"]
     assert symbols_for_quote_venue(uni, specs["okx"]) == ["AUSDT", "CUSDT"]
     assert build_universe(specs, ["mexc"], set(), {}) == {}
+    assert build_universe(specs, ["mexc", "blofin", "okx"], {"BADUSDT"}, {"okx": ()}) == {
+        "AUSDT": ["blofin", "mexc", "okx"], "BUSDT": ["blofin", "mexc"], "CUSDT": ["mexc", "okx"]}   # empty whitelist = unrestricted
+    del specs["blofin"]["BUSDT"]                                                                     # delisted on one venue -> drops out
+    assert "BUSDT" not in build_universe(specs, ["mexc", "blofin", "okx"], {"BADUSDT"}, {"okx": ("CUSDT",)})
