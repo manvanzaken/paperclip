@@ -668,10 +668,11 @@ class FakeClock:
 
 
 def mk_bbo(venue: str, symbol: str, bid: float, ask: float, bq: float = 1000.0, aq: float = 1000.0,
-           ts: float | None = None, contract_size: float = 1.0) -> BBO:
+           ts: float | None = None, contract_size: float = 1.0, ts_exchange: float | None = None) -> BBO:
+    """ts = local receive time (governs staleness); ts_exchange defaults to ts unless given."""
     t = time.time() if ts is None else ts
     return BBO(venue=venue, symbol=symbol, bid=bid, bid_qty=bq, ask=ask, ask_qty=aq,
-               ts_exchange=t, ts_local=t, contract_size=contract_size)
+               ts_exchange=t if ts_exchange is None else ts_exchange, ts_local=t, contract_size=contract_size)
 
 
 def mk_spec(venue: str, symbol: str = "XYZUSDT", contract_size: float = 1.0, lot: float = 1.0,
@@ -800,8 +801,9 @@ class BBO:
     bid_qty: float      # contracts resting at the best bid
     ask: float
     ask_qty: float      # contracts resting at the best ask
-    ts_exchange: float  # seconds
-    ts_local: float     # seconds, when we received it
+    ts_exchange: float  # seconds, the venue's own timestamp (informational)
+    ts_local: float     # seconds from the LOCAL clock at receipt — governs staleness; adapters must never
+                        # stamp this from the venue clock (a future-dated ts_local would be fresh forever)
     contract_size: float = 1.0
 
     @property
@@ -1037,6 +1039,12 @@ def test_set_get_and_staleness():
     assert board.fresh_venues("XYZUSDT", now=103.0) == ["hyperliquid"]
     assert board.fresh_counts(now=103.0) == {"mexc": 0, "blofin": 0, "hyperliquid": 1}
     assert board.symbols() == {"XYZUSDT"}
+    # staleness is governed by ts_local, never by the venue clock
+    assert board.set(mk_bbo("mexc", "PQRUSDT", 1.0, 1.001, ts=100.0, ts_exchange=1.0))
+    assert board.fresh("mexc", "PQRUSDT", now=101.0) is not None
+    assert board.fresh("mexc", "XYZUSDT", now=102.0) is not None   # boundary: age == stale_s is still fresh
+    assert board.set(mk_bbo("mexc", "XYZUSDT", 2.0, 2.001, ts=110.0))  # newest quote overwrites
+    assert board.get("mexc", "XYZUSDT").bid == 2.0
 ```
 
 - [x] **Step 2: Run the test to verify it fails**
@@ -5905,7 +5913,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

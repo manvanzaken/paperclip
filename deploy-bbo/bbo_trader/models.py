@@ -25,8 +25,9 @@ class BBO:
     bid_qty: float      # contracts resting at the best bid
     ask: float
     ask_qty: float      # contracts resting at the best ask
-    ts_exchange: float  # seconds
-    ts_local: float     # seconds, when we received it
+    ts_exchange: float  # seconds, the venue's own timestamp (informational)
+    ts_local: float     # seconds from the LOCAL clock at receipt — governs staleness; adapters must never
+                        # stamp this from the venue clock (a future-dated ts_local would be fresh forever)
     contract_size: float = 1.0
 
     @property

@@ -20,10 +20,11 @@ class FakeClock:
 
 
 def mk_bbo(venue: str, symbol: str, bid: float, ask: float, bq: float = 1000.0, aq: float = 1000.0,
-           ts: float | None = None, contract_size: float = 1.0) -> BBO:
+           ts: float | None = None, contract_size: float = 1.0, ts_exchange: float | None = None) -> BBO:
+    """ts = local receive time (governs staleness); ts_exchange defaults to ts unless given."""
     t = time.time() if ts is None else ts
     return BBO(venue=venue, symbol=symbol, bid=bid, bid_qty=bq, ask=ask, ask_qty=aq,
-               ts_exchange=t, ts_local=t, contract_size=contract_size)
+               ts_exchange=t if ts_exchange is None else ts_exchange, ts_local=t, contract_size=contract_size)
 
 
 def mk_spec(venue: str, symbol: str = "XYZUSDT", contract_size: float = 1.0, lot: float = 1.0,

@@ -16,3 +16,9 @@ def test_set_get_and_staleness():
     assert board.fresh_venues("XYZUSDT", now=103.0) == ["hyperliquid"]
     assert board.fresh_counts(now=103.0) == {"mexc": 0, "blofin": 0, "hyperliquid": 1}
     assert board.symbols() == {"XYZUSDT"}
+    # staleness is governed by ts_local, never by the venue clock
+    assert board.set(mk_bbo("mexc", "PQRUSDT", 1.0, 1.001, ts=100.0, ts_exchange=1.0))
+    assert board.fresh("mexc", "PQRUSDT", now=101.0) is not None
+    assert board.fresh("mexc", "XYZUSDT", now=102.0) is not None   # boundary: age == stale_s is still fresh
+    assert board.set(mk_bbo("mexc", "XYZUSDT", 2.0, 2.001, ts=110.0))  # newest quote overwrites
+    assert board.get("mexc", "XYZUSDT").bid == 2.0
