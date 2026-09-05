@@ -1990,13 +1990,14 @@ git commit -m "feat(bbo): per-venue token-bucket rate budgets with reserve"
 - Create: `deploy-bbo/bbo_trader/positions.py`
 - Test: `deploy-bbo/tests/test_positions.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_positions.py`:
 
 ```python
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -2142,10 +2143,27 @@ def test_state_file_is_never_absent_and_saves_do_not_race(tmp_path):
     assert not (tmp_path / "real_state.json.bak.tmp").exists()
     assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]      # no stray temp files
 
+    # a watcher thread must never observe the live file absent while saves run back to back
+    absent = []
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            if not (tmp_path / "real_state.json").exists():
+                absent.append(1)
+    w = threading.Thread(target=watch, daemon=True)
+    w.start()
+    for i in range(50):
+        store.save({"n": 10 + i})
+
     async def concurrent():
         await asyncio.gather(store.save_async({"n": 3}), store.save_async({"n": 4}))
     asyncio.run(concurrent())
+    stop.set()
+    w.join()
+    assert not absent
     assert store.load()["n"] in (3, 4) and (tmp_path / "real_state.json").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     (tmp_path / "real_state.json").unlink()                                   # torn save: only the backup survives
     with pytest.raises(StateCorrupt, match="torn save"):
         store.load()
@@ -2161,16 +2179,24 @@ def test_non_object_state_and_stranded_closed_entries(tmp_path):
     book = PositionBook()
     book.load({"open_positions": [closed, live]})                             # a CLOSED entry under open_positions
     assert [p.id for p in book.open] == [4] and [p.id for p in book.closed] == [3] and book.next_id == 5
+    weird = Position(5, "X", "a", "b", "FROM_THE_FUTURE", "TT").to_dict()      # unknown status -> DEGRADED, kept open
+    live_under_closed = Position(6, "X", "a", "b", OPEN, "TT").to_dict()
+    book.load({"open_positions": [weird], "closed_positions": [live_under_closed]})
+    assert {p.id: p.status for p in book.open} == {5: DEGRADED, 6: OPEN} and book.closed == []
+    stale = tmp_path / "real_state.json.123.456.tmp"
+    stale.write_text("junk")
+    StateStore(tmp_path / "real_state.json")                                  # start-up sweeps crash leftovers
+    assert not stale.exists()
     store.save({"weird": {1, 2}})                                             # unserializable -> str fallback, no crash
     assert "weird" in store.load()
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_positions.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.positions'`
 
-- [ ] **Step 3: Implement `bbo_trader/positions.py`**
+- [x] **Step 3: Implement `bbo_trader/positions.py`**
 
 ```python
 """Position lifecycle: transition table, P&L finalization, PositionBook, StateStore, dashboard state."""
@@ -2328,7 +2354,7 @@ class PositionBook:
         if self.peak_equity > 0:
             dd = (self.peak_equity - equity) / self.peak_equity * 100.0
             self.max_drawdown_pct = max(self.max_drawdown_pct, dd)
-        last_ts = float(self.equity_history[-1].get("_ts", 0.0)) if self.equity_history else 0.0
+        last_ts = float(self.equity_history[-1].get("_ts") or 0.0) if self.equity_history else 0.0   # null-tolerant
         if not self.equity_history or now - last_ts >= every_s:
             self.equity_history.append({"t": _iso(now), "v": round(equity, 4), "_ts": now})
             del self.equity_history[:-self.EQUITY_POINTS]
@@ -2354,20 +2380,30 @@ class PositionBook:
         self.equity_history = list(d.get("equity_history", []))[-self.EQUITY_POINTS:]
         self.audit = list(d.get("order_audit_log", []))
         loaded_open = [Position.from_dict(x) for x in d.get("open_positions", [])]
-        self.open = [p for p in loaded_open if p.status in NON_TERMINAL]
-        stranded = [p for p in loaded_open if p.status not in NON_TERMINAL]   # a CLOSED entry under open_positions
-        self.closed = ([Position.from_dict(x) for x in d.get("closed_positions", [])] + stranded)[-self.closed_keep:]
+        loaded_closed = [Position.from_dict(x) for x in d.get("closed_positions", [])]
+        for p in loaded_open:
+            if p.status not in NON_TERMINAL and p.status != CLOSED:
+                # a status this build does not know (rollback, hand edit): the venues may still hold it
+                log.error("STATE_UNKNOWN_STATUS #%s %r -> DEGRADED (reconcile can still book it)", p.id, p.status)
+                p.status = DEGRADED
+        stranded_closed = [p for p in loaded_open if p.status == CLOSED]          # CLOSED under open_positions
+        stranded_open = [p for p in loaded_closed if p.status in NON_TERMINAL]    # live under closed_positions
+        if stranded_closed or stranded_open:
+            log.warning("STATE_REPARTITIONED %d closed entries under open, %d live entries under closed",
+                        len(stranded_closed), len(stranded_open))
+        self.open = [p for p in loaded_open if p.status != CLOSED] + stranded_open
+        self.closed = ([p for p in loaded_closed if p.status not in NON_TERMINAL] + stranded_closed)[-self.closed_keep:]
         self._closed_dicts = [p.to_dict() for p in self.closed]
         highest = max((p.id for p in self.open + self.closed), default=0)
         self.next_id = max(int(d.get("next_id", 1)), highest + 1)   # never reuse an id the file still holds
 
 
 def _sanitize(obj):
-    """Replace non-finite floats with None so the dashboard's JSON.parse never chokes."""
+    """Replace non-finite floats with None so the dashboard's JSON.parse never chokes; coerce non-primitive keys."""
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
+        return {(k if isinstance(k, (str, int, float, bool)) or k is None else str(k)): _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
     return obj
@@ -2382,31 +2418,37 @@ def dumps_state(state: dict) -> str:
 
 
 class StateStore:
-    """Atomic, durable JSON state. The live file is NEVER absent: write a uniquely named tmp →
-    flush+fsync → hard-link the current file to `.bak` → rename tmp over the live file. Saves are
-    serialized by a lock so an overlapping shutdown save cannot race the sweep's save."""
+    """Atomic JSON state. The live file is NEVER absent: write a uniquely named tmp → flush+fsync →
+    hard-link the current file to `.bak` → rename tmp over the live file. `save()` is serialized by a
+    thread lock and `save_async()` additionally by an asyncio lock, so an overlapping shutdown save
+    cannot race the sweep's save. Stale tmp files from a crash are removed at start-up."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.bak = self.path.with_suffix(self.path.suffix + ".bak")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
+        self._tlock = threading.Lock()
+        for stale in self.path.parent.glob(f"{self.path.name}.*.tmp"):
+            stale.unlink(missing_ok=True)
 
     def save(self, state: dict) -> None:
         payload = dumps_state(state)
-        tmp = self.path.with_suffix(f"{self.path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
-        with open(tmp, "w") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        link = self.path.with_suffix(self.path.suffix + ".bak.tmp")
-        try:
-            link.unlink(missing_ok=True)
-            os.link(self.path, link)          # the live file itself is never unlinked
-            os.replace(link, self.bak)
-        except FileNotFoundError:
-            pass                              # first save: nothing to back up
-        os.replace(tmp, self.path)
+        uniq = f"{os.getpid()}.{threading.get_ident()}"
+        tmp = self.path.with_suffix(f"{self.path.suffix}.{uniq}.tmp")
+        link = self.path.with_suffix(f"{self.path.suffix}.{uniq}.bak.tmp")
+        with self._tlock:
+            with open(tmp, "w") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                link.unlink(missing_ok=True)
+                os.link(self.path, link)          # the live file itself is never unlinked
+                os.replace(link, self.bak)
+            except FileNotFoundError:
+                pass                              # first save: nothing to back up
+            os.replace(tmp, self.path)
 
     async def save_async(self, state: dict) -> None:
         """Serialize + write off the event loop (state must be a snapshot the loop no longer mutates)."""
@@ -2466,12 +2508,12 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
     return d
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_positions.py -q`
 Expected: `9 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/positions.py deploy-bbo/tests/test_positions.py

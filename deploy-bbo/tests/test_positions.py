@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -145,10 +146,27 @@ def test_state_file_is_never_absent_and_saves_do_not_race(tmp_path):
     assert not (tmp_path / "real_state.json.bak.tmp").exists()
     assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]      # no stray temp files
 
+    # a watcher thread must never observe the live file absent while saves run back to back
+    absent = []
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            if not (tmp_path / "real_state.json").exists():
+                absent.append(1)
+    w = threading.Thread(target=watch, daemon=True)
+    w.start()
+    for i in range(50):
+        store.save({"n": 10 + i})
+
     async def concurrent():
         await asyncio.gather(store.save_async({"n": 3}), store.save_async({"n": 4}))
     asyncio.run(concurrent())
+    stop.set()
+    w.join()
+    assert not absent
     assert store.load()["n"] in (3, 4) and (tmp_path / "real_state.json").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     (tmp_path / "real_state.json").unlink()                                   # torn save: only the backup survives
     with pytest.raises(StateCorrupt, match="torn save"):
         store.load()
@@ -164,5 +182,13 @@ def test_non_object_state_and_stranded_closed_entries(tmp_path):
     book = PositionBook()
     book.load({"open_positions": [closed, live]})                             # a CLOSED entry under open_positions
     assert [p.id for p in book.open] == [4] and [p.id for p in book.closed] == [3] and book.next_id == 5
+    weird = Position(5, "X", "a", "b", "FROM_THE_FUTURE", "TT").to_dict()      # unknown status -> DEGRADED, kept open
+    live_under_closed = Position(6, "X", "a", "b", OPEN, "TT").to_dict()
+    book.load({"open_positions": [weird], "closed_positions": [live_under_closed]})
+    assert {p.id: p.status for p in book.open} == {5: DEGRADED, 6: OPEN} and book.closed == []
+    stale = tmp_path / "real_state.json.123.456.tmp"
+    stale.write_text("junk")
+    StateStore(tmp_path / "real_state.json")                                  # start-up sweeps crash leftovers
+    assert not stale.exists()
     store.save({"weird": {1, 2}})                                             # unserializable -> str fallback, no crash
     assert "weird" in store.load()
