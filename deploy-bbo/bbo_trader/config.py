@@ -178,13 +178,17 @@ def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
         if not (0 <= limits.reserve < min(limits.orders, limits.cancels)):
             raise ValueError(f"{name}: rate_limits.reserve must be in [0, min(orders, cancels)) — a reserve "
                              f"equal to the capacity would silently block every entry")
+        max_topics = int(v.get("max_topics", 50))
+        if max_topics < 0:
+            raise ValueError(f"{name}: max_topics must be >= 0 (0 = every topic on one connection) — a negative "
+                             f"value would create zero shards and silently subscribe to nothing")
         out.append(VenueConfig(
             name=name,
             role=role,
             taker_fee_pct=float(v["taker_fee_pct"]),
             maker_fee_pct=float(v["maker_fee_pct"]),
             rate_limits=limits,
-            max_topics=int(v.get("max_topics", 50)),
+            max_topics=max_topics,
             min_requote_ms=int(v.get("min_requote_ms", 500)),
             staleness_override_s=(float(v["staleness_override_s"]) if v.get("staleness_override_s") is not None else None),
             symbol_whitelist=tuple(v.get("symbol_whitelist") or ()),

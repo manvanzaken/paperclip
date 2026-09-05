@@ -1,9 +1,16 @@
 """Generic sharded WebSocket runner (ported from SpreadWatch's WSFeed, incl. its hard-won lessons):
 one connection task per shard of `max_topics` instruments, uptime-keyed reconnect backoff, optional
-app-level keepalive, non-JSON frames ignored, server closes logged with the socket's lifetime."""
+app-level keepalive, non-JSON frames ignored, server closes logged with the socket's lifetime.
+
+Unlike SpreadWatch's pure bookstore write, `on_items` here is the trading brain (App.on_bbo → evaluate
+→ spawn), so the runner never lets a consumer or parse exception take the socket down: a bad frame
+costs one quote and is logged with escalating sparsity. A socket that goes silent for `receive_timeout`
+is dropped and reconnected (the venue may never send a CLOSE), a failing keepalive drops the socket
+visibly, and teardown is bounded so a venue that keeps streaming while we leave cannot park a shard."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -46,6 +53,7 @@ class WSAdapter:
     ping: tuple[float, object] | None = None      # (interval_s, message) app-level keepalive
     text_ping_reply: tuple[str, str] | None = None  # (server text frame, our reply)
     heartbeat: float | None = 20.0                # aiohttp protocol ping
+    receive_timeout: float | None = 10.0          # drop a socket that goes silent this long
 
 
 async def _send(ws, msg) -> None:
@@ -82,6 +90,8 @@ class WSRunner:
         return len(self._connected)
 
     async def stop(self) -> None:
+        """Ends `run()` and tears down every connection at the next loop tick. The App cancels the run task
+        instead (same effect through `run()`'s finally); `stop()` serves embedding and tests."""
         self._stop = True
 
     async def run(self) -> None:
@@ -100,29 +110,43 @@ class WSRunner:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 self._connected.clear()
 
+    async def _pinger(self, ws, conn_id: int, interval: float, msg) -> None:
+        """Keepalive. A failure must be visible AND must drop the socket: a silently dead
+        pinger means MEXC kills the connection 60 s later for no logged reason."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await _send(ws, msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s conn %d keepalive failed: %r", self.adapter.name, conn_id, e)
+            with contextlib.suppress(Exception):
+                await ws.close()
+
     async def _run_conn(self, conn_id: int, insts: list[str]) -> None:
         backoff = Backoff()
         a = self.adapter
+        closes = 0
         while not self._stop:
             opened = None
             loop = asyncio.get_running_loop()
             try:
                 async with self._session_factory() as session:
-                    async with session.ws_connect(a.url, heartbeat=a.heartbeat) as ws:
+                    ws = await session.ws_connect(
+                        a.url, heartbeat=a.heartbeat,
+                        timeout=aiohttp.ClientWSTimeout(ws_receive=a.receive_timeout, ws_close=10.0))
+                    try:
                         for m in a.subscribe(insts):
                             await _send(ws, m)
                         pinger = None
                         if a.ping:
                             interval, msg = a.ping
-
-                            async def _pinger():
-                                while True:
-                                    await asyncio.sleep(interval)
-                                    await _send(ws, msg)
-                            pinger = asyncio.create_task(_pinger())
+                            pinger = asyncio.create_task(self._pinger(ws, conn_id, interval, msg))
                         self._connected.add(conn_id)
                         opened = loop.time()
                         state: dict = {}
+                        bad = 0
                         try:
                             async for msg in ws:
                                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -139,14 +163,28 @@ class WSRunner:
                                     continue
                                 if not isinstance(raw, dict):
                                     continue
-                                items = a.parse(raw, state)
-                                if items:
-                                    self.on_items(items)
+                                try:
+                                    items = a.parse(raw, state)
+                                    if items:
+                                        self.on_items(items)
+                                except Exception:  # noqa: BLE001 — a bad frame or a consumer
+                                    bad += 1     # bug costs one quote, never the socket
+                                    if bad in (1, 10, 100) or bad % 1000 == 0:
+                                        log.exception("%s conn %d dropped frame #%d", a.name, conn_id, bad)
                         finally:
                             if pinger:
                                 pinger.cancel()
-                        log.info("%s conn %d closed by server (%d insts, lived %.0fs)",
-                                 a.name, conn_id, len(insts), loop.time() - opened)
+                                with contextlib.suppress(asyncio.CancelledError, Exception):
+                                    await pinger
+                        closes += 1      # first close per shard at INFO, a flapping venue at DEBUG
+                        log.log(logging.INFO if closes == 1 else logging.DEBUG,
+                                "%s conn %d closed by server #%d (%d insts, lived %.0fs, %d bad frames)",
+                                a.name, conn_id, closes, len(insts), loop.time() - opened, bad)
+                    finally:
+                        # ws.close() restarts its ws_close timeout for every non-CLOSE frame,
+                        # so a venue still streaming while we leave can park this task forever.
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(ws.close(), 5.0)
             except asyncio.CancelledError:
                 self._connected.discard(conn_id)
                 raise

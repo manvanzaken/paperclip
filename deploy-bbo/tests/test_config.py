@@ -237,3 +237,13 @@ def test_rate_limits_are_validated(tmp_path):
     venues.write_text(json.dumps({"mexc": {**base, "rate_limits": {"orders": 27, "cancels": 5, "window_s": 10, "reserve": 4, "shared": True}}}))
     with pytest.raises(ValueError, match="orders == cancels"):
         load_config(env=env)
+
+
+def test_max_topics_must_be_non_negative(tmp_path):
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    venues = tmp_path / "venues.json"
+    env = {"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked)}
+    venues.write_text(json.dumps({"mexc": {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0, "max_topics": -1}}))
+    with pytest.raises(ValueError, match="max_topics must be >= 0"):
+        load_config(env=env)
