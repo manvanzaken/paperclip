@@ -57,7 +57,7 @@ def _top(d: dict, inst: str, contract_size: float, ts_ms: object, now: float) ->
     bids, asks = d.get("bids") or [], d.get("asks") or []
     if not bids or not asks:
         return None
-    return BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]), float(asks[0][1]),
+    return BBO(NAME, to_symbol(inst), _num(bids[0][0]), _num(bids[0][1]), _num(asks[0][0]), _num(asks[0][1]),
                float(ts_ms or 0) / 1000.0, now, contract_size)
 
 

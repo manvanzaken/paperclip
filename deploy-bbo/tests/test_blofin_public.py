@@ -5,8 +5,10 @@ from bbo_trader.venues import blofin
 
 def test_instrument_mapping_and_subscribe():
     assert blofin.to_instrument("BTCUSDT") == "BTC-USDT" and blofin.to_symbol("BTC-USDT") == "BTCUSDT"
-    assert blofin.subscribe(["A-USDT", "B-USDT"]) == [{"op": "subscribe", "args": [
-        {"channel": "books5", "instId": "A-USDT"}, {"channel": "books5", "instId": "B-USDT"}]}]
+    # one message per instrument: BloFin validates a subscribe message atomically (one bad instId → nothing subscribed)
+    assert blofin.subscribe(["A-USDT", "B-USDT"]) == [{"op": "subscribe", "args": [{"channel": "books5", "instId": "A-USDT"}]},
+                                                      {"op": "subscribe", "args": [{"channel": "books5", "instId": "B-USDT"}]}]
+    assert all(len(m["args"]) == 1 for m in blofin.subscribe([f"S{i}-USDT" for i in range(50)]))
 
 
 def test_parse_books5_dict_and_list_shapes():
@@ -83,11 +85,8 @@ class _Session:
         return _Resp(self.status, self.body)
 
 
-LIVE_INSTRUMENT = {"instId": "BTC-USDT", "baseCurrency": "BTC", "quoteCurrency": "USDT", "contractValue": "0.0001",
-                   "listTime": "1755507600000", "maxLeverage": "125", "minSize": "1", "lotSize": "1", "tickSize": "0.1",
-                   "instType": "SWAP", "contractType": "linear", "state": "live", "settleCurrency": "USDT", "offTime": ""}
-LIVE_TICKER = {"instId": "BTC-USDT", "last": "79758.8", "askPrice": "79755.2", "askSize": "26613", "bidPrice": "79755.1",
-               "bidSize": "1935", "volCurrency24h": "18.9118", "vol24h": "189118", "ts": "1788625085021"}
+LIVE_INSTRUMENT = {"instId": "BTC-USDT", "baseCurrency": "BTC", "quoteCurrency": "USDT", "contractValue": "0.001", "listTime": "1673517600000", "expireTime": "4918462709025", "maxLeverage": "150", "assetClass": "Crypto", "minSize": "0.1", "lotSize": "0.1", "tickSize": "0.1", "instType": "SWAP", "contractType": "linear", "maxLimitSize": "1000000", "maxMarketSize": "100000", "state": "live", "thresholdX": "0.02", "thresholdY": "0.01", "thresholdZ": "0.02", "settleCurrency": "USDT", "offTime": ""}   # verbatim /api/v1/market/instruments row
+LIVE_TICKER = {"instId": "BTC-USDT", "last": "80032.6", "lastSize": "12", "askPrice": "80032.8", "askSize": "6416", "bidPrice": "80032.7", "bidSize": "4310", "high24h": "80163.9", "open24h": "79681.8", "low24h": "79356.4", "volCurrency24h": "1166.606", "vol24h": "1166606", "ts": "1788627625240"}   # verbatim /api/v1/market/tickers row
 LIVE_FUNDING = {"instId": "HOLO-USDT", "fundingRate": "0.000077429202847014", "fundingTime": "1788638400000",
                 "fundingInterval": "4", "fundingIntervalUnit": "hour", "fundingRateCap": "0.03", "fundingRateFloor": "-0.03"}
 LIVE_BOOKS_REST = {"code": "0", "msg": "success", "data": [{"asks": [["79738.8", "5976"], ["79738.9", "256"]],
@@ -98,8 +97,12 @@ LIVE_PUSH = {"arg": {"channel": "books5", "instId": "BTC-USDT"}, "action": "snap
 
 def test_live_shapes_round_trip():
     specs = blofin.parse_instruments({"code": "0", "msg": "success", "data": [LIVE_INSTRUMENT]})
-    assert specs["BTCUSDT"].contract_size == 0.0001 and specs["BTCUSDT"].tick == 0.1 and specs["BTCUSDT"].lot == 1.0
-    assert blofin.parse_tickers({"code": "0", "data": [LIVE_TICKER]}) == {"BTCUSDT": pytest.approx(18.9118 * 79758.8)}
+    s = specs["BTCUSDT"]
+    assert (s.contract_size, s.lot, s.min_qty, s.tick) == tuple(float(LIVE_INSTRUMENT[k]) for k in ("contractValue", "lotSize", "minSize", "tickSize"))
+    assert s.contract_size == 0.001 and s.lot == 0.1                                       # BloFin's BTC: 0.001 BTC, 0.1-contract lots
+    assert blofin.parse_tickers({"code": "0", "data": [LIVE_TICKER]}) == {
+        "BTCUSDT": pytest.approx(float(LIVE_TICKER["volCurrency24h"]) * float(LIVE_TICKER["last"]))}   # base units × last
+    assert float(LIVE_TICKER["volCurrency24h"]) == pytest.approx(float(LIVE_TICKER["vol24h"]) * float(LIVE_INSTRUMENT["contractValue"]), rel=1e-6)
     assert blofin.parse_funding({"code": "0", "data": [LIVE_FUNDING]}) == {"HOLOUSDT": (pytest.approx(7.7429202847014e-05), 1788638400.0)}
     b = blofin.parse_books5(LIVE_PUSH, {"BTC-USDT": 0.0001}, now=1.0)[0]
     assert b.bid == 79666.4 and b.ask_qty == 1233.0 and b.ts_exchange == pytest.approx(1788599375.999, abs=1e-6)
@@ -111,11 +114,18 @@ def test_live_shapes_round_trip():
 def test_instruments_isolate_bad_rows_and_unknown_instruments_yield_nothing(caplog):
     rows = [LIVE_INSTRUMENT, dict(LIVE_INSTRUMENT, instId="BAD-USDT", contractValue="n/a"),
             dict(LIVE_INSTRUMENT, instId="NUL-USDT", tickSize=None), "not-a-row", dict(LIVE_INSTRUMENT, instId="OK2-USDT"),
-            dict(LIVE_INSTRUMENT, instId="BTC-USDC", quoteCurrency="USDC")]
+            dict(LIVE_INSTRUMENT, instId="BTC-USDC", quoteCurrency="USDC"),
+            dict(LIVE_INSTRUMENT, instId="SPY-USDT", assetClass="Equity"),          # equity perp: gaps when Wall St is closed
+            dict(LIVE_INSTRUMENT, instId="INV-USDT", contractType="inverse"),
+            dict(LIVE_INSTRUMENT, instId="NAN-USDT", contractValue=float("nan"))]   # json.loads accepts a bare NaN
     with caplog.at_level(logging.WARNING, logger="bbo.blofin"):
         specs = blofin.parse_instruments({"code": "0", "data": rows})
-    assert list(specs) == ["BTCUSDT", "OK2USDT"] and "SPEC_ROWS_DROPPED blofin 3 of 6" in caplog.text
-    assert blofin.parse_tickers({"data": [dict(LIVE_TICKER, instId="BAD-USDT", last=None), LIVE_TICKER, 5]}) == {"BTCUSDT": pytest.approx(18.9118 * 79758.8)}
+    assert list(specs) == ["BTCUSDT", "OK2USDT"] and "SPEC_ROWS_DROPPED blofin 4 of 9" in caplog.text
+    # the REAL subscribe ack for a KNOWN instrument carries arg.channel == books5 but no data
+    assert blofin.parse_books5({"event": "subscribe", "arg": {"channel": "books5", "instId": "BTC-USDT"}}, {"BTC-USDT": 0.001}, 1.0) == []
+    assert blofin.parse_books5(dict(LIVE_PUSH, action="update"), {"BTC-USDT": 0.001}, 1.0) == []   # only snapshots are a top of book
+    assert blofin.parse_tickers({"data": [dict(LIVE_TICKER, instId="BAD-USDT", last=None), LIVE_TICKER, 5]}) == {
+        "BTCUSDT": pytest.approx(float(LIVE_TICKER["volCurrency24h"]) * float(LIVE_TICKER["last"]))}
     assert blofin.parse_funding({"data": [dict(LIVE_FUNDING, instId="BAD-USDT", fundingTime=""), LIVE_FUNDING]}) == {"HOLOUSDT": (pytest.approx(7.7429202847014e-05), 1788638400.0)}
     assert blofin.parse_books5(LIVE_PUSH, {}, 1.0) == []                                  # no contract size → no quote
     assert blofin.parse_books5(dict(LIVE_PUSH, data="junk"), {"BTC-USDT": 1.0}, 1.0) == []
@@ -129,6 +139,11 @@ def test_instruments_isolate_bad_rows_and_unknown_instruments_yield_nothing(capl
     assert state["errors"] == 12 and caplog.text.count("error event") == 2
     with pytest.raises(ValueError):
         blofin.to_instrument("BTCUSDC")
+    with pytest.raises(ValueError):
+        blofin.to_instrument("USDT")
+    a = feed._runner.adapter                                       # WS wiring, verified live: no server pings, idle close ~32 s
+    assert a.url == "wss://openapi.blofin.com/ws/public" and a.max_topics == 50
+    assert a.ping == (25.0, "ping") and a.data_timeout == 120.0 and a.text_ping_reply is None
 
 
 async def test_rest_client_raises_on_error_envelopes_and_never_returns_an_empty_universe():
@@ -148,7 +163,7 @@ async def test_rest_client_raises_on_error_envelopes_and_never_returns_an_empty_
     assert list(await m.fetch_specs()) == ["BTCUSDT"]
     m.session = _Session(200, json.dumps(LIVE_BOOKS_REST))
     b = await m.fetch_bbo("BTCUSDT")
-    assert b.contract_size == 0.0001 and b.ts_local == 7.0
+    assert b.contract_size == float(LIVE_INSTRUMENT["contractValue"]) and b.ts_local == 7.0   # the spec's size, not a default
     url, kw = m.session.calls[0]
     assert url.endswith("/api/v1/market/books?instId=BTC-USDT&size=5") and kw["timeout"].total == 5.0 and "User-Agent" in kw["headers"]
     assert await m.fetch_bbo("NOPEUSDT") is None

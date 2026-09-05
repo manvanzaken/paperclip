@@ -4,9 +4,12 @@ instruments / tickers / funding / books fallback. Plan 2 adds BlofinPrivate and 
 Shapes as captured live (SpreadWatch 2026-08-23, re-verified 2026-09-05): books5 `data` is a DICT on the
 WS and a one-element LIST on REST, prices/sizes are strings, keepalive is a bare text `ping` answered with
 `pong`. Errors come back as HTTP 200 + {"code": "152002", "msg": ...} with no `data` (so `_get` checks
-`code == "0"`); a rejected subscription answers {"event": "error", ...} on a healthy socket; `fundingTime`
-is the UPCOMING settlement and `fundingInterval` is 4 or 8 hours; every instrument is `state: live` today,
-contract values span 1e-4 … 1e7."""
+`code == "0"`). A subscribe MESSAGE is validated atomically: one unknown instId answers {"event": "error",
+"code": "60012", ...} and subscribes NONE of the other args in that message while the socket stays open —
+hence one message per instrument. `fundingTime` is the UPCOMING settlement and `fundingInterval` is 4 or
+8 hours (three 1 h contracts); every instrument is `state: live` today (delistings simply vanish from the
+list), `expireTime` is a year-2124 sentinel, contract values span 1e-4 … 1e7, and the USDT set includes
+equity/index/commodity perps (`assetClass`), which are excluded: their underlying markets close."""
 from __future__ import annotations
 
 import json
@@ -41,7 +44,10 @@ def to_symbol(instrument: str) -> str:
 
 
 def subscribe(insts: list[str]) -> list[dict]:
-    return [{"op": "subscribe", "args": [{"channel": "books5", "instId": i} for i in insts]}]
+    """One message per instrument (verified live 2026-09-05): BloFin validates a subscribe message atomically,
+    so a single delisted instId in a batched message would black out the whole shard — silently, because
+    our own text pings keep the empty socket alive."""
+    return [{"op": "subscribe", "args": [{"channel": "books5", "instId": i}]} for i in insts]
 
 
 def _num(x: object) -> float:
@@ -64,13 +70,17 @@ def _top(d: dict, inst: str, contract_size: float, now: float) -> BBO | None:
     bids, asks = d.get("bids") or [], d.get("asks") or []
     if not bids or not asks:
         return None
-    return BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]), float(asks[0][1]),
+    return BBO(NAME, to_symbol(inst), _num(bids[0][0]), _num(bids[0][1]), _num(asks[0][0]), _num(asks[0][1]),
                float(d.get("ts") or 0) / 1000.0, now, contract_size)
 
 
 def parse_books5(raw: dict, contract_size: dict[str, float], now: float) -> list[BBO]:
-    """books5 push → one BBO per row. An instrument without a known contract size yields nothing."""
+    """books5 push → one BBO per row. An instrument without a known contract size yields nothing. books5 is
+    snapshot-only; the sibling `books` channel sends `action: "update"` deltas with partial sides, so anything
+    but a snapshot is ignored rather than read as a top of book."""
     if (raw.get("arg") or {}).get("channel") != "books5" or "data" not in raw:
+        return []
+    if raw.get("action") not in (None, "snapshot"):
         return []
     inst = str(raw["arg"].get("instId", ""))
     cs = contract_size.get(inst)
@@ -99,6 +109,8 @@ def parse_instruments(raw: dict) -> dict[str, VenueSpec]:
             inst = str(c.get("instId", ""))
             if not inst.endswith("-USDT") or str(c.get("state", "live")) != "live":
                 continue
+            if c.get("contractType", "linear") != "linear" or c.get("assetClass", "Crypto") != "Crypto":
+                continue        # inverse contracts size the other way; equity/commodity perps gap when their market is closed
             sym = to_symbol(inst)
             out[sym] = VenueSpec(NAME, sym, inst, _num(c.get("contractValue")), _num(c.get("lotSize")),
                                  _num(c.get("minSize")), _num(c.get("tickSize")))
@@ -150,7 +162,7 @@ class BlofinPublic:
             on_items=self._emit, session_factory=session_factory)
 
     def _parse(self, raw: dict, state: dict) -> list[BBO]:
-        if raw.get("event") == "error":              # a rejected topic on an otherwise healthy socket
+        if raw.get("event") == "error":              # the whole subscribe message was refused; the socket stays open
             n = state["errors"] = state.get("errors", 0) + 1
             if n in (1, 10, 100) or n % 1000 == 0:
                 log.warning("blofin error event #%d: code=%s %.200s", n, raw.get("code"), raw.get("msg"))
