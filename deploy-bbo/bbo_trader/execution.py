@@ -214,7 +214,7 @@ class Executor:
             in_doubt = True
         ack_ms = (asyncio.get_running_loop().time() - t0) * 1000.0
         self.metrics.record("submit_to_ack", ack_ms)
-        self.book.audit_order({"ts": now, "pos": pos.id, "leg": leg, "venue": venue, "side": side, "qty": qty,
+        self.book.audit_order({"ts": now, "pos": pos.id, "symbol": pos.symbol, "leg": leg, "venue": venue, "side": side, "qty": qty,
                                "type": "market", "reduce_only": reduce_only, "client_id": cid,
                                "ok": ack.ok and not in_doubt, "error": ack.error})
         if not ack.ok:
@@ -457,7 +457,7 @@ class Executor:
         except Exception as e:  # noqa: BLE001 — in doubt: the venue may hold a resting order we did not see acked
             log.error("TM_POST_IN_DOUBT #%d %s: %r — querying the venue", pos.id, v.name, e)
             ack = await self._resolve_doubtful_post(v, pos, cid)
-        self.book.audit_order({"ts": now, "pos": pos.id, "leg": "maker", "venue": v.name, "side": pos.maker_side,
+        self.book.audit_order({"ts": now, "pos": pos.id, "symbol": pos.symbol, "leg": "maker", "venue": v.name, "side": pos.maker_side,
                                "qty": pos.maker_qty, "price": pos.maker_rest_price, "type": "post_only",
                                "reduce_only": reduce_only, "client_id": cid, "ok": ack.ok, "error": ack.error})
         if not ack.ok:

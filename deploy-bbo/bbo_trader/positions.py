@@ -58,6 +58,23 @@ def finalize_pnl(pos: Position) -> None:
         pos.exit_spread_pct = (pos.exit_price_a - pos.exit_price_b) / pos.exit_price_b * 100.0
 
 
+def dashboard_audit_entry(entry: dict) -> dict:
+    """The executor records an order under its own keys (`ts`, `venue`, `qty`, `price`, `type`, `leg`, `client_id`, `ok`);
+    the legacy dashboard's ORDER AUDIT LOG reads `timestamp`, `action`, `exchange`, `symbol`, `size`, `fill_price`,
+    `order_id`, `success`. Keep both — the dashboard stays unmodified and the executor's tests keep their names."""
+    e = dict(entry)
+    if "ts" in e and "timestamp" not in e:
+        try:
+            e["timestamp"] = _iso(float(e["ts"]))
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    e.setdefault("action", " ".join(str(x) for x in (e.get("type"), e.get("leg")) if x) or "order")
+    for dash, ours in (("exchange", "venue"), ("size", "qty"), ("fill_price", "price"), ("order_id", "client_id"), ("success", "ok")):
+        if dash not in e and ours in e:
+            e[dash] = e[ours]
+    return e
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
@@ -159,7 +176,7 @@ class PositionBook:
             del self.equity_history[:-self.EQUITY_POINTS]
 
     def audit_order(self, entry: dict) -> None:
-        self.audit.append(entry)
+        self.audit.append(dashboard_audit_entry(entry))
         del self.audit[:-1000]
 
     def to_dict(self) -> dict:
@@ -177,7 +194,7 @@ class PositionBook:
         self.peak_equity = float(d.get("peak_equity", 0.0))
         self.max_drawdown_pct = float(d.get("max_drawdown_pct", 0.0))
         self.equity_history = list(d.get("equity_history", []))[-self.EQUITY_POINTS:]
-        self.audit = list(d.get("order_audit_log", []))
+        self.audit = [dashboard_audit_entry(e) for e in d.get("order_audit_log", []) if isinstance(e, dict)]
         loaded_open = [Position.from_dict(x) for x in d.get("open_positions", [])]
         loaded_closed = [Position.from_dict(x) for x in d.get("closed_positions", [])]
         for p in loaded_open:

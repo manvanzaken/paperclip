@@ -54,6 +54,10 @@ async def test_quote_to_tt_position_to_exit_and_state_file(tmp_path):
     assert state["spread_scanner"][0]["symbol"] == SYM and (tmp_path / "bbo_heartbeat_paper").exists()
     assert app._market_data_interval() == 3600.0 and state["bbo"]["connected"] == {}
     assert state["equity"] == pytest.approx(200.0 + pos.net_pnl_usd)
+    audit = state["order_audit_log"][0]                              # the legacy dashboard's audit columns are filled
+    assert audit["symbol"] == SYM and audit["exchange"] == audit["venue"] and audit["size"] == audit["qty"]
+    assert audit["order_id"] == audit["client_id"] and audit["success"] is True and audit["action"] == "market entry_a"
+    assert audit["timestamp"].startswith("20") and "T" in audit["timestamp"]
 
 
 async def test_quote_to_tm_position_and_halt_cancels_resting(tmp_path):
