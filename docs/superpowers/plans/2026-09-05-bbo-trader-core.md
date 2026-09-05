@@ -79,7 +79,7 @@ deploy-bbo/
 - Create: `deploy-bbo/requirements.txt`, `deploy-bbo/pytest.ini`, `deploy-bbo/.gitignore`, `deploy-bbo/bbo_trader/__init__.py`, `deploy-bbo/bbo_trader/venues/__init__.py`, `deploy-bbo/config/venues.json`, `deploy-bbo/config/blocked_symbols.json`, `deploy-bbo/bbo_trader/config.py`
 - Test: `deploy-bbo/tests/__init__.py`, `deploy-bbo/tests/test_config.py`
 
-- [ ] **Step 1: Create the folder, venv, and dependency files**
+- [x] **Step 1: Create the folder, venv, and dependency files**
 
 ```bash
 cd "/Users/vandenboogaard/Claude projects/Claude Paperclip/.claude/worktrees/trader-realtime-bid-ask-f22eff"
@@ -95,7 +95,7 @@ touch bbo_trader/__init__.py bbo_trader/venues/__init__.py tests/__init__.py
 
 Expected: pip finishes without errors; `.venv/bin/python -c "import aiohttp, pytest_asyncio"` prints nothing.
 
-- [ ] **Step 2: Write the venue registry and blocked-symbol seed**
+- [x] **Step 2: Write the venue registry and blocked-symbol seed**
 
 `config/venues.json` — only `mexc` and `blofin` are `trade` in this plan; every other venue is `off` until Plan 3 gives it an adapter. Fees are the SpreadWatch tables (percent per leg, verify against live accounts).
 
@@ -153,7 +153,7 @@ print(len(syms), "blocked symbols written")'
 
 Expected: `143 blocked symbols written` (the count follows the legacy list; anything between 130 and 180 is fine).
 
-- [ ] **Step 3: Write the failing config tests**
+- [x] **Step 3: Write the failing config tests**
 
 `tests/test_config.py`:
 
@@ -382,12 +382,12 @@ def test_bad_mode_reported_before_missing_files(tmp_path):
         })
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [x] **Step 4: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.config'` (14 tests collected, all erroring at import)
 
-- [ ] **Step 5: Implement `bbo_trader/config.py`**
+- [x] **Step 5: Implement `bbo_trader/config.py`**
 
 ```python
 """Configuration: environment defaults → DATA_DIR/bot_config.json overrides → venues.json registry.
@@ -620,12 +620,12 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     return Config(**overrides)
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
 Expected: `14 passed`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd "/Users/vandenboogaard/Claude projects/Claude Paperclip/.claude/worktrees/trader-realtime-bid-ask-f22eff"
@@ -641,7 +641,7 @@ git commit -m "feat(bbo): scaffold deploy-bbo package with config loader and ven
 - Create: `deploy-bbo/bbo_trader/models.py`
 - Test: `deploy-bbo/tests/conftest.py`, `deploy-bbo/tests/test_models.py`
 
-- [ ] **Step 1: Write shared test helpers**
+- [x] **Step 1: Write shared test helpers**
 
 `tests/conftest.py`:
 
@@ -689,7 +689,7 @@ def clock():
     return FakeClock()
 ```
 
-- [ ] **Step 2: Write the failing model tests**
+- [x] **Step 2: Write the failing model tests**
 
 `tests/test_models.py`:
 
@@ -765,12 +765,12 @@ def test_state_constants():
     assert CLOSED not in NON_TERMINAL and OPEN in NON_TERMINAL and len(NON_TERMINAL) == 8
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_models.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.models'`
 
-- [ ] **Step 4: Implement `bbo_trader/models.py`**
+- [x] **Step 4: Implement `bbo_trader/models.py`**
 
 ```python
 """Core data types. Pure dataclasses, no I/O."""
@@ -994,12 +994,12 @@ class Position:
         return cls(**kw)
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_models.py -q`
 Expected: `7 passed`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/models.py deploy-bbo/tests/conftest.py deploy-bbo/tests/test_models.py
@@ -1014,7 +1014,7 @@ git commit -m "feat(bbo): core data types (BBO, OrderEvent, Intent, Position) wi
 - Create: `deploy-bbo/bbo_trader/quotes.py`
 - Test: `deploy-bbo/tests/test_quotes.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `tests/test_quotes.py`:
 
@@ -1039,12 +1039,12 @@ def test_set_get_and_staleness():
     assert board.symbols() == {"XYZUSDT"}
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_quotes.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.quotes'`
 
-- [ ] **Step 3: Implement `bbo_trader/quotes.py`**
+- [x] **Step 3: Implement `bbo_trader/quotes.py`**
 
 ```python
 """QuoteBoard: latest best bid/ask per venue×symbol with staleness. Pure, no I/O."""
@@ -1097,12 +1097,12 @@ class QuoteBoard:
         return set(self._venues_by_symbol)
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_quotes.py -q`
 Expected: `1 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/quotes.py deploy-bbo/tests/test_quotes.py
