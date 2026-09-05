@@ -1995,12 +1995,14 @@ git commit -m "feat(bbo): per-venue token-bucket rate budgets with reserve"
 `tests/test_positions.py`:
 
 ```python
+import json
+
 import pytest
 
 from bbo_trader.models import (Position, TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING,
                                TT_EXITING, CLOSED, DEGRADED)
-from bbo_trader.positions import (transition, InvalidTransition, finalize_pnl, PositionBook, StateStore,
-                                  build_state)
+from bbo_trader.positions import (transition, InvalidTransition, StateCorrupt, finalize_pnl, PositionBook,
+                                  StateStore, build_state)
 
 
 def test_transition_table():
@@ -2016,6 +2018,10 @@ def test_transition_table():
     transition(p, CLOSED)
     with pytest.raises(InvalidTransition):
         transition(p, OPEN)
+    q = Position(2, "XYZUSDT", "blofin", "mexc", OPEN, "TT")
+    transition(q, CLOSED)                     # reconcile: closed externally
+    r = Position(3, "XYZUSDT", "blofin", "mexc", OPEN, "TT")
+    transition(r, DEGRADED)                   # reconcile: held but unactionable
 
 
 def test_finalize_pnl_two_legs():
@@ -2036,14 +2042,20 @@ def test_book_lifecycle_and_totals():
     assert (p1.id, p2.id, book.next_id) == (1, 2, 3)
     assert book.for_symbol("XYZUSDT") == [p1] and book.get(2) is p2
     assert book.resting_counts() == {"blofin": 1}
+    assert book.by_status(MAKER_RESTING) == [p2] and book.by_status(OPEN) == []
     p1.status = OPEN
     p1.entry_price_a, p1.entry_price_b, p1.exit_price_a, p1.exit_price_b = 1.0, 1.0, 0.99, 1.0
     transition(p1, TT_EXITING)
     book.close(p1, "convergence", now=200.0)
     assert p1.status == CLOSED and p1.exit_reason == "convergence" and p1.exit_time == 200.0
     assert book.total_trades == 1 and book.total_wins == 1 and book.total_pnl_usd == pytest.approx(0.25)
+    book.close(p1, "convergence", now=201.0)          # late duplicate terminal event: idempotent
+    assert book.total_trades == 1 and len(book.closed) == 1 and p1.exit_time == 200.0
+    assert book.get(1) is None and book.get(1, include_closed=True) is p1
     book.discard(p2)                                  # cancelled maker, never a trade
     assert book.open == [] and book.total_trades == 1
+    with pytest.raises(InvalidTransition):
+        book.discard(p1)                              # closed positions cannot be discarded
     for i in range(3):                                # closed list is capped
         q = book.new("QQQUSDT", "blofin", "mexc", TT_ENTERING, "TT")
         q.status = TT_EXITING
@@ -2053,6 +2065,8 @@ def test_book_lifecycle_and_totals():
     book.mark_equity(90.0, now=10.0)                  # within 60 s -> no new history point
     assert book.peak_equity == 100.0 and book.max_drawdown_pct == pytest.approx(10.0)
     assert len(book.equity_history) == 1
+    assert book.equity_history[0]["t"].startswith("1970-01-01T00:00:00") and book.equity_history[0]["v"] == 100.0
+    assert PositionBook(closed_keep=0).closed_keep == 1
 
 
 def test_state_store_roundtrip_and_dashboard_schema(tmp_path):
@@ -2061,14 +2075,14 @@ def test_state_store_roundtrip_and_dashboard_schema(tmp_path):
     p.client_ids["maker"] = "bp1-maker-1"
     state = build_state(book, equity=210.0, cash=200.0, starting_capital=200.0, mode="paper",
                         risk_state={"pair_stats": {}, "venue_symbol_blacklist": ["blofin|HNTUSDT"],
-                                    "symbol_blacklist": {}, "pair_strikes": {}, "pair_blacklist": {}},
+                                    "symbol_blacklist": {}, "pair_strikes": {}, "pair_blacklist": {}, "halted": True},
                         balances={"mexc": {"available": 100.0}}, scanner=[], bbo={"latency": {}},
                         saved_at=1_700_000_100.0)
     for key in ("state_saved_at_ts", "cash", "equity", "open_positions", "closed_positions", "total_pnl_usd",
                 "pair_stats", "blofin_risk_blacklist", "balance_cache", "spread_scanner", "dry_run",
                 "kill_switch", "saved_at", "bbo", "risk", "order_audit_log", "equity_history"):
         assert key in state, key
-    assert state["blofin_risk_blacklist"] == ["HNTUSDT"] and state["kill_switch"] is False
+    assert state["blofin_risk_blacklist"] == ["HNTUSDT"] and state["kill_switch"] is True   # mirrors the manual halt
     store = StateStore(tmp_path / "real_state.json")
     store.save(state)
     loaded = store.load()
@@ -2077,6 +2091,8 @@ def test_state_store_roundtrip_and_dashboard_schema(tmp_path):
     book2.load(loaded)
     assert book2.open[0] == p and book2.next_id == 2
     assert StateStore(tmp_path / "missing.json").load() is None
+    store.save(state)                                  # second save keeps the previous file as .bak
+    assert store.load_backup()["open_positions"][0]["id"] == 1
 
 
 def test_closed_dicts_are_cached_and_reloaded():
@@ -2092,6 +2108,29 @@ def test_closed_dicts_are_cached_and_reloaded():
     book2 = PositionBook(closed_keep=2)
     book2.load(d)
     assert [c["id"] for c in book2.to_dict()["closed_positions"]] == [2, 3]
+
+
+def test_corrupt_state_is_never_a_fresh_start(tmp_path):
+    store = StateStore(tmp_path / "real_state.json")
+    (tmp_path / "real_state.json").write_text('{"open_positions": [')     # truncated by a crash
+    with pytest.raises(StateCorrupt):
+        store.load()
+    assert store.load_backup() is None                                    # no backup yet
+    store.save({"a": 1})                                                  # fresh save after repair
+    assert store.load() == {"a": 1}
+
+
+def test_state_never_emits_nan_and_load_repairs_next_id(tmp_path):
+    store = StateStore(tmp_path / "real_state.json")
+    store.save({"equity": float("nan"), "nested": [float("inf"), 1.0]})
+    text = (tmp_path / "real_state.json").read_text()
+    assert "NaN" not in text and "Infinity" not in text
+    assert json.loads(text) == {"equity": None, "nested": [None, 1.0]}
+    book = PositionBook()
+    book.load({"next_id": 1, "open_positions": [Position(7, "X", "a", "b", OPEN, "TT").to_dict()]})
+    assert book.next_id == 8                                              # never reuse an id the file holds
+    book.load({})                                                         # tolerant of missing keys
+    assert book.open == [] and book.total_trades == 0
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2105,7 +2144,10 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.positions'
 """Position lifecycle: transition table, P&L finalization, PositionBook, StateStore, dashboard state."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2113,11 +2155,15 @@ from pathlib import Path
 from .models import (Position, TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING,
                      TT_EXITING, EXIT_HEDGING, DEGRADED, CLOSED)
 
+log = logging.getLogger("bbo.state")
+
+# OPEN -> CLOSED / DEGRADED exist for reconciliation: a position the venues no longer hold (closed
+# externally, liquidated) is booked closed; one we hold but cannot act on becomes DEGRADED.
 ALLOWED: dict[str, set[str]] = {
     TT_ENTERING: {OPEN, CLOSED, DEGRADED},
     MAKER_RESTING: {HEDGING, CLOSED, TT_ENTERING},
     HEDGING: {OPEN, CLOSED, DEGRADED},
-    OPEN: {TT_EXITING, EXIT_MAKER_RESTING},
+    OPEN: {TT_EXITING, EXIT_MAKER_RESTING, CLOSED, DEGRADED},
     EXIT_MAKER_RESTING: {EXIT_HEDGING, TT_EXITING, OPEN},
     TT_EXITING: {CLOSED, DEGRADED},
     EXIT_HEDGING: {CLOSED, DEGRADED, TT_EXITING},
@@ -2128,6 +2174,11 @@ ALLOWED: dict[str, set[str]] = {
 
 class InvalidTransition(Exception):
     pass
+
+
+class StateCorrupt(Exception):
+    """The state file exists but cannot be read or parsed. Never treat this as a fresh start: the
+    venues may still hold the positions the file described."""
 
 
 def transition(pos: Position, new_status: str) -> None:
@@ -2149,11 +2200,19 @@ def finalize_pnl(pos: Position) -> None:
         pos.exit_spread_pct = (pos.exit_price_a - pos.exit_price_b) / pos.exit_price_b * 100.0
 
 
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
 class PositionBook:
     """All non-terminal positions live in `open` (resting, hedging, open, exiting, degraded).
 
     Closed positions are immutable once closed, so their dashboard dicts are cached at close time:
-    state saves (up to 2/s) must not re-serialize hundreds of closed positions."""
+    state saves (up to 2/s) must not re-serialize hundreds of closed positions. `close()` is
+    idempotent — the cancel-after-fill / fill-after-cancel races the spec designs for may deliver a
+    late terminal event after a position was already booked."""
+
+    EQUITY_POINTS = 2000        # at the 60 s cadence ≈ 33 h of dashboard chart; keeps the state file small
 
     def __init__(self, closed_keep: int = 200):
         self.open: list[Position] = []
@@ -2165,9 +2224,9 @@ class PositionBook:
         self.total_pnl_usd = 0.0
         self.peak_equity = 0.0
         self.max_drawdown_pct = 0.0
-        self.equity_history: list[dict] = []
-        self.audit: list[dict] = []
-        self.closed_keep = closed_keep
+        self.equity_history: list[dict] = []   # {"t": iso, "v": equity, "_ts": float} — the dashboard reads t/v
+        self.audit: list[dict] = []            # 1000 kept in memory, the last 200 persisted
+        self.closed_keep = max(1, closed_keep)
         self.dirty = False
 
     def new(self, symbol: str, venue_a: str, venue_b: str, status: str, mode: str, **kw) -> Position:
@@ -2178,10 +2237,14 @@ class PositionBook:
         self.dirty = True
         return pos
 
-    def get(self, pos_id: int) -> Position | None:
+    def get(self, pos_id: int, include_closed: bool = False) -> Position | None:
         for p in self.open:
             if p.id == pos_id:
                 return p
+        if include_closed:
+            for p in self.closed:
+                if p.id == pos_id:
+                    return p
         return None
 
     def for_symbol(self, symbol: str) -> list[Position]:
@@ -2198,8 +2261,9 @@ class PositionBook:
         return out
 
     def close(self, pos: Position, exit_reason: str, now: float, counts_as_trade: bool = True) -> None:
-        if pos.status != CLOSED:
-            transition(pos, CLOSED)
+        if pos.status == CLOSED:
+            return                                     # already booked: a late duplicate event
+        transition(pos, CLOSED)
         pos.exit_reason = exit_reason
         pos.exit_time = now
         finalize_pnl(pos)
@@ -2217,7 +2281,10 @@ class PositionBook:
         self.dirty = True
 
     def discard(self, pos: Position) -> None:
-        """Drop a position that never became a trade (resting maker cancelled with zero fill)."""
+        """Drop a position that never became a trade (nothing filled). Anything that may hold a leg on
+        a venue must be closed, not discarded."""
+        if pos.status not in (TT_ENTERING, MAKER_RESTING):
+            raise InvalidTransition(f"#{pos.id} discard from {pos.status}")
         if pos in self.open:
             self.open.remove(pos)
         self.dirty = True
@@ -2228,9 +2295,10 @@ class PositionBook:
         if self.peak_equity > 0:
             dd = (self.peak_equity - equity) / self.peak_equity * 100.0
             self.max_drawdown_pct = max(self.max_drawdown_pct, dd)
-        if not self.equity_history or now - self.equity_history[-1]["ts"] >= every_s:
-            self.equity_history.append({"ts": now, "equity": round(equity, 4)})
-            del self.equity_history[:-10000]
+        last_ts = float((self.equity_history[-1].get("_ts") or 0.0)) if self.equity_history else 0.0
+        if not self.equity_history or now - last_ts >= every_s:
+            self.equity_history.append({"t": _iso(now), "v": round(equity, 4), "_ts": now})
+            del self.equity_history[:-self.EQUITY_POINTS]
 
     def audit_order(self, entry: dict) -> None:
         self.audit.append(entry)
@@ -2239,53 +2307,95 @@ class PositionBook:
     def to_dict(self) -> dict:
         return {"next_id": self.next_id, "total_trades": self.total_trades, "total_wins": self.total_wins,
                 "total_pnl_usd": self.total_pnl_usd, "peak_equity": self.peak_equity,
-                "max_drawdown_pct": self.max_drawdown_pct, "equity_history": self.equity_history[-10000:],
+                "max_drawdown_pct": self.max_drawdown_pct, "equity_history": self.equity_history[-self.EQUITY_POINTS:],
                 "open_positions": [p.to_dict() for p in self.open],
                 "closed_positions": list(self._closed_dicts),
                 "order_audit_log": self.audit[-200:]}
 
     def load(self, d: dict) -> None:
-        self.next_id = int(d.get("next_id", 1))
         self.total_trades = int(d.get("total_trades", 0))
         self.total_wins = int(d.get("total_wins", 0))
         self.total_pnl_usd = float(d.get("total_pnl_usd", 0.0))
         self.peak_equity = float(d.get("peak_equity", 0.0))
         self.max_drawdown_pct = float(d.get("max_drawdown_pct", 0.0))
-        self.equity_history = list(d.get("equity_history", []))
+        self.equity_history = list(d.get("equity_history", []))[-self.EQUITY_POINTS:]
         self.audit = list(d.get("order_audit_log", []))
         self.open = [Position.from_dict(x) for x in d.get("open_positions", [])]
         self.closed = [Position.from_dict(x) for x in d.get("closed_positions", [])][-self.closed_keep:]
         self._closed_dicts = [p.to_dict() for p in self.closed]
+        highest = max((p.id for p in self.open + self.closed), default=0)
+        self.next_id = max(int(d.get("next_id", 1)), highest + 1)   # never reuse an id the file still holds
+
+
+def _sanitize(obj):
+    """Replace non-finite floats with None so the dashboard's JSON.parse never chokes."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
+def dumps_state(state: dict) -> str:
+    try:
+        return json.dumps(state, allow_nan=False)
+    except ValueError:
+        log.error("STATE_NAN non-finite float in state — sanitizing to null")
+        return json.dumps(_sanitize(state))
 
 
 class StateStore:
+    """Atomic, durable JSON state: write tmp → flush+fsync → keep the previous file as `.bak` → rename."""
+
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.bak = self.path.with_suffix(self.path.suffix + ".bak")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def save(self, state: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dumps_state(state)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w") as f:
-            json.dump(state, f)
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        if self.path.exists():
+            os.replace(self.path, self.bak)
         os.replace(tmp, self.path)
 
-    def load(self) -> dict | None:
+    async def save_async(self, state: dict) -> None:
+        """Serialize + write off the event loop (state must be a snapshot the loop no longer mutates)."""
+        await asyncio.to_thread(self.save, state)
+
+    def _read(self, path: Path) -> dict | None:
         try:
-            with open(self.path, "r") as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except FileNotFoundError:
             return None
-        except (json.JSONDecodeError, OSError):
-            return None
+        except (json.JSONDecodeError, OSError) as e:
+            raise StateCorrupt(f"{path}: {e}") from e
+
+    def load(self) -> dict | None:
+        """None only when no state file exists (fresh start). Raises StateCorrupt otherwise."""
+        return self._read(self.path)
+
+    def load_backup(self) -> dict | None:
+        return self._read(self.bak)
 
 
 def build_state(book: PositionBook, *, equity: float, cash: float, starting_capital: float, mode: str,
                 risk_state: dict, balances: dict, scanner: list, bbo: dict, saved_at: float) -> dict:
-    """The real_trader dashboard schema plus `risk` and `bbo` sections."""
+    """The real_trader dashboard schema plus `risk` and `bbo` sections. `cash` is realized-only
+    (capital + realized P&L): the legacy dashboard shows `cash + Σ open net_pnl_usd`, so `equity`
+    must not be passed as `cash` when it already includes unrealized P&L. `kill_switch` mirrors the
+    manual halt so the dashboard's status light reflects `stop.flag` / `/stop`."""
     d = book.to_dict()
     d.update({
         "state_saved_at_ts": saved_at,
-        "saved_at": datetime.fromtimestamp(saved_at, tz=timezone.utc).isoformat(),
+        "saved_at": _iso(saved_at),
         "cash": cash, "equity": equity, "starting_capital": starting_capital,
         "pair_stats": risk_state.get("pair_stats", {}),
         "blofin_risk_blacklist": sorted(k.split("|", 1)[1] for k in risk_state.get("venue_symbol_blacklist", [])
@@ -2293,11 +2403,11 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
         "symbol_blacklist": risk_state.get("symbol_blacklist", {}),
         "pair_failure_counts": risk_state.get("pair_strikes", {}),
         "pair_blacklist": risk_state.get("pair_blacklist", {}),
-        "balance_cache": balances,
+        "balance_cache": {k: dict(v) for k, v in balances.items()},
         "spread_scanner": scanner,
         "spread_histogram": {},
         "dry_run": mode != "live",
-        "kill_switch": False,
+        "kill_switch": bool(risk_state.get("halted")),
         "mode": mode,
         "risk": risk_state,
         "bbo": bbo,
@@ -2308,7 +2418,7 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_positions.py -q`
-Expected: `5 passed`
+Expected: `7 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -3120,7 +3230,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `67 passed`
+Expected: `69 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -4273,7 +4383,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `81 passed`
+Expected: `83 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -5406,7 +5516,7 @@ Expected: `11 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `95 passed`
+Expected: `97 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -5632,7 +5742,7 @@ import pytest
 from bbo_trader.app import App
 from bbo_trader.main import legacy_bot_running
 from bbo_trader.models import OPEN, CLOSED, MAKER_RESTING
-from bbo_trader.positions import StateStore
+from bbo_trader.positions import StateStore, StateCorrupt
 from bbo_trader.strategy import PairEvaluator
 from tests.conftest import mk_bbo
 from tests.test_execution_tt import Harness, SYM
@@ -5720,6 +5830,16 @@ def test_legacy_guard(tmp_path):
     os.utime(hb, (1000.0, 1000.0))
     assert legacy_bot_running(hb, 120.0, now=1050.0)
     assert not legacy_bot_running(hb, 120.0, now=1200.0)
+
+
+async def test_live_refuses_corrupt_state_and_paper_falls_back_to_backup(tmp_path):
+    (tmp_path / "real_state.json").write_text("{not json")
+    app = build_app(tmp_path)                                  # paper: no backup -> fresh start, no exception
+    app.load_state()
+    assert app.book.open == []
+    live = build_app(tmp_path, mode="live")
+    with pytest.raises(StateCorrupt):
+        live.load_state()
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -5799,7 +5919,7 @@ from .discovery import build_universe, symbols_for_venue
 from .execution import Executor
 from .metrics import Metrics, CoverageWatchdog
 from .models import BBO, Intent, Position, MAKER_RESTING, OPEN, EXIT_MAKER_RESTING
-from .positions import PositionBook, StateStore, build_state
+from .positions import PositionBook, StateStore, StateCorrupt, build_state
 from .quotes import QuoteBoard
 from .risk import RiskManager
 from .strategy import PairEvaluator
@@ -5943,7 +6063,7 @@ class App:
         await self.executor.retry_degraded()
         self._heartbeat(now)
         if self.book.dirty or now - self._last_state_save >= 5.0:
-            self.save_state(now)
+            await self.save_state(now)
 
     def _heartbeat(self, now: float) -> None:
         try:
@@ -5959,21 +6079,32 @@ class App:
                 "resting_makers": self.book.resting_counts(), "halted": self.risk.halted,
                 "pending_entries": sorted(self._pending_entries)}
 
-    def save_state(self, now: float) -> None:
-        equity = self.equity()
-        self.book.mark_equity(equity, now)
+    async def save_state(self, now: float) -> None:
+        cash = self.equity()                     # realized only (capital + realized P&L); no mark-to-market in v1
+        self.book.mark_equity(cash, now)
         if now - self._last_scan >= 1.0:
             self._scanner = self.evaluator.scan(self.universe, 100)
             self._last_scan = now
-        state = build_state(self.book, equity=equity, cash=equity, starting_capital=self.cfg.paper_capital_per_venue * len(self.cfg.trade_venues),
+        state = build_state(self.book, equity=cash, cash=cash,
+                            starting_capital=self.cfg.paper_capital_per_venue * len(self.cfg.trade_venues),
                             mode=self.cfg.mode, risk_state=self.risk.to_dict(), balances=self.risk.balances,
                             scanner=self._scanner, bbo=self.bbo_section(now), saved_at=now)
-        self.store.save(state)
         self.book.dirty = False
         self._last_state_save = now
+        await self.store.save_async(state)       # snapshot built above; serialization runs off the loop
 
     def load_state(self) -> None:
-        d = self.store.load()
+        try:
+            d = self.store.load()
+        except StateCorrupt as e:
+            if self.cfg.mode == "live":
+                raise                            # never start live on a corrupt file: the venues may hold its positions
+            log.error("STATE_CORRUPT %s — paper mode: trying the backup", e)
+            try:
+                d = self.store.load_backup()
+            except StateCorrupt as e2:
+                log.error("STATE_CORRUPT backup unusable too (%s) — fresh start", e2)
+                d = None
         if not d:
             log.info("STATE fresh start")
             return
@@ -6067,7 +6198,7 @@ class App:
         try:
             await self.executor.cancel_all_resting()
         finally:
-            self.save_state(self.clock())
+            await self.save_state(self.clock())
 ```
 
 - [ ] **Step 5: Implement `bbo_trader/main.py`**
@@ -6091,7 +6222,7 @@ from .config import Config, load_config
 from .execution import Executor
 from .metrics import Metrics
 from .notify import Telegram
-from .positions import PositionBook, StateStore
+from .positions import PositionBook, StateStore, StateCorrupt
 from .quotes import QuoteBoard
 from .risk import RiskManager
 from .strategy import PairEvaluator
@@ -6150,7 +6281,11 @@ async def run(cfg: Config) -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: setattr(app, "running", False))
         log.info("=== BBO trader starting [%s] venues=%s ===", cfg.mode, list(venues))
-        await app.run()
+        try:
+            await app.run()
+        except StateCorrupt as e:
+            log.critical("REFUSED: state file corrupt (%s) — inspect real_state.json / .bak, repair, then restart", e)
+            return 3
     return 0
 
 
@@ -6167,12 +6302,12 @@ if __name__ == "__main__":
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_app.py -q`
-Expected: `4 passed`
+Expected: `5 passed`
 
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `102 passed`
+Expected: `105 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -6295,7 +6430,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; 2 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
