@@ -40,3 +40,17 @@ BLOFIN_FEES = Fees(taker=0.06, maker=0.02)
 @pytest.fixture
 def clock():
     return FakeClock()
+
+
+def make_cfg(tmp_path=None, **over):
+    """A Config with mexc + blofin as trade venues, no file I/O."""
+    from pathlib import Path
+    from bbo_trader.config import Config, VenueConfig, RateLimits
+    venues = (
+        VenueConfig("mexc", "trade", 0.02, 0.00, RateLimits(20, 20, 2.0, 4, False), max_topics=30, min_requote_ms=500),
+        VenueConfig("blofin", "trade", 0.06, 0.02, RateLimits(30, 30, 10.0, 6, True), max_topics=50, min_requote_ms=1000),
+        VenueConfig("okx", "quote_only", 0.05, 0.02, RateLimits(), symbol_whitelist=("BTCUSDT",)),
+    )
+    kw = dict(venues=venues, data_dir=Path(tmp_path) if tmp_path is not None else Path("./data"))
+    kw.update(over)
+    return Config(**kw)
