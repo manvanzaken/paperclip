@@ -52,7 +52,8 @@ MAX_CLOSE_RETRIES = 40           # ~20 min of DEGRADED retries, then the positio
 HEDGING_SWEEP_AFTER_S = 2.0      # a HEDGING position whose maker order is still live this long gets its cancel retried
 #                                  (the sweep runs inside retry_degraded, which the App calls from its 500 ms sweep)
 MAX_CID_LEN = 32                 # MEXC externalOid / BloFin clientOrderId
-MAX_TRACKS = 5000                # maker tracks outlive their position (fill-after-cancel alerts); oldest are dropped
+MAX_TRACKS = 5000                # maker tracks outlive their position (fill-after-cancel alerts); the OLDEST are dropped —
+#                                  a live position's tracks are always among the newest, so the bound is safe in practice
 
 
 @dataclass
@@ -331,7 +332,16 @@ class Executor:
             self.risk.set_cooldown(sym)
             rem = round((pos.filled_a - pos.exit_filled_a) if leg == "a" else (pos.filled_b - pos.exit_filled_b), 10)
             if await self._flatten_leg(pos, leg, rem) and pos.status != DEGRADED:
-                self._close(pos, "failed_entry")
+                rem_a = round(pos.filled_a - pos.exit_filled_a, 10)     # a stray maker fill may sit on the OTHER leg
+                rem_b = round(pos.filled_b - pos.exit_filled_b, 10)
+                if rem_a <= 1e-9 and rem_b <= 1e-9:
+                    self._close(pos, "failed_entry")
+                else:
+                    log.error("DESYNC_NOT_FLAT #%d %s rem_a=%s rem_b=%s — DEGRADED", pos.id, sym, rem_a, rem_b)
+                    transition(pos, DEGRADED)
+                    pos.degraded_leg = "a" if rem_a > 1e-9 else "b"
+                    pos.last_close_attempt = self.clock()
+                    self.book.dirty = True
             elif pos.status != DEGRADED:
                 transition(pos, DEGRADED)
                 pos.degraded_leg = leg
@@ -342,6 +352,7 @@ class Executor:
         self.risk.record_strike(sym, a, b)
         self.risk.set_cooldown(sym)
         if pos.filled_a > 1e-12 or pos.filled_b > 1e-12:       # something (a stray maker fill) is on the books
+            self._resize_from_legs(pos, spec_a, spec_b)
             if pos.status != DEGRADED:
                 transition(pos, DEGRADED)
                 pos.degraded_leg = "a" if pos.filled_a > 1e-12 else "b"
@@ -676,8 +687,9 @@ class Executor:
         for i, delay in enumerate(FLATTEN_LADDER_S[:3]):
             ev = await self._place_taker(pos, pos.maker_venue, f"mflat{i}", side, remaining, True, priority=True)
             if ev.state == "filled" and ev.filled_qty > 0:
-                # the part of the fill never booked on the leg is realized here; a part already booked (a degrade
-                # or stray-fill path ran meanwhile) is booked as the leg's exit fill so the legs stay consistent
+                # the part of the fill never booked on the leg is realized here; a part already booked (defensive:
+                # bookings and flattens share the position lock, so this should not happen) is booked as the leg's
+                # exit fill so the legs stay consistent
                 unbooked = max(0.0, min(ev.filled_qty, round(pos.maker_filled_qty - pos.maker_booked_qty, 10)))
                 booked_part = round(ev.filled_qty - unbooked, 10)
                 if unbooked > 0:

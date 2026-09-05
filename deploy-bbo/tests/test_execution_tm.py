@@ -305,3 +305,40 @@ async def test_stray_fills_after_close_or_discard_alert_a_human(tmp_path):
                                    liquidity="maker", ts=h.ex.clock()))               # 5 more than we ever booked
     await asyncio.sleep(0.01)
     assert any("STRAY_FILL_AFTER_CLOSE" in n for n in h.notes) and pos2.filled_a == 20.0   # books untouched, human alerted
+
+
+async def test_desync_with_a_stray_on_the_failed_leg_degrades_instead_of_closing(tmp_path, monkeypatch):
+    from bbo_trader import execution
+    from bbo_trader.models import OrderEvent
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0041, 1.0061)
+    h.quote("mexc", 1.0000, 1.0010)
+    sim = h.sim("blofin")
+    pos = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                     rest_price=1.0061, size_usd=25.0))
+    old_cid = pos.maker_client_id
+    h.quote("blofin", 1.0060, 1.0065)
+    real_pm = sim.place_market
+
+    async def reject_opening_orders(symbol, side, qty, reduce_only, client_id):   # the blofin TT leg is refused
+        if not reduce_only:
+            return OrderAck(False, error="venue busy")
+        return await real_pm(symbol, side, qty, reduce_only, client_id)
+    sim.place_market = reject_opening_orders
+    await h.ex.upgrade_to_tt(pos)
+    for _ in range(50):
+        if pos.status == "TT_ENTERING":
+            break
+        await asyncio.sleep(0.001)
+    assert pos.status == "TT_ENTERING"
+    sim._pos[SYM] = sim._pos.get(SYM, 0.0) - 12.0                  # the cancelled maker order filled on the refused leg's venue
+    h.ex.on_order_event(OrderEvent("blofin", old_cid, "sim-1", "filled", filled_qty=12.0, avg_price=1.0061,
+                                   fee=0.0024, liquidity="maker", ts=h.ex.clock()))
+    await settle()
+    assert pos.status == "DEGRADED" and pos.filled_a == 12.0 and pos.exit_filled_b == pos.filled_b == 2.0
+    assert pos in h.book.open                                      # the mexc leg was flattened, the blofin stray is still owned
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    for _ in range(2):
+        await h.ex.retry_degraded()
+        await settle()
+    assert pos.status == CLOSED and await sim.positions() == [] and await h.sim("mexc").positions() == []
