@@ -19,6 +19,8 @@ def test_parse_commands_filters_chat_and_advances_offset():
         assert parse_commands([{"update_id": 5, "message": {"chat": {"id": 42}, "text": text}}], "42", 0) == ([], 6)
     assert parse_commands([{"update_id": 5, "edited_message": {"chat": {"id": 42}, "text": "/stop"}}], "42", 0) == ([], 6)
     assert parse_commands([{"update_id": 5, "message": "junk"}, "junk", {"update_id": "x"}], "42", 0) == ([], 6)
+    assert parse_commands([{"update_id": 5, "message": {"chat": "junk", "text": "/stop"}},
+                           {"update_id": 6, "message": {"chat": {"id": 42}, "text": "/stop"}}], "42", 0) == (["/stop"], 7)
     # the command menu in a group sends /stop@botname; phones capitalize
     assert parse_commands([{"update_id": 5, "message": {"chat": {"id": 42}, "text": "/Stop@bbo_bot"}}], "42", 0) == (["/stop"], 6)
     # a chat id with stray whitespace (env file) still matches

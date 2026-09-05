@@ -34,7 +34,8 @@ def parse_commands(updates: list[dict], chat_id: str, offset: int, not_before: f
         msg = u.get("message")
         if not isinstance(msg, dict):
             continue                                    # edited_message / channel_post / callback_query: ignored
-        if str((msg.get("chat") or {}).get("id", "")).strip() != want:
+        chat = msg.get("chat")
+        if not isinstance(chat, dict) or str(chat.get("id", "")).strip() != want:
             continue
         try:
             dated = float(msg.get("date") or 0.0)
@@ -59,6 +60,9 @@ class Telegram:
         self._session_factory = session_factory
         self._offset = 0
         self._started = clock()          # updates dated before this are ignored: no replay of a stale /close_all
+        #                                  (Telegram dates are whole seconds; a command sent in the start-up second may be
+        #                                  dropped — the safe side of the bias: a missed /stop costs a re-send, a replayed
+        #                                  /close_all costs money)
         self._warned = False
 
     def _fail(self, what: str) -> None:
