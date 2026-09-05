@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from bbo_trader.config import load_config, Config, VenueConfig
 
 
@@ -47,17 +49,111 @@ def test_defaults_and_env(tmp_path):
 
 def test_bot_config_json_overrides_env_but_not_mode(tmp_path):
     venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
     data = tmp_path / "data"
     data.mkdir()
     (data / "bot_config.json").write_text(json.dumps({"MAX_POSITION_USD": 12.5, "MODE": "live"}))
-    cfg = load_config(env={"DATA_DIR": str(data), "VENUES_FILE": str(venues), "MAX_POSITION_USD": "40"})
+    cfg = load_config(env={
+        "DATA_DIR": str(data), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+        "MAX_POSITION_USD": "40",
+    })
     assert cfg.max_position_usd == 12.5             # file wins over env
     assert cfg.mode == "paper"                      # MODE is process-level only
 
 
 def test_missing_venues_file_raises(tmp_path):
-    try:
+    with pytest.raises(FileNotFoundError, match="venues file not found"):
         load_config(env={"DATA_DIR": str(tmp_path), "VENUES_FILE": str(tmp_path / "nope.json")})
-    except FileNotFoundError:
-        return
-    raise AssertionError("expected FileNotFoundError")
+
+
+def test_mode_is_normalized_and_validated(tmp_path):
+    venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    base_env = {"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked)}
+
+    cfg = load_config(env={**base_env, "MODE": "Paper "})
+    assert cfg.mode == "paper"
+
+    cfg = load_config(env={**base_env, "MODE": "LIVE"})
+    assert cfg.mode == "live"
+
+    with pytest.raises(ValueError, match="MODE must be"):
+        load_config(env={**base_env, "MODE": "dry"})
+
+
+def test_unknown_role_raises(tmp_path):
+    venues = tmp_path / "venues.json"
+    venues.write_text(json.dumps({
+        "mexc": {"role": "Trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0,
+                 "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 4, "shared": False},
+                 "max_topics": 30, "min_requote_ms": 500},
+    }))
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    with pytest.raises(ValueError, match="unknown role"):
+        load_config(env={
+            "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+        })
+
+
+def test_shared_string_false_is_false(tmp_path):
+    venues = tmp_path / "venues.json"
+    venues.write_text(json.dumps({
+        "mexc": {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0,
+                 "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 4, "shared": "false"},
+                 "max_topics": 30, "min_requote_ms": 500},
+        "blofin": {"role": "trade", "taker_fee_pct": 0.06, "maker_fee_pct": 0.02,
+                   "rate_limits": {"orders": 30, "cancels": 30, "window_s": 10.0, "reserve": 6, "shared": "true"},
+                   "max_topics": 50, "min_requote_ms": 1000},
+    }))
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    cfg = load_config(env={
+        "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+    })
+    assert cfg.venue("mexc").rate_limits.shared is False
+    assert cfg.venue("blofin").rate_limits.shared is True
+
+
+def test_missing_blocked_file_raises(tmp_path):
+    venues = _write_venues(tmp_path)
+    with pytest.raises(FileNotFoundError, match="blocked symbols file not found"):
+        load_config(env={
+            "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues),
+            "BLOCKED_FILE": str(tmp_path / "nope_blocked.json"),
+        })
+
+
+def test_unknown_bot_config_keys_are_ignored_and_secrets_hidden(tmp_path):
+    venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "bot_config.json").write_text(json.dumps({"NOT_A_FIELD": 1, "venues": "pwned"}))
+    cfg = load_config(env={
+        "DATA_DIR": str(data), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+        "MEXC_API_SECRET": "secret-value",
+    })
+    assert cfg.trade_venues == ["mexc", "blofin"]
+    assert "secret-value" not in repr(cfg.venue("mexc"))
+
+
+def test_venue_lookup_keyerror(tmp_path):
+    venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    cfg = load_config(env={
+        "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+    })
+    with pytest.raises(KeyError):
+        cfg.venue("nope")
+
+
+def test_invalid_json_names_file(tmp_path):
+    venues = tmp_path / "venues.json"
+    venues.write_text("{")
+    with pytest.raises(ValueError, match="invalid JSON"):
+        load_config(env={"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues)})

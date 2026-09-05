@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Mapping
 
@@ -31,9 +31,10 @@ class VenueConfig:
     min_requote_ms: int = 500
     staleness_override_s: float | None = None
     symbol_whitelist: tuple[str, ...] = ()
-    api_key: str = ""
-    api_secret: str = ""
-    passphrase: str = ""
+    # secrets: excluded from repr; anything that serializes a VenueConfig (asdict) must whitelist fields
+    api_key: str = field(default="", repr=False)
+    api_secret: str = field(default="", repr=False)
+    passphrase: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -127,25 +128,32 @@ def _coerce(raw: str, target_type) -> object:
 
 
 def _read_json(path: Path):
-    with open(path, "r") as f:
-        return json.load(f)
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path}: invalid JSON: {e}") from e
 
 
 def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
+    # Venue order follows venues.json key order (json.load preserves it); trade_venues/feed_venues keep that order.
     raw = _read_json(path)
     out = []
     for name, v in raw.items():
         rl = v.get("rate_limits") or {}
         prefix = name.upper()
+        role = v.get("role", "off")
+        if role not in ("trade", "quote_only", "off"):
+            raise ValueError(f"{name}: unknown role {role!r} (expected trade | quote_only | off)")
         out.append(VenueConfig(
             name=name,
-            role=v.get("role", "off"),
+            role=role,
             taker_fee_pct=float(v["taker_fee_pct"]),
             maker_fee_pct=float(v["maker_fee_pct"]),
             rate_limits=RateLimits(
                 orders=int(rl.get("orders", 20)), cancels=int(rl.get("cancels", 20)),
                 window_s=float(rl.get("window_s", 2.0)), reserve=int(rl.get("reserve", 4)),
-                shared=bool(rl.get("shared", False))),
+                shared=_coerce(rl.get("shared", False), bool)),
             max_topics=int(v.get("max_topics", 50)),
             min_requote_ms=int(v.get("min_requote_ms", 500)),
             staleness_override_s=(float(v["staleness_override_s"]) if v.get("staleness_override_s") is not None else None),
@@ -186,5 +194,13 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         raise FileNotFoundError(f"venues file not found: {venues_file}")
     overrides["venues"] = _load_venues(venues_file, env)
     blocked_file = Path(overrides.get("blocked_file", Config.blocked_file))
-    overrides["blocked_symbols"] = frozenset(_read_json(blocked_file)) if blocked_file.exists() else frozenset()
+    if not blocked_file.exists():
+        raise FileNotFoundError(f"blocked symbols file not found: {blocked_file}")
+    overrides["blocked_symbols"] = frozenset(_read_json(blocked_file))
+    # MODE is process-level only; validate and normalize so a typo (e.g. "Paper ", "dry") never
+    # silently routes to live trading, since downstream code branches on `cfg.mode == "paper"`.
+    mode = str(overrides.get("mode", Config.mode)).strip().lower()
+    if mode not in ("paper", "live"):
+        raise ValueError(f"MODE must be 'paper' or 'live', got {overrides.get('mode')!r}")
+    overrides["mode"] = mode
     return Config(**overrides)
