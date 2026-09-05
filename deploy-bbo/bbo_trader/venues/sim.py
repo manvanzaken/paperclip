@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -29,6 +28,7 @@ from typing import Callable
 from ..config import Config
 from ..models import BBO, Fees, OrderAck, OrderEvent, VenueSpec
 from ..quotes import QuoteBoard
+from ..sizing import lots_floor
 from .base import VenuePosition
 
 log = logging.getLogger("bbo.sim")
@@ -237,8 +237,7 @@ class SimVenue:
             if touch == o.last_touch:
                 continue                                              # the same book re-pushed: no new flow
             o.last_touch = touch
-            lot = self._spec(o.symbol).lot
-            cap = math.floor(self.frac * touch[1] / lot) * lot        # a sub-lot touch fills nothing
+            cap = lots_floor(self.frac * touch[1], self._spec(o.symbol))   # whole lots; a sub-lot touch fills nothing
             qty = min(o.remaining, cap)
             if qty > 0:
                 self._fill(o, qty, o.price, "maker")

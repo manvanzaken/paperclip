@@ -518,6 +518,8 @@ class Config:
     maker_top_level_frac: float = 0.5
     legacy_heartbeat_path: Path = Path("/app/data/heartbeat_live")
     legacy_heartbeat_max_age_s: float = 120.0
+    coverage_floor: int = 10                  # FEED_COVERAGE_LOW below max(floor, coverage_frac × the venue's high-water mark)
+    coverage_frac: float = 0.5
     # bearer token: excluded from repr; asdict() still exposes it — whitelist fields when serializing Config
     telegram_token: str = field(default="", repr=False)
     telegram_chat_id: str = ""
@@ -5415,7 +5417,7 @@ git commit -m "feat(bbo): BloFin public adapter — books5 BBO feed, instruments
 - Create: `deploy-bbo/bbo_trader/venues/sim.py`
 - Test: `deploy-bbo/tests/test_sim.py`, `deploy-bbo/tests/test_venue_protocols.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_sim.py`:
 
@@ -5574,14 +5576,34 @@ async def test_cancel_inside_latency_prevents_the_fill_and_amend_resets_the_cloc
     clock.tick(0.01)
     sim.on_quote(mk_bbo("blofin", SYM, 1.0011, 1.0013, bq=100.0, ts=clock()))
     assert events[-1].state == "filled" and events[-1].avg_price == 1.0011
+
+
+async def test_flip_realizes_pnl_on_the_closed_part_and_reanchors_the_average(tmp_path, clock):
+    cfg, board, sim, events = build(tmp_path, clock)
+    board.set(mk_bbo("blofin", SYM, 1.0000, 1.0000, ts=clock()))            # zero-width book: fills at the touch
+    sim.slip = 0.0
+    await sim.place_market(SYM, "buy", 5.0, False, "c1")                     # long 5 @ 1.0
+    await asyncio.sleep(0.02)
+    board.set(mk_bbo("blofin", SYM, 1.2000, 1.2000, ts=clock()))
+    await sim.place_market(SYM, "sell", 8.0, False, "c2")                    # not reduce-only: flips to short 3 @ 1.2
+    await asyncio.sleep(0.02)
+    p = (await sim.positions())[0]
+    assert p.side == "short" and p.qty == 3.0 and sim._avg[SYM] == pytest.approx(1.2)
+    fees = sum(e.fee for e in events if e.state == "filled")
+    assert (await sim.balance())["available"] == pytest.approx(100.0 + (1.2 - 1.0) * 5 * 10.0 - fees)   # P&L on the 5 closed
+    board.set(mk_bbo("blofin", SYM, 1.1000, 1.1000, ts=clock()))
+    await sim.place_market(SYM, "buy", 3.0, True, "c3")                      # cover the short: +0.1 x 3 x 10
+    await asyncio.sleep(0.02)
+    fees = sum(e.fee for e in events if e.state == "filled")
+    assert await sim.positions() == [] and (await sim.balance())["available"] == pytest.approx(100.0 + 10.0 + 3.0 - fees)
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_sim.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.venues.sim'`
 
-- [ ] **Step 3: Implement `bbo_trader/venues/sim.py`**
+- [x] **Step 3: Implement `bbo_trader/venues/sim.py`**
 
 ```python
 """SimVenue: paper trading over any real public feed. Implements the Trading + PrivateFeed protocols.
@@ -5606,7 +5628,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -5615,6 +5636,7 @@ from typing import Callable
 from ..config import Config
 from ..models import BBO, Fees, OrderAck, OrderEvent, VenueSpec
 from ..quotes import QuoteBoard
+from ..sizing import lots_floor
 from .base import VenuePosition
 
 log = logging.getLogger("bbo.sim")
@@ -5823,8 +5845,7 @@ class SimVenue:
             if touch == o.last_touch:
                 continue                                              # the same book re-pushed: no new flow
             o.last_touch = touch
-            lot = self._spec(o.symbol).lot
-            cap = math.floor(self.frac * touch[1] / lot) * lot        # a sub-lot touch fills nothing
+            cap = lots_floor(self.frac * touch[1], self._spec(o.symbol))   # whole lots; a sub-lot touch fills nothing
             qty = min(o.remaining, cap)
             if qty > 0:
                 self._fill(o, qty, o.price, "maker")
@@ -5871,7 +5892,7 @@ class SimVenue:
         return None
 ```
 
-- [ ] **Step 3b: Write the protocol conformance test**
+- [x] **Step 3b: Write the protocol conformance test**
 
 `tests/test_venue_protocols.py` (pins every adapter to the protocols in `venues/base.py`; goes green immediately and fails on any signature drift in Plan 2/3 adapters):
 
@@ -5918,15 +5939,15 @@ def test_adapters_conform_to_protocols():
 Run: `.venv/bin/python -m pytest tests/test_venue_protocols.py -q`
 Expected: `1 passed`
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_sim.py -q`
-Expected: `9 passed`
+Expected: `10 passed`
 
-- [ ] **Step 5: Run the whole suite and commit**
+- [x] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `112 passed`
+Expected: `113 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py deploy-bbo/tests/test_venue_protocols.py
@@ -5941,55 +5962,109 @@ git commit -m "feat(bbo): SimVenue — paper trading with conservative maker fil
 - Create: `deploy-bbo/bbo_trader/metrics.py`
 - Test: `deploy-bbo/tests/test_metrics.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_metrics.py`:
 
 ```python
+import asyncio
+import logging
+
+from bbo_trader import metrics as metrics_mod
 from bbo_trader.metrics import LatencyHist, Metrics, CoverageWatchdog
 from bbo_trader.quotes import QuoteBoard
 from tests.conftest import mk_bbo
 
 
-def test_latency_hist_percentiles():
+def test_latency_hist_percentiles_window_and_lifetime():
     h = LatencyHist()
     for v in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
         h.add(v)
     d = h.to_dict()
-    assert d["n"] == 10 and d["p50"] == 60.0 and d["p95"] == 100.0 and d["max"] == 100.0
-    assert LatencyHist().to_dict() == {"n": 0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+    assert d["n"] == 10 and d["p50"] == 60.0 and d["p95"] == 100.0 and d["max"] == 100.0   # floor(q·n) convention
+    assert LatencyHist().to_dict() == {"n": 0, "total": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "max_ever": 0.0}
+    small = LatencyHist(3)
+    for v in (1000.0, 1.0, 2.0, 3.0, 4.0):
+        small.add(v)
+    d = small.to_dict()
+    assert d["n"] == 3 and d["max"] == 4.0 and d["total"] == 5 and d["max_ever"] == 1000.0   # window vs lifetime
+    small.add(-5.0)                                              # a backwards clock step is clamped, NaN ignored
+    small.add(float("nan"))
+    assert small.to_dict()["n"] == 3 and small.to_dict()["total"] == 6 and min(small._v) == 0.0
 
 
-def test_metrics_record_and_funnel():
-    m = Metrics()
+def test_metrics_record_and_funnel_and_shape():
+    t = [100.0]
+    m = Metrics(mono=lambda: t[0])
     m.record("submit_to_ack", 120.0)
+    m.record("submit_to_ack", 80.0)
     m.funnel["below_edge"] += 2
+    t[0] = 160.0
     d = m.to_dict()
-    assert d["latency_ms"]["submit_to_ack"]["n"] == 1 and d["funnel"] == {"below_edge": 2}
+    assert d["latency_ms"]["submit_to_ack"]["n"] == 2 and d["latency_ms"]["submit_to_ack"]["p50"] == 120.0
+    assert d["funnel"] == {"below_edge": 2} and d["uptime_s"] == 60
+    assert set(d) == {"latency_ms", "funnel", "loop_lag_ms", "uptime_s", "started_at"}
 
 
-def test_coverage_watchdog_counts(clock):
+async def test_loop_lag_sampler_measures_and_summarizes(monkeypatch, caplog):
+    m = Metrics()
+    real_sleep = asyncio.sleep
+
+    async def slow_sleep(_s):                                     # the loop is "busy": every sleep overruns by ~30 ms
+        await real_sleep(0.03)
+    monkeypatch.setattr(metrics_mod.asyncio, "sleep", slow_sleep)
+    with caplog.at_level(logging.WARNING, logger="bbo.metrics"):
+        task = asyncio.create_task(m.sample_loop_lag(interval_s=0.001, warn_ms=10.0, summary_s=0.05))
+        await real_sleep(0.2)
+        task.cancel()
+    d = m.to_dict()["loop_lag_ms"]
+    assert d["n"] >= 3 and d["p50"] >= 20.0                        # lag is measured against the requested interval
+    lines = [r for r in caplog.records if "LOOP_LAG" in r.getMessage()]
+    assert 1 <= len(lines) <= 4 and "over 10 ms" in lines[0].getMessage()   # summarized, not one line per sample
+
+
+def test_coverage_watchdog_counts_relative_floor_and_grace(clock, caplog):
     board = QuoteBoard(2.0)
     board.set(mk_bbo("mexc", "AUSDT", 1, 1.1, ts=clock()))
     board.set(mk_bbo("mexc", "BUSDT", 1, 1.1, ts=clock()))
     board.set(mk_bbo("blofin", "AUSDT", 1, 1.1, ts=clock() - 5))    # stale
     w = CoverageWatchdog(board, ["mexc", "blofin"], floor=1, clock=clock)
-    assert w.check() == {"mexc": 2, "blofin": 0}
+    with caplog.at_level(logging.WARNING, logger="bbo.metrics"):
+        assert w.check() == {"mexc": 2, "blofin": 0}                # a dead venue reads 0, never disappears
+    assert "FEED_COVERAGE_LOW" not in caplog.text                    # quiet during the start-up grace
+    clock.tick(61)
+    for i in range(400):
+        board.set(mk_bbo("mexc", f"S{i}USDT", 1, 1.1, ts=clock()))
+    with caplog.at_level(logging.WARNING, logger="bbo.metrics"):
+        w.check()
+    assert "FEED_COVERAGE_LOW blofin fresh=0" in caplog.text and "FEED_COVERAGE_LOW mexc" not in caplog.text
+    caplog.clear()
+    clock.tick(3)                                                    # mexc: 390 of 400 go stale -> under 50 % of its high-water mark
+    for i in range(10):
+        board.set(mk_bbo("mexc", f"S{i}USDT", 1, 1.1, ts=clock()))
+    with caplog.at_level(logging.WARNING, logger="bbo.metrics"):
+        assert w.check()["mexc"] == 10
+    assert "FEED_COVERAGE_LOW mexc fresh=10 threshold=200" in caplog.text
+    assert w.to_dict() == {"fresh": {"mexc": 10, "blofin": 0}, "high": {"mexc": 400, "blofin": 0}, "floor": 1, "frac": 0.5}
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_metrics.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.metrics'`
 
-- [ ] **Step 3: Implement `bbo_trader/metrics.py`**
+- [x] **Step 3: Implement `bbo_trader/metrics.py`**
 
 ```python
-"""Latency histograms, the rejection funnel, event-loop lag sampling and the feed coverage watchdog."""
+"""Latency histograms, the rejection funnel, event-loop lag sampling and the feed coverage watchdog.
+
+Everything here lands in the state file's `bbo` section for the dashboard, so the numbers say what they
+are: histogram `n`/`max` describe the sliding window, `total`/`max_ever` the process lifetime."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import Counter, deque
 
@@ -5999,11 +6074,20 @@ log = logging.getLogger("bbo.metrics")
 class LatencyHist:
     def __init__(self, maxlen: int = 1000):
         self._v: deque[float] = deque(maxlen=maxlen)
+        self._total = 0
+        self._max_ever = 0.0
 
     def add(self, ms: float) -> None:
-        self._v.append(float(ms))
+        ms = float(ms)
+        if not math.isfinite(ms):
+            return
+        ms = max(0.0, ms)                 # a backwards clock step is not a negative latency
+        self._v.append(ms)
+        self._total += 1
+        self._max_ever = max(self._max_ever, ms)
 
     def _pct(self, q: float) -> float:
+        """Index floor(q·n) of the sorted window — one rank above nearest-rank, so p95 == max while n <= 20."""
         if not self._v:
             return 0.0
         s = sorted(self._v)
@@ -6014,64 +6098,89 @@ class LatencyHist:
         return len(self._v)
 
     def to_dict(self) -> dict:
-        return {"n": self.count, "p50": round(self._pct(0.50), 1), "p95": round(self._pct(0.95), 1),
-                "max": round(max(self._v), 1) if self._v else 0.0}
+        return {"n": self.count, "total": self._total, "p50": round(self._pct(0.50), 1),
+                "p95": round(self._pct(0.95), 1), "max": round(max(self._v), 1) if self._v else 0.0,
+                "max_ever": round(self._max_ever, 1)}
 
 
 class Metrics:
-    def __init__(self):
+    def __init__(self, mono=time.monotonic):
         self.hists: dict[str, LatencyHist] = {}
         self.funnel: Counter = Counter()
         self.loop_lag = LatencyHist(600)
+        self._mono = mono
+        self.started_mono = mono()
         self.started = time.time()
 
     def record(self, stage: str, ms: float) -> None:
         self.hists.setdefault(stage, LatencyHist()).add(ms)
 
-    async def sample_loop_lag(self, interval_s: float = 1.0) -> None:
+    async def sample_loop_lag(self, interval_s: float = 1.0, warn_ms: float = 50.0, summary_s: float = 60.0) -> None:
+        """Samples the event-loop lag every `interval_s`; one LOOP_LAG summary line per `summary_s` at most
+        (a lag storm must not bury the trading log under one warning per second)."""
         loop = asyncio.get_running_loop()
+        over = samples = 0
+        worst = 0.0
+        window_start = loop.time()
         while True:
             t0 = loop.time()
             await asyncio.sleep(interval_s)
-            lag_ms = (loop.time() - t0 - interval_s) * 1000.0
-            self.loop_lag.add(max(0.0, lag_ms))
-            if lag_ms > 50.0:
-                log.warning("LOOP_LAG %.0f ms", lag_ms)
+            lag_ms = max(0.0, (loop.time() - t0 - interval_s) * 1000.0)
+            self.loop_lag.add(lag_ms)
+            samples += 1
+            if lag_ms > warn_ms:
+                over += 1
+                worst = max(worst, lag_ms)
+            if loop.time() - window_start >= summary_s:
+                if over:
+                    log.warning("LOOP_LAG %d of %d samples over %.0f ms in the last %.0fs, worst %.0f ms",
+                                over, samples, warn_ms, loop.time() - window_start, worst)
+                over = samples = 0
+                worst = 0.0
+                window_start = loop.time()
 
     def to_dict(self) -> dict:
         return {"latency_ms": {k: h.to_dict() for k, h in self.hists.items()},
                 "funnel": dict(self.funnel), "loop_lag_ms": self.loop_lag.to_dict(),
-                "uptime_s": round(time.time() - self.started)}
+                "uptime_s": round(self._mono() - self.started_mono), "started_at": self.started}
 
 
 class CoverageWatchdog:
-    """Logs fresh-quote counts per venue every interval and warns when a venue is under its floor."""
+    """Fresh-quote counts per CONFIGURED venue (a dead venue reads 0, it never disappears). Warns when a venue
+    is under max(floor, frac × its own high-water mark): an absolute floor alone is silent when 390 of 400
+    symbols go stale and permanently noisy on a 10-pair venue. Quiet for `grace_s` after start so the first
+    minute of connecting does not raise an alarm. The App schedules `check()`; `to_dict()` goes to the state file."""
 
-    def __init__(self, board, venues: list[str], floor: int = 10, interval_s: float = 60.0, clock=time.time):
-        self.board, self.venues, self.floor, self.interval_s, self.clock = board, venues, floor, interval_s, clock
-        self.last: dict[str, int] = {}
+    def __init__(self, board, venues: list[str], floor: int = 10, frac: float = 0.5, grace_s: float = 60.0,
+                 clock=time.time):
+        self.board, self.venues, self.floor, self.frac, self.grace_s, self.clock = board, list(venues), floor, frac, grace_s, clock
+        self.last: dict[str, int] = {v: 0 for v in self.venues}
+        self.high: dict[str, int] = {v: 0 for v in self.venues}
+        self._t0 = clock()
 
     def check(self) -> dict[str, int]:
-        counts = self.board.fresh_counts(self.clock())
+        now = self.clock()
+        counts = self.board.fresh_counts(now)
         self.last = {v: counts.get(v, 0) for v in self.venues}
         log.info("FEED_COVERAGE %s", " ".join(f"{v}={n}" for v, n in self.last.items()))
         for v, n in self.last.items():
-            if n < self.floor:
-                log.warning("FEED_COVERAGE_LOW %s fresh=%d floor=%d", v, n, self.floor)
+            self.high[v] = max(self.high[v], n)
+            threshold = max(float(self.floor), self.frac * self.high[v])
+            if n < threshold and now - self._t0 >= self.grace_s:
+                log.warning("FEED_COVERAGE_LOW %s fresh=%d threshold=%.0f (floor=%d, high=%d)", v, n, threshold,
+                            self.floor, self.high[v])
         return self.last
 
-    async def run(self) -> None:
-        while True:
-            await asyncio.sleep(self.interval_s)
-            self.check()
+    def to_dict(self) -> dict:
+        return {"fresh": dict(self.last), "high": dict(self.high), "floor": self.floor, "frac": self.frac}
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_metrics.py -q`
-Expected: `3 passed`
+Expected: `4 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/metrics.py deploy-bbo/tests/test_metrics.py
@@ -6211,6 +6320,33 @@ async def test_budget_exhaustion_rejects_entry_but_reserve_allows_close(tmp_path
     assert await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0)) is None
     assert h.metrics.funnel["budget"] == 1 and h.book.open == []  # blofin rejected → mexc leg flattened → failed_entry
     assert h.book.closed[0].exit_reason == "failed_entry"
+
+
+async def test_retry_degraded_books_a_leg_the_venue_no_longer_holds(tmp_path, monkeypatch):
+    from bbo_trader import execution
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    pos = await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0, spread_pct=0.42))
+    h.sim("mexc")._pos.clear()                                     # the venue lost our long (accounting drift)
+    h.sim("mexc")._avg.clear()
+    await h.ex.exit_tt(pos, "test")
+    assert pos.status == "DEGRADED" and pos.degraded_leg == "b"    # mexc refused: nothing to reduce
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    await h.ex.retry_degraded()
+    assert pos.status == CLOSED and pos.exit_filled_b == pos.filled_b and pos.exit_reason == "test"
+    assert await h.sim("blofin").positions() == [] and await h.sim("mexc").positions() == []
+    monkeypatch.setattr(execution, "MAX_CLOSE_RETRIES", 1)         # a leg that can never close stops retrying
+    h.quote("blofin", 1.0050, 1.0060)
+    pos2 = await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0, spread_pct=0.42))
+    h.sim("mexc")._pos.clear()
+    h.sim("mexc")._pos[SYM] = -1.0                                 # venue holds a SHORT where we book a long: not flat, not closable
+    await h.ex.exit_tt(pos2, "test")
+    assert pos2.status == "DEGRADED"
+    await h.ex.retry_degraded()
+    await h.ex.retry_degraded()
+    await asyncio.sleep(0.01)                                      # notification task runs
+    assert pos2.status == "DEGRADED" and pos2.close_retry_count == 2 and any("DEGRADED_STUCK" in n for n in h.notes)
 ```
 
 - [ ] **Step 2: Write the failing TM-flow tests**
@@ -6387,6 +6523,30 @@ async def test_failed_cancel_leaves_nothing_in_flight(tmp_path):
     sim.cancel = real_cancel
     await h.ex.cancel_maker(pos, "test")                                     # the venue is back: cancel goes through
     assert pos.maker_cancel_sent
+
+
+async def test_exit_maker_rejected_when_venue_is_flat_books_the_leg_and_closes(tmp_path):
+    h = Harness(tmp_path)
+    h.quote("blofin", 1.0041, 1.0061)
+    h.quote("mexc", 1.0000, 1.0010)
+    pos = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                     rest_price=1.0061, size_usd=25.0))
+    await asyncio.sleep(0.005)
+    h.quote("blofin", 1.0061, 1.0062, bq=100.0)
+    await settle()
+    assert pos.status == OPEN
+    h.sim("blofin")._pos.clear()                                   # the venue lost our short (accounting drift)
+    h.sim("blofin")._avg.clear()
+    h.quote("blofin", 1.0020, 1.0030)
+    h.quote("mexc", 1.0000, 1.0005)
+    assert await h.ex.exit_tm(pos, Intent("TM_EXIT", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                          rest_price=1.0015))
+    assert pos.status == EXIT_MAKER_RESTING
+    await asyncio.sleep(0.005)
+    h.quote("blofin", 1.0010, 1.0015, aq=100.0)                    # our reduce-only bid would fill: venue says nothing to reduce
+    await settle()
+    assert pos.status == CLOSED and pos.exit_reason == "venue_flat" and pos.exit_filled_a == pos.filled_a
+    assert await h.sim("mexc").positions() == [] and pos.exit_filled_b == pos.filled_b
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -6453,6 +6613,7 @@ class LegTrack:
     submitted_ts: float
     last: OrderEvent | None = None
     done: asyncio.Future | None = None
+    acked: bool = False       # the venue accepted the order at some point (a later "rejected" is post-rest)
 
 
 class Executor:
@@ -6513,6 +6674,8 @@ class Executor:
             log.info("ORDER_EVENT_UNKNOWN %s %s %s", ev.venue, ev.client_id, ev.state)
             return
         tr.last = ev
+        if ev.state != "rejected":
+            tr.acked = True
         pos = self.book.get(tr.pos_id)
         if pos is not None:
             if ev.order_id:
@@ -6799,8 +6962,10 @@ class Executor:
         return False
 
     def _on_maker_event(self, pos: Position, tr: LegTrack, ev: OrderEvent) -> None:
-        if ev.state in ("ack", "rejected"):
-            return
+        if ev.state == "ack" or (ev.state == "rejected" and not tr.acked):
+            return          # a pre-rest (post-only would cross) rejection is handled by _post_maker off the OrderAck
+        if ev.state == "rejected":
+            log.warning("TM_REJECTED_WHILE_RESTING #%d %s %s: %s", pos.id, pos.symbol, pos.maker_venue, ev.error)
         if ev.filled_qty > pos.maker_filled_qty + 1e-12:
             if pos.maker_fill_ts == 0.0:
                 pos.maker_fill_ts = self.clock()
@@ -6966,6 +7131,17 @@ class Executor:
             return
         # exit phase
         if pos.maker_filled_qty <= 1e-12:
+            tr = self._tracks.get(pos.maker_client_id)
+            if (tr is not None and tr.last is not None and tr.last.state == "rejected"
+                    and "nothing to reduce" in (tr.last.error or "")
+                    and await self._leg_flat_at_venue(pos, pos.maker_venue)):
+                # the venue holds nothing on the maker leg: book it closed at the mark, close the other leg TT
+                self._book_leg_flat(pos, "a" if pos.maker_venue == pos.venue_a else "b", pos.maker_venue)
+                pos.requote_pending = False
+                pos.exit_reason = pos.exit_reason or "venue_flat"
+                transition(pos, TT_EXITING)
+                await self._close_remainder_tt(pos)
+                return
             if pos.requote_pending and pos.status == EXIT_MAKER_RESTING:
                 pos.requote_pending = False
                 pos.maker_rest_price = pos.requote_price
@@ -7120,12 +7296,12 @@ class Executor:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_execution_tt.py tests/test_execution_tm.py -q`
-Expected: `12 passed`
+Expected: `14 passed`
 
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `127 passed`
+Expected: `131 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -7573,7 +7749,7 @@ class App:
         self._last_state_save = 0.0
         self._scanner: list[dict] = []
         self._last_scan = 0.0
-        self.watchdog = CoverageWatchdog(board, list(venues), clock=clock)
+        self.watchdog = CoverageWatchdog(board, list(venues), floor=cfg.coverage_floor, frac=cfg.coverage_frac, clock=clock)
         self.running = True
 
     # ---- helpers ------------------------------------------------------------------
@@ -7723,7 +7899,7 @@ class App:
 
     def bbo_section(self, now: float) -> dict:
         return {"mode": self.cfg.mode, "universe": len(self.universe), "metrics": self.metrics.to_dict(),
-                "coverage": self.board.fresh_counts(now),
+                "coverage": self.watchdog.to_dict(),
                 "budget": {n: v.budget.to_dict(now) for n, v in self.venues.items()},
                 "resting_makers": self.book.resting_counts(), "halted": self.risk.halted,
                 "pending_entries": sorted(self._pending_entries)}
@@ -7792,7 +7968,7 @@ class App:
         elif cmd == "/status" and self.telegram is not None:
             await self.telegram.send(f"{self.cfg.mode} equity ${self.equity():.2f} open={len(self.book.open)} "
                                      f"trades={self.book.total_trades} pnl=${self.book.total_pnl_usd:+.2f} "
-                                     f"halted={self.risk.halted} coverage={self.board.fresh_counts(self.clock())}")
+                                     f"halted={self.risk.halted} coverage={self.watchdog.last}")
 
     # ---- periodic loops ------------------------------------------------------------------
     async def _loop(self, interval_s: float, fn: Callable[[], Awaitable[None]]) -> None:
@@ -7988,7 +8164,7 @@ Expected: `6 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `136 passed`
+Expected: `140 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -8111,7 +8287,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Third round (approved): the shipped-defaults test pins `receive_timeout is None`/`heartbeat == 20`/`data_timeout == 120`, and a close caused by a heartbeat timeout logs the socket's exception instead of "by server". **Tasks 12/13 amended after the Task 12 code review (2026-09-05, verified against both live APIs):** `_get` raises `VenueError` (new, `venues/base.py`) on a non-200 status, a non-JSON body or an error ENVELOPE (MEXC `success != true`, BloFin `code != "0"` — both venues report errors as HTTP 200), and `fetch_specs` raises rather than returning an empty set; `parse_specs` also requires `apiAllowed` (MEXC: `state` is 0 for every contract, `apiAllowed` false for ~30 live ones); every row parser isolates a malformed row (`SPEC_ROWS_DROPPED`) and uses strict numerics (no `or` defaults); an instrument without a known contract size yields no BBO (sizes span 1e-5…1e7) and `fetch_bbo` returns None without a spec; `to_instrument` rejects non-USDT symbols; MEXC `ts_exchange` prefers `data.cts`; rejected subscriptions (`rs.error` / `event: error`) are logged with escalating sparsity; BloFin sends a User-Agent. Task 19: `refresh_market_data` never applies an empty spec set, funding has its own 5-minute loop (`refresh_funding`; both venues run 4 h and 8 h grids), `_quote_fallback` fetches legs concurrently with a per-call guard (`QUOTE_FALLBACK_FAILED`). Live-shape fixtures + fake-session REST tests: 4 MEXC and 3 BloFin tests added. Re-review (approved): timestamp assertions use `abs=1e-6`, malformed rows carry distinct symbols so a fabricated zero cannot hide behind the good row, a status-only failure case is covered, and the `PublicFeed` docstring states that unknown instruments yield no BBO. **Task 13 amended after code review (2026-09-05, verified live):** `subscribe()` sends ONE message per instrument — BloFin validates a subscribe message atomically, so one delisted instId in a batched message subscribed nothing for the whole shard while our text pings kept the empty socket alive; `parse_books5` ignores non-snapshot actions; `parse_instruments` also requires `contractType == linear` and `assetClass == Crypto` (BloFin lists equity/index/commodity USDT perps that gap when their market is closed); both adapters' `_top` use strict `_num` for levels; the BloFin fixture is a verbatim live BTC-USDT row (contract value 0.001, 0.1-contract lots) with assertions derived from it; tests pin the WS wiring (url, 50 topics, 25 s text ping, 120 s data timeout), the real subscribe ack for a known instrument, `action: update` frames, a JSON NaN literal, and the too-short-symbol guard. Re-review (approved): NaN prices are pinned to raise in both adapters, the synthetic spec rows use lot ≠ min so a transposed `VenueSpec` argument fails, the fixture uses BloFin's real `Stocks` label, and the docstring describes `expireTime` correctly (per-instrument far-future values; `instType` is always SWAP). **Task 14 amended after code review (2026-09-05):** the paper venue no longer flatters the strategy — taker orders fill at the touch that exists AFTER the latency (paper now shows spread decay) and push an `ack` event first, the maker cap is granted once per DISTINCT touch (an unchanged book re-pushed 10×/s is not new flow) and a sub-lot touch fills nothing, reduce-only fills are clamped to the open position (a close against a flat position is rejected with `nothing to reduce`, like the real venues), every fill needs a FRESH quote, resting orders are indexed per symbol (`on_quote` no longer scans every order ever placed) and terminal orders are bounded (`MAX_ORDERS`), positions carry an average cost so realized P&L and fees flow into `balance()`, `place_post_only` rejects `qty <= 0`, `cancel` distinguishes unknown from terminal, `amend` refuses without a fresh quote, the fill task is exception-guarded and a missing spec is logged once; 5 tests added (9 total). Task 16 accordingly: `retry_degraded` books a leg closed at the mark when the venue confirms it holds no position after a `nothing to reduce` rejection (`LEG_FLAT_AT_VENUE`) and stops after `MAX_CLOSE_RETRIES` (`DEGRADED_STUCK`, Telegram) instead of spinning. Re-review round (approved): nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Third round (approved): the shipped-defaults test pins `receive_timeout is None`/`heartbeat == 20`/`data_timeout == 120`, and a close caused by a heartbeat timeout logs the socket's exception instead of "by server". **Tasks 12/13 amended after the Task 12 code review (2026-09-05, verified against both live APIs):** `_get` raises `VenueError` (new, `venues/base.py`) on a non-200 status, a non-JSON body or an error ENVELOPE (MEXC `success != true`, BloFin `code != "0"` — both venues report errors as HTTP 200), and `fetch_specs` raises rather than returning an empty set; `parse_specs` also requires `apiAllowed` (MEXC: `state` is 0 for every contract, `apiAllowed` false for ~30 live ones); every row parser isolates a malformed row (`SPEC_ROWS_DROPPED`) and uses strict numerics (no `or` defaults); an instrument without a known contract size yields no BBO (sizes span 1e-5…1e7) and `fetch_bbo` returns None without a spec; `to_instrument` rejects non-USDT symbols; MEXC `ts_exchange` prefers `data.cts`; rejected subscriptions (`rs.error` / `event: error`) are logged with escalating sparsity; BloFin sends a User-Agent. Task 19: `refresh_market_data` never applies an empty spec set, funding has its own 5-minute loop (`refresh_funding`; both venues run 4 h and 8 h grids), `_quote_fallback` fetches legs concurrently with a per-call guard (`QUOTE_FALLBACK_FAILED`). Live-shape fixtures + fake-session REST tests: 4 MEXC and 3 BloFin tests added. Re-review (approved): timestamp assertions use `abs=1e-6`, malformed rows carry distinct symbols so a fabricated zero cannot hide behind the good row, a status-only failure case is covered, and the `PublicFeed` docstring states that unknown instruments yield no BBO. **Task 13 amended after code review (2026-09-05, verified live):** `subscribe()` sends ONE message per instrument — BloFin validates a subscribe message atomically, so one delisted instId in a batched message subscribed nothing for the whole shard while our text pings kept the empty socket alive; `parse_books5` ignores non-snapshot actions; `parse_instruments` also requires `contractType == linear` and `assetClass == Crypto` (BloFin lists equity/index/commodity USDT perps that gap when their market is closed); both adapters' `_top` use strict `_num` for levels; the BloFin fixture is a verbatim live BTC-USDT row (contract value 0.001, 0.1-contract lots) with assertions derived from it; tests pin the WS wiring (url, 50 topics, 25 s text ping, 120 s data timeout), the real subscribe ack for a known instrument, `action: update` frames, a JSON NaN literal, and the too-short-symbol guard. Re-review (approved): NaN prices are pinned to raise in both adapters, the synthetic spec rows use lot ≠ min so a transposed `VenueSpec` argument fails, the fixture uses BloFin's real `Stocks` label, and the docstring describes `expireTime` correctly (per-instrument far-future values; `instType` is always SWAP). **Task 14 amended after code review (2026-09-05):** the paper venue no longer flatters the strategy — taker orders fill at the touch that exists AFTER the latency (paper now shows spread decay) and push an `ack` event first, the maker cap is granted once per DISTINCT touch (an unchanged book re-pushed 10×/s is not new flow) and a sub-lot touch fills nothing, reduce-only fills are clamped to the open position (a close against a flat position is rejected with `nothing to reduce`, like the real venues), every fill needs a FRESH quote, resting orders are indexed per symbol (`on_quote` no longer scans every order ever placed) and terminal orders are bounded (`MAX_ORDERS`), positions carry an average cost so realized P&L and fees flow into `balance()`, `place_post_only` rejects `qty <= 0`, `cancel` distinguishes unknown from terminal, `amend` refuses without a fresh quote, the fill task is exception-guarded and a missing spec is logged once; 5 tests added (9 total). Task 16 accordingly: `retry_degraded` books a leg closed at the mark when the venue confirms it holds no position after a `nothing to reduce` rejection (`LEG_FLAT_AT_VENUE`) and stops after `MAX_CLOSE_RETRIES` (`DEGRADED_STUCK`, Telegram) instead of spinning. Re-review (approved) + follow-ups: the sim's maker cap uses `lots_floor`, a flip test pins the average re-anchor; Task 16's `_on_maker_event` no longer swallows a POST-rest rejection (`LegTrack.acked`; a resting reduce-only exit maker refused with `nothing to reduce` books the leg flat after the venue confirms it and closes the other leg TT, exit reason `venue_flat`); 2 executor tests added. **Task 15 amended after code review (2026-09-05):** histograms report lifetime `total`/`max_ever` beside the windowed `n`/`max` and clamp negative/NaN samples, `LOOP_LAG` is one summary line per `summary_s` (not one per second), uptime is monotonic, `CoverageWatchdog` warns under max(`coverage_floor`, `coverage_frac` × the venue's high-water mark) after a start-up grace, has no `run()` (the App schedules `check()`), and its `to_dict()` (fresh/high/floor) is what the App persists as `coverage`; Config gained `coverage_floor`/`coverage_frac`; 1 metrics test added. Re-review round (approved): nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

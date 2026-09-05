@@ -152,3 +152,23 @@ async def test_cancel_inside_latency_prevents_the_fill_and_amend_resets_the_cloc
     clock.tick(0.01)
     sim.on_quote(mk_bbo("blofin", SYM, 1.0011, 1.0013, bq=100.0, ts=clock()))
     assert events[-1].state == "filled" and events[-1].avg_price == 1.0011
+
+
+async def test_flip_realizes_pnl_on_the_closed_part_and_reanchors_the_average(tmp_path, clock):
+    cfg, board, sim, events = build(tmp_path, clock)
+    board.set(mk_bbo("blofin", SYM, 1.0000, 1.0000, ts=clock()))            # zero-width book: fills at the touch
+    sim.slip = 0.0
+    await sim.place_market(SYM, "buy", 5.0, False, "c1")                     # long 5 @ 1.0
+    await asyncio.sleep(0.02)
+    board.set(mk_bbo("blofin", SYM, 1.2000, 1.2000, ts=clock()))
+    await sim.place_market(SYM, "sell", 8.0, False, "c2")                    # not reduce-only: flips to short 3 @ 1.2
+    await asyncio.sleep(0.02)
+    p = (await sim.positions())[0]
+    assert p.side == "short" and p.qty == 3.0 and sim._avg[SYM] == pytest.approx(1.2)
+    fees = sum(e.fee for e in events if e.state == "filled")
+    assert (await sim.balance())["available"] == pytest.approx(100.0 + (1.2 - 1.0) * 5 * 10.0 - fees)   # P&L on the 5 closed
+    board.set(mk_bbo("blofin", SYM, 1.1000, 1.1000, ts=clock()))
+    await sim.place_market(SYM, "buy", 3.0, True, "c3")                      # cover the short: +0.1 x 3 x 10
+    await asyncio.sleep(0.02)
+    fees = sum(e.fee for e in events if e.state == "filled")
+    assert await sim.positions() == [] and (await sim.balance())["available"] == pytest.approx(100.0 + 10.0 + 3.0 - fees)

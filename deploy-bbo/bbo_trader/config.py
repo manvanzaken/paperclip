@@ -99,6 +99,8 @@ class Config:
     maker_top_level_frac: float = 0.5
     legacy_heartbeat_path: Path = Path("/app/data/heartbeat_live")
     legacy_heartbeat_max_age_s: float = 120.0
+    coverage_floor: int = 10                  # FEED_COVERAGE_LOW below max(floor, coverage_frac × the venue's high-water mark)
+    coverage_frac: float = 0.5
     # bearer token: excluded from repr; asdict() still exposes it — whitelist fields when serializing Config
     telegram_token: str = field(default="", repr=False)
     telegram_chat_id: str = ""
