@@ -1,7 +1,10 @@
 """Position lifecycle: transition table, P&L finalization, PositionBook, StateStore, dashboard state."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,11 +12,15 @@ from pathlib import Path
 from .models import (Position, TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING,
                      TT_EXITING, EXIT_HEDGING, DEGRADED, CLOSED)
 
+log = logging.getLogger("bbo.state")
+
+# OPEN -> CLOSED / DEGRADED exist for reconciliation: a position the venues no longer hold (closed
+# externally, liquidated) is booked closed; one we hold but cannot act on becomes DEGRADED.
 ALLOWED: dict[str, set[str]] = {
     TT_ENTERING: {OPEN, CLOSED, DEGRADED},
     MAKER_RESTING: {HEDGING, CLOSED, TT_ENTERING},
     HEDGING: {OPEN, CLOSED, DEGRADED},
-    OPEN: {TT_EXITING, EXIT_MAKER_RESTING},
+    OPEN: {TT_EXITING, EXIT_MAKER_RESTING, CLOSED, DEGRADED},
     EXIT_MAKER_RESTING: {EXIT_HEDGING, TT_EXITING, OPEN},
     TT_EXITING: {CLOSED, DEGRADED},
     EXIT_HEDGING: {CLOSED, DEGRADED, TT_EXITING},
@@ -24,6 +31,11 @@ ALLOWED: dict[str, set[str]] = {
 
 class InvalidTransition(Exception):
     pass
+
+
+class StateCorrupt(Exception):
+    """The state file exists but cannot be read or parsed. Never treat this as a fresh start: the
+    venues may still hold the positions the file described."""
 
 
 def transition(pos: Position, new_status: str) -> None:
@@ -45,11 +57,19 @@ def finalize_pnl(pos: Position) -> None:
         pos.exit_spread_pct = (pos.exit_price_a - pos.exit_price_b) / pos.exit_price_b * 100.0
 
 
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
 class PositionBook:
     """All non-terminal positions live in `open` (resting, hedging, open, exiting, degraded).
 
     Closed positions are immutable once closed, so their dashboard dicts are cached at close time:
-    state saves (up to 2/s) must not re-serialize hundreds of closed positions."""
+    state saves (up to 2/s) must not re-serialize hundreds of closed positions. `close()` is
+    idempotent — the cancel-after-fill / fill-after-cancel races the spec designs for may deliver a
+    late terminal event after a position was already booked."""
+
+    EQUITY_POINTS = 2000        # at the 60 s cadence ≈ 33 h of dashboard chart; keeps the state file small
 
     def __init__(self, closed_keep: int = 200):
         self.open: list[Position] = []
@@ -61,9 +81,9 @@ class PositionBook:
         self.total_pnl_usd = 0.0
         self.peak_equity = 0.0
         self.max_drawdown_pct = 0.0
-        self.equity_history: list[dict] = []
-        self.audit: list[dict] = []
-        self.closed_keep = closed_keep
+        self.equity_history: list[dict] = []   # {"t": iso, "v": equity, "_ts": float} — the dashboard reads t/v
+        self.audit: list[dict] = []            # 1000 kept in memory, the last 200 persisted
+        self.closed_keep = max(1, closed_keep)
         self.dirty = False
 
     def new(self, symbol: str, venue_a: str, venue_b: str, status: str, mode: str, **kw) -> Position:
@@ -74,10 +94,14 @@ class PositionBook:
         self.dirty = True
         return pos
 
-    def get(self, pos_id: int) -> Position | None:
+    def get(self, pos_id: int, include_closed: bool = False) -> Position | None:
         for p in self.open:
             if p.id == pos_id:
                 return p
+        if include_closed:
+            for p in self.closed:
+                if p.id == pos_id:
+                    return p
         return None
 
     def for_symbol(self, symbol: str) -> list[Position]:
@@ -94,8 +118,9 @@ class PositionBook:
         return out
 
     def close(self, pos: Position, exit_reason: str, now: float, counts_as_trade: bool = True) -> None:
-        if pos.status != CLOSED:
-            transition(pos, CLOSED)
+        if pos.status == CLOSED:
+            return                                     # already booked: a late duplicate event
+        transition(pos, CLOSED)
         pos.exit_reason = exit_reason
         pos.exit_time = now
         finalize_pnl(pos)
@@ -113,7 +138,10 @@ class PositionBook:
         self.dirty = True
 
     def discard(self, pos: Position) -> None:
-        """Drop a position that never became a trade (resting maker cancelled with zero fill)."""
+        """Drop a position that never became a trade (nothing filled). Anything that may hold a leg on
+        a venue must be closed, not discarded."""
+        if pos.status not in (TT_ENTERING, MAKER_RESTING):
+            raise InvalidTransition(f"#{pos.id} discard from {pos.status}")
         if pos in self.open:
             self.open.remove(pos)
         self.dirty = True
@@ -124,9 +152,10 @@ class PositionBook:
         if self.peak_equity > 0:
             dd = (self.peak_equity - equity) / self.peak_equity * 100.0
             self.max_drawdown_pct = max(self.max_drawdown_pct, dd)
-        if not self.equity_history or now - self.equity_history[-1]["ts"] >= every_s:
-            self.equity_history.append({"ts": now, "equity": round(equity, 4)})
-            del self.equity_history[:-10000]
+        last_ts = float((self.equity_history[-1].get("_ts") or 0.0)) if self.equity_history else 0.0
+        if not self.equity_history or now - last_ts >= every_s:
+            self.equity_history.append({"t": _iso(now), "v": round(equity, 4), "_ts": now})
+            del self.equity_history[:-self.EQUITY_POINTS]
 
     def audit_order(self, entry: dict) -> None:
         self.audit.append(entry)
@@ -135,53 +164,95 @@ class PositionBook:
     def to_dict(self) -> dict:
         return {"next_id": self.next_id, "total_trades": self.total_trades, "total_wins": self.total_wins,
                 "total_pnl_usd": self.total_pnl_usd, "peak_equity": self.peak_equity,
-                "max_drawdown_pct": self.max_drawdown_pct, "equity_history": self.equity_history[-10000:],
+                "max_drawdown_pct": self.max_drawdown_pct, "equity_history": self.equity_history[-self.EQUITY_POINTS:],
                 "open_positions": [p.to_dict() for p in self.open],
                 "closed_positions": list(self._closed_dicts),
                 "order_audit_log": self.audit[-200:]}
 
     def load(self, d: dict) -> None:
-        self.next_id = int(d.get("next_id", 1))
         self.total_trades = int(d.get("total_trades", 0))
         self.total_wins = int(d.get("total_wins", 0))
         self.total_pnl_usd = float(d.get("total_pnl_usd", 0.0))
         self.peak_equity = float(d.get("peak_equity", 0.0))
         self.max_drawdown_pct = float(d.get("max_drawdown_pct", 0.0))
-        self.equity_history = list(d.get("equity_history", []))
+        self.equity_history = list(d.get("equity_history", []))[-self.EQUITY_POINTS:]
         self.audit = list(d.get("order_audit_log", []))
         self.open = [Position.from_dict(x) for x in d.get("open_positions", [])]
         self.closed = [Position.from_dict(x) for x in d.get("closed_positions", [])][-self.closed_keep:]
         self._closed_dicts = [p.to_dict() for p in self.closed]
+        highest = max((p.id for p in self.open + self.closed), default=0)
+        self.next_id = max(int(d.get("next_id", 1)), highest + 1)   # never reuse an id the file still holds
+
+
+def _sanitize(obj):
+    """Replace non-finite floats with None so the dashboard's JSON.parse never chokes."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
+def dumps_state(state: dict) -> str:
+    try:
+        return json.dumps(state, allow_nan=False)
+    except ValueError:
+        log.error("STATE_NAN non-finite float in state — sanitizing to null")
+        return json.dumps(_sanitize(state))
 
 
 class StateStore:
+    """Atomic, durable JSON state: write tmp → flush+fsync → keep the previous file as `.bak` → rename."""
+
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.bak = self.path.with_suffix(self.path.suffix + ".bak")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def save(self, state: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dumps_state(state)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w") as f:
-            json.dump(state, f)
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        if self.path.exists():
+            os.replace(self.path, self.bak)
         os.replace(tmp, self.path)
 
-    def load(self) -> dict | None:
+    async def save_async(self, state: dict) -> None:
+        """Serialize + write off the event loop (state must be a snapshot the loop no longer mutates)."""
+        await asyncio.to_thread(self.save, state)
+
+    def _read(self, path: Path) -> dict | None:
         try:
-            with open(self.path, "r") as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except FileNotFoundError:
             return None
-        except (json.JSONDecodeError, OSError):
-            return None
+        except (json.JSONDecodeError, OSError) as e:
+            raise StateCorrupt(f"{path}: {e}") from e
+
+    def load(self) -> dict | None:
+        """None only when no state file exists (fresh start). Raises StateCorrupt otherwise."""
+        return self._read(self.path)
+
+    def load_backup(self) -> dict | None:
+        return self._read(self.bak)
 
 
 def build_state(book: PositionBook, *, equity: float, cash: float, starting_capital: float, mode: str,
                 risk_state: dict, balances: dict, scanner: list, bbo: dict, saved_at: float) -> dict:
-    """The real_trader dashboard schema plus `risk` and `bbo` sections."""
+    """The real_trader dashboard schema plus `risk` and `bbo` sections. `cash` is realized-only
+    (capital + realized P&L): the legacy dashboard shows `cash + Σ open net_pnl_usd`, so `equity`
+    must not be passed as `cash` when it already includes unrealized P&L. `kill_switch` mirrors the
+    manual halt so the dashboard's status light reflects `stop.flag` / `/stop`."""
     d = book.to_dict()
     d.update({
         "state_saved_at_ts": saved_at,
-        "saved_at": datetime.fromtimestamp(saved_at, tz=timezone.utc).isoformat(),
+        "saved_at": _iso(saved_at),
         "cash": cash, "equity": equity, "starting_capital": starting_capital,
         "pair_stats": risk_state.get("pair_stats", {}),
         "blofin_risk_blacklist": sorted(k.split("|", 1)[1] for k in risk_state.get("venue_symbol_blacklist", [])
@@ -189,11 +260,11 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
         "symbol_blacklist": risk_state.get("symbol_blacklist", {}),
         "pair_failure_counts": risk_state.get("pair_strikes", {}),
         "pair_blacklist": risk_state.get("pair_blacklist", {}),
-        "balance_cache": balances,
+        "balance_cache": {k: dict(v) for k, v in balances.items()},
         "spread_scanner": scanner,
         "spread_histogram": {},
         "dry_run": mode != "live",
-        "kill_switch": False,
+        "kill_switch": bool(risk_state.get("halted")),
         "mode": mode,
         "risk": risk_state,
         "bbo": bbo,
