@@ -50,3 +50,21 @@ tests/release-smoke/test-results/
 tests/release-smoke/playwright-report/
 .superset/
 .claude/worktrees/
+
+# Crypto scanner
+crypto-scanner/config.yaml
+crypto-scanner/tokens.json
+crypto-scanner/inventory.yaml
+crypto-scanner/seen_announcements.json
+crypto-scanner/.venv/
+crypto-scanner/__pycache__/
+crypto-scanner/**/__pycache__/
+prod-snapshot/
+
+# --- lokaal trading-werk (2026-09-04) ---
+**/.env.local
+.vercel/
+railway-backups/
+.claire/
+.superpowers/
+.claude/launch.json

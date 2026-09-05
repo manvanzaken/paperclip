@@ -1,0 +1,6 @@
+ccxt>=4.0.0
+aiohttp>=3.9.0
+pyyaml>=6.0
+rich>=13.0
+python-telegram-bot>=21.0
+requests>=2.31

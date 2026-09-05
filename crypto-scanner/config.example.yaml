@@ -1,0 +1,51 @@
+# Binance Alpha Price Inefficiency Scanner - Configuration
+# Copy this file to config.yaml and customize as needed.
+
+# Scanning behavior
+scan_interval_seconds: 30
+min_spread_pct: 1.5          # Only alert if net spread exceeds this after fees
+min_liquidity_usd: 5000      # Skip pairs with less liquidity than this
+max_tokens: 50               # Max Binance Alpha tokens to track
+
+# CEX API keys (read-only permissions only!)
+# All price scanning works WITHOUT keys. Keys are optional for higher rate limits.
+binance:
+  api_key: ""
+  api_secret: ""
+
+# Optional additional CEXs for cross-CEX arbitrage
+gate:
+  api_key: ""
+  api_secret: ""
+mexc:
+  api_key: ""
+  api_secret: ""
+kucoin:
+  api_key: ""
+  api_secret: ""
+  passphrase: ""
+bybit:
+  api_key: ""
+  api_secret: ""
+
+# Fee defaults (override if your tier is different)
+fees:
+  binance_spot_pct: 0.1
+  gate_spot_pct: 0.2
+  mexc_spot_pct: 0.2
+  kucoin_spot_pct: 0.1
+  bybit_spot_pct: 0.1
+  slippage_pct: 0.5
+  gas_eth_usd: 5.0
+  gas_bsc_usd: 0.10
+  gas_sol_usd: 0.001
+
+# Alerts (all optional)
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""
+
+discord:
+  enabled: false
+  webhook_url: ""
