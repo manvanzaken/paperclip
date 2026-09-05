@@ -82,7 +82,14 @@ class Config:
     failed_entry_cooldown_s: float = 60.0
     pair_strikes_to_blacklist: int = 2
     pair_blacklist_s: float = 86_400.0
+    strike_decay_s: float = 21_600.0          # strikes older than this are forgotten
     symbol_loss_blacklist_s: float = 21_600.0
+    symbol_loss_pct: float = -0.10            # a close worse than this % of size blacklists the symbol
+    pair_stats_window_s: float = 86_400.0     # win-rate gate looks at closes inside this window (so a route can recover)
+    pair_min_trades: int = 5                  # ...once it has at least this many closes in the window
+    pair_min_win_rate: float = 0.30           # ...and blocks below this win rate
+    balance_max_age_s: float = 120.0          # live: a balance cache older than this fails closed ("balance_unknown")
+    funding_block_min_pct: float = 0.01       # funding gate blocks only above this net cost (percent points)
     # ops
     halt_flag: str = "stop.flag"
     resume_flag: str = "start.flag"

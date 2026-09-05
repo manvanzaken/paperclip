@@ -491,7 +491,14 @@ class Config:
     failed_entry_cooldown_s: float = 60.0
     pair_strikes_to_blacklist: int = 2
     pair_blacklist_s: float = 86_400.0
+    strike_decay_s: float = 21_600.0          # strikes older than this are forgotten
     symbol_loss_blacklist_s: float = 21_600.0
+    symbol_loss_pct: float = -0.10            # a close worse than this % of size blacklists the symbol
+    pair_stats_window_s: float = 86_400.0     # win-rate gate looks at closes inside this window (so a route can recover)
+    pair_min_trades: int = 5                  # ...once it has at least this many closes in the window
+    pair_min_win_rate: float = 0.30           # ...and blocks below this win rate
+    balance_max_age_s: float = 120.0          # live: a balance cache older than this fails closed ("balance_unknown")
+    funding_block_min_pct: float = 0.01       # funding gate blocks only above this net cost (percent points)
     # ops
     halt_flag: str = "stop.flag"
     resume_flag: str = "start.flag"
@@ -2494,7 +2501,8 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
         "blofin_risk_blacklist": sorted(k.split("|", 1)[1] for k in risk_state.get("venue_symbol_blacklist", [])
                                         if k.startswith("blofin|")),
         "symbol_blacklist": risk_state.get("symbol_blacklist", {}),
-        "pair_failure_counts": risk_state.get("pair_strikes", {}),
+        "pair_failure_counts": {k: (v.get("n", 0) if isinstance(v, dict) else v)
+                                for k, v in risk_state.get("pair_strikes", {}).items()},
         "pair_blacklist": risk_state.get("pair_blacklist", {}),
         "balance_cache": {k: dict(v) for k, v in balances.items()},
         "spread_scanner": scanner,
@@ -2553,6 +2561,11 @@ def make_cfg(tmp_path=None, **over):
 `tests/test_risk.py`:
 
 ```python
+from dataclasses import replace
+
+import pytest
+
+from bbo_trader.config import VenueConfig, RateLimits
 from bbo_trader.models import Position, OPEN
 from bbo_trader.risk import MismatchGuard, RiskManager, pair_key, route_key
 from tests.conftest import make_cfg
@@ -2560,29 +2573,45 @@ from tests.conftest import make_cfg
 
 def test_mismatch_guard_slow_and_fast_tiers():
     g = MismatchGuard(slow_pct=10.0, slow_n=3, fast_pct=50.0, fast_n=2)
-    assert not g.observe("k", 12.0) and not g.observe("k", 12.0)
+    assert not g.observe("k", 12.0)
+    assert not g.observe("k", 12.0)
     assert not g.observe("k", 5.0)                      # reset by a sane quote
-    assert not g.observe("k", 12.0) and not g.observe("k", 12.0)
-    assert g.observe("k", 12.0)                         # third consecutive > 10% -> blacklisted
-    assert g.is_blacklisted("k")
+    assert not g.observe("k", 12.0)
+    assert not g.observe("k", 12.0)
+    assert g.observe("k", 12.0)                         # third consecutive > 10% -> blacklisted (slow tier)
+    assert g.is_blacklisted("k") and g.blacklisted["k"]["tier"] == "slow"
+    assert not g.observe("k", 12.0)                     # already blacklisted: no second transition
     g2 = MismatchGuard(10.0, 300, 50.0, 2)
-    assert not g2.observe("f", 80.0) and g2.observe("f", -80.0)   # fast tier, sign-agnostic
+    assert not g2.observe("f", 80.0)
+    assert g2.observe("f", -80.0)                       # fast tier, sign-agnostic
+    assert g2.blacklisted["f"]["tier"] == "fast" and g2.blacklisted["f"]["spread_pct"] == -80.0
+    assert not g2.observe("n", float("nan"))            # NaN never counts as absurd
+    with pytest.raises(ValueError):
+        MismatchGuard(10.0, 0, 50.0, 2)                 # n=0 would blacklist every pair on its first quote
+    with pytest.raises(ValueError):
+        MismatchGuard(0.0, 3, 50.0, 2)
 
 
 def test_entry_gates_in_order(tmp_path, clock):
     cfg = make_cfg(tmp_path, max_concurrent=2, blocked_symbols=frozenset({"BADUSDT"}))
+    cfg = replace(cfg, venues=cfg.venues + (VenueConfig("gate", "trade", 0.05, 0.02, RateLimits(),
+                                                        symbol_whitelist=("BTCUSDT",)),))
     r = RiskManager(cfg, clock)
     ok = lambda **kw: r.entry_allowed(kw.get("symbol", "XYZUSDT"), kw.get("a", "blofin"), kw.get("b", "mexc"),
                                       kw.get("size", 25.0), kw.get("open_count", 0))
     assert ok() == (True, "ok")
+    assert ok(a="mexc", b="mexc") == (False, "invalid")
+    assert ok(size=0.0) == (False, "invalid")
     assert ok(open_count=2) == (False, "max_concurrent")
     assert ok(symbol="BADUSDT") == (False, "blocked_symbol")
     r.set_cooldown("XYZUSDT")
     assert ok() == (False, "cooldown")
     clock.tick(61)
     assert ok() == (True, "ok")
-    assert ok(a="okx", b="mexc") == (False, "venue_blocked")           # okx whitelist excludes XYZUSDT
-    assert ok(symbol="BTCUSDT", a="okx", b="mexc") == (True, "ok")
+    assert ok(a="okx", b="mexc") == (False, "venue_blocked")           # quote_only venue: never tradable
+    assert ok(a="binance", b="mexc") == (False, "venue_blocked")       # unknown venue fails closed, no KeyError
+    assert ok(a="gate", b="mexc") == (False, "venue_blocked")          # whitelist excludes XYZUSDT
+    assert ok(symbol="BTCUSDT", a="gate", b="mexc") == (True, "ok")
     r.blacklist_venue_symbol("blofin", "XYZUSDT")
     assert ok() == (False, "venue_blocked")
     r.venue_symbol_blacklist.clear()
@@ -2590,10 +2619,8 @@ def test_entry_gates_in_order(tmp_path, clock):
     assert r.record_strike("XYZUSDT", "blofin", "mexc")                 # 2 strikes -> 24 h blacklist
     assert ok() == (False, "pair_blacklist")
     assert ok(a="mexc", b="blofin") == (True, "ok")                     # other direction unaffected
-    r.mismatch.blacklisted.add(route_key("XYZUSDT", "mexc", "blofin"))
+    r.mismatch.blacklist(route_key("XYZUSDT", "mexc", "blofin"))
     assert ok(a="mexc", b="blofin") == (False, "mismatch")
-    r.pair_stats[pair_key("ABCUSDT", "blofin", "mexc")] = {"wins": 1, "losses": 4, "total_pnl": -1.0}
-    assert ok(symbol="ABCUSDT") == (False, "pair_win_rate")
     r.set_balance("mexc", available=20.0, total=100.0)
     assert ok(symbol="QQQUSDT") == (False, "balance")                  # 20 < 25 × 1.05
     r.set_balance("mexc", available=30.0, total=100.0)
@@ -2602,16 +2629,56 @@ def test_entry_gates_in_order(tmp_path, clock):
     assert ok(symbol="QQQUSDT") == (False, "halted")
 
 
-def test_halt_flags(tmp_path, clock):
-    cfg = make_cfg(tmp_path)
-    r = RiskManager(cfg, clock)
+def test_balance_gate_fails_closed_in_live_mode(tmp_path, clock):
+    r = RiskManager(make_cfg(tmp_path, mode="live"), clock)
+    ok = lambda: r.entry_allowed("XYZUSDT", "blofin", "mexc", 25.0, 0)
+    assert ok() == (False, "balance_unknown")                           # no cache yet
+    r.set_balance("mexc", 100.0, 100.0)
+    r.set_balance("blofin", 100.0, 100.0)
+    assert ok() == (True, "ok")
+    clock.tick(121)
+    assert ok() == (False, "balance_unknown")                           # stale cache (> balance_max_age_s)
+    r.set_balance("mexc", 100.0, 100.0)
+    r.set_balance("blofin", 10.0, 100.0)
+    assert ok() == (False, "balance")
+    paper = RiskManager(make_cfg(tmp_path), clock)                      # paper: a missing cache is permissive
+    assert paper.entry_allowed("XYZUSDT", "blofin", "mexc", 25.0, 0) == (True, "ok")
+
+
+def test_halt_flags_are_consumed_and_stop_wins(tmp_path, clock):
+    r = RiskManager(make_cfg(tmp_path), clock)
     assert r.check_flags() is None
     (tmp_path / "stop.flag").write_text("")
-    assert r.check_flags() == "halt" and r.halted
-    assert r.check_flags() is None                      # idempotent
+    assert r.check_flags() == "halt" and r.halted and r.halt_reason == "stop.flag"
+    assert not (tmp_path / "stop.flag").exists()                        # consumed: the persisted `halted` is the truth
+    assert r.check_flags() is None
+    r.resume()                                                          # a Telegram /start must really resume
+    assert r.check_flags() is None and not r.halted
+    (tmp_path / "start.flag").write_text("")
+    assert r.check_flags() == "resume_noop" and not r.halted            # start while running: consumed, reported
+    (tmp_path / "stop.flag").write_text("")
+    (tmp_path / "start.flag").write_text("")
+    assert r.check_flags() == "halt" and r.halted                       # both present: stop wins
+    assert not (tmp_path / "stop.flag").exists() and not (tmp_path / "start.flag").exists()
     (tmp_path / "start.flag").write_text("")
     assert r.check_flags() == "resume" and not r.halted
-    assert not (tmp_path / "stop.flag").exists() and not (tmp_path / "start.flag").exists()
+
+
+def test_undeletable_flag_never_disables_the_stop(tmp_path, clock):
+    r = RiskManager(make_cfg(tmp_path), clock)
+    (tmp_path / "start.flag").mkdir()                                   # a directory is not a flag
+    (tmp_path / "stop.flag").write_text("")
+    assert r.check_flags() == "halt" and r.halted                       # no exception, stop honoured
+    assert r.check_flags() is None and r.halted                         # the directory does not resume the bot
+    (tmp_path / "start.flag").rmdir()
+    (tmp_path / "start.flag").write_text("")
+    tmp_path.chmod(0o555)                                               # a real flag that cannot be unlinked
+    try:
+        assert r.check_flags() == "resume" and not r.halted             # honoured once...
+        r.halt("telegram")
+        assert r.check_flags() is None and r.halted                     # ...then ignored: it must not undo a later halt
+    finally:
+        tmp_path.chmod(0o755)
 
 
 def test_funding_gate_net_of_both_legs(tmp_path, clock):
@@ -2622,26 +2689,72 @@ def test_funding_gate_net_of_both_legs(tmp_path, clock):
     r.set_funding("mexc", {"XYZUSDT": (0.0005, now + 300)})
     assert r.funding_blocks("XYZUSDT", "blofin", "mexc")
     assert not r.funding_blocks("XYZUSDT", "mexc", "blofin")           # reversed legs: net +0.04%
+    r.set_funding("mexc", {"XYZUSDT": (0.000101, now + 300)})          # 0.0001 % apart: below the threshold
+    assert not r.funding_blocks("XYZUSDT", "blofin", "mexc")
     r.set_funding("mexc", {"XYZUSDT": (0.0005, now + 3600)})           # mexc settles outside the window
     assert not r.funding_blocks("XYZUSDT", "blofin", "mexc")
     assert not r.funding_blocks("NOFUNDUSDT", "blofin", "mexc")        # unknown -> allowed
+    r.set_funding("mexc", {"XYZUSDT": (0.0005, now - 7200)})           # dead feed: stamp hours in the past
+    assert not r.funding_blocks("XYZUSDT", "blofin", "mexc") and "mexc|XYZUSDT" in r.stale_funding
+    r.set_funding("mexc", {"XYZUSDT": (0.0005, now + 300)})
+    assert r.funding_blocks("XYZUSDT", "blofin", "mexc") and not r.stale_funding
+    r.set_funding("mexc", {"XYZUSDT": ("bad", None)})                  # malformed feed value: logged, ignored
+    assert r.funding["mexc|XYZUSDT"] == (0.0005, now + 300)
 
 
-def test_record_close_and_persistence(tmp_path, clock):
+def test_record_close_win_rate_window_and_symbol_blacklist(tmp_path, clock):
     r = RiskManager(make_cfg(tmp_path), clock)
-    p = Position(1, "XYZUSDT", "blofin", "mexc", OPEN, "TT", size_usd=25.0, net_pnl_usd=-0.05)
-    r.record_close(p)                                    # -0.2% of size -> 6 h symbol blacklist
+    key = pair_key("XYZUSDT", "blofin", "mexc")
+    mk = lambda pnl: Position(1, "XYZUSDT", "blofin", "mexc", OPEN, "TT", size_usd=25.0, net_pnl_usd=pnl)
+    r.record_close(mk(-0.05))                            # -0.2% of size -> 6 h symbol blacklist
     assert r.symbol_blacklist["XYZUSDT"] == clock() + 21_600.0
-    assert r.pair_stats[pair_key("XYZUSDT", "blofin", "mexc")] == {"wins": 0, "losses": 1, "total_pnl": -0.05}
+    r.record_close(mk(0.0))                              # zero P&L: neither win nor loss
+    r.record_close(mk(0.01), counts_as_trade=False)      # reconciliation close: ignored
+    assert r.pair_stats[key]["wins"] == 0 and r.pair_stats[key]["losses"] == 1
+    assert r.pair_stats[key]["total_pnl"] == pytest.approx(-0.05)
+    ok = lambda: r.entry_allowed("XYZUSDT", "blofin", "mexc", 25.0, 0)
+    clock.tick(21_601)
+    for pnl in (-0.01, -0.01, -0.01, 0.02):              # 1 win / 4 losses inside the window -> 20 % < 30 %
+        r.record_close(mk(pnl))
+    assert ok() == (False, "pair_win_rate")
+    clock.tick(86_401)                                   # outcomes age out of the window: the route can recover
+    assert ok() == (True, "ok")
+
+
+def test_strikes_decay_and_state_roundtrip(tmp_path, clock):
+    r = RiskManager(make_cfg(tmp_path), clock)
+    key = pair_key("XYZUSDT", "blofin", "mexc")
+    assert not r.record_strike("XYZUSDT", "blofin", "mexc")
+    clock.tick(21_601)                                   # strike_decay_s: the old strike is forgotten
+    assert not r.record_strike("XYZUSDT", "blofin", "mexc")
+    assert r.pair_strikes[key]["n"] == 1
+    r.record_close(Position(1, "ABCUSDT", "blofin", "mexc", OPEN, "TT", size_usd=25.0, net_pnl_usd=-0.05))
+    r.mismatch.blacklist("QQQUSDT|blofin|mexc", 80.0)
     d = r.to_dict()
+    r.record_close(Position(2, "ABCUSDT", "blofin", "mexc", OPEN, "TT", size_usd=25.0, net_pnl_usd=0.05))
+    assert d["pair_stats"][pair_key("ABCUSDT", "blofin", "mexc")]["wins"] == 0    # to_dict() is a snapshot
     r2 = RiskManager(make_cfg(tmp_path), clock)
     r2.load(d)
-    assert r2.symbol_blacklist == r.symbol_blacklist and r2.pair_stats == r.pair_stats
+    assert r2.symbol_blacklist == r.symbol_blacklist and r2.pair_strikes == r.pair_strikes
+    assert r2.pair_stats[pair_key("ABCUSDT", "blofin", "mexc")]["losses"] == 1
+    assert r2.mismatch.is_blacklisted("QQQUSDT|blofin|mexc") and r2.mismatch.blacklisted["QQQUSDT|blofin|mexc"]["spread_pct"] == 80.0
     clock.tick(30_000)
-    assert RiskManager(make_cfg(tmp_path), clock).load(d) is None
     r3 = RiskManager(make_cfg(tmp_path), clock)
     r3.load(d)
-    assert r3.symbol_blacklist == {}                     # expired entries dropped on load
+    assert r3.symbol_blacklist == {} and r3.pair_strikes == {}          # expired entries dropped on load
+
+
+def test_load_tolerates_corrupt_and_legacy_state(tmp_path, clock):
+    r = RiskManager(make_cfg(tmp_path), clock)
+    now = clock()
+    r.load({"pair_blacklist": {"k": "soon", "ok": now + 100}, "pair_strikes": {"k": None, "old": 1},
+            "cooldowns": None, "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1}},
+            "mismatch_blacklist": ["legacy|a|b"], "venue_symbol_blacklist": "notalist", "halted": 1})
+    assert r.pair_blacklist == {"ok": now + 100} and r.pair_strikes == {"old": {"n": 1, "ts": now}}
+    assert r.cooldowns == {} and "p" not in r.pair_stats and r.pair_stats["q"]["recent"] == []
+    assert r.mismatch.is_blacklisted("legacy|a|b") and r.venue_symbol_blacklist == set() and r.halted
+    r.load("garbage")                                                   # not even an object: fresh state, no raise
+    assert not r.halted and r.pair_blacklist == {}
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -2652,13 +2765,33 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.risk'`
 - [ ] **Step 4: Implement `bbo_trader/risk.py`**
 
 ```python
-"""Risk: manual halt, blacklists and strikes, mismatch guard, balances, funding gate."""
+"""Risk: manual halt, blacklists and strikes, mismatch guard, balances, funding gate.
+
+Rules of this module:
+- `entry_allowed` never raises and fails CLOSED on unknown input (unknown or quote-only venue,
+  missing/stale balance cache in live mode); every rejection has a stable reason string that the
+  strategy counts in the funnel.
+- There is no automatic kill switch in v1 (user decision). Halting is manual: `stop.flag`/`start.flag`
+  in DATA_DIR (edge-triggered, consumed on read, stop wins over a simultaneous start) or Telegram
+  /stop and /start. The halt survives restarts through the persisted `halted` flag, not the files.
+- One position per symbol is NOT gated here: the app drives a held symbol's position instead of
+  re-evaluating it (`App.on_quote`), so a held symbol never reaches `entry_allowed`.
+"""
 from __future__ import annotations
 
+import logging
+import math
 import time
+from pathlib import Path
 
 from .config import Config
 from .models import Position
+
+log = logging.getLogger("bbo.risk")
+
+RECENT_OUTCOMES_KEEP = 20          # per route; the win-rate gate reads the ones inside pair_stats_window_s
+FUNDING_STALE_GRACE_S = 60.0       # a settle stamp this far in the past is a late poll, further back a dead feed
+BALANCE_HEADROOM = 1.05            # notional × 1.05 must be available (conservative: leverage is not modelled)
 
 
 def pair_key(symbol: str, venue_a: str, venue_b: str) -> str:
@@ -2670,25 +2803,105 @@ def route_key(symbol: str, venue_x: str, venue_y: str) -> str:
     return f"{symbol}|" + "|".join(sorted((venue_x, venue_y)))
 
 
+# ---- tolerant state parsers: a hand-edited or version-skewed `risk` section must never crash start-up ----
+def _float_map(raw: object, now: float | None = None) -> dict[str, float]:
+    """`{key: float}`; drops unparsable entries and, when `now` is given, expired ones."""
+    out: dict[str, float] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            t = float(v)
+        except (TypeError, ValueError):
+            log.warning("RISK_STATE_DROP %r=%r", k, v)
+            continue
+        if math.isfinite(t) and (now is None or t > now):
+            out[str(k)] = t
+    return out
+
+
+def _strikes_from(raw: object, now: float, decay_s: float) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            if isinstance(v, dict):
+                n, ts = int(v.get("n", 0)), float(v.get("ts", now))
+            else:
+                n, ts = int(v), now            # legacy bare count: starts decaying from this load
+        except (TypeError, ValueError):
+            log.warning("RISK_STATE_DROP pair_strikes %r=%r", k, v)
+            continue
+        if n > 0 and now - ts <= decay_s:
+            out[str(k)] = {"n": n, "ts": ts}
+    return out
+
+
+def _stats_from(raw: object) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            recent = [[float(ts), bool(won)] for ts, won in (v.get("recent") or [])]
+            out[str(k)] = {"wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
+                           "total_pnl": float(v.get("total_pnl", 0.0)), "recent": recent[-RECENT_OUTCOMES_KEEP:]}
+        except (TypeError, ValueError, AttributeError):
+            log.warning("RISK_STATE_DROP pair_stats %r=%r", k, v)
+    return out
+
+
+def _mismatch_from(raw: object) -> dict[str, dict]:
+    """Accepts the legacy bare list of keys or the current `{key: {ts, spread_pct, tier}}`. A key is
+    never dropped over a bad detail: the blacklist is a safety list."""
+    if isinstance(raw, list):
+        return {str(k): {"ts": 0.0, "spread_pct": 0.0, "tier": "legacy"} for k in raw}
+    out: dict[str, dict] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[str(k)] = {"ts": float(v.get("ts", 0.0)), "spread_pct": float(v.get("spread_pct", 0.0)),
+                               "tier": str(v.get("tier", ""))}
+            except (TypeError, ValueError, AttributeError):
+                out[str(k)] = {"ts": 0.0, "spread_pct": 0.0, "tier": "legacy"}
+    return out
+
+
 class MismatchGuard:
-    """Same-ticker-different-asset detector: |raw spread| stays absurd for N consecutive quotes."""
+    """Same-ticker-different-asset detector: |raw mid spread| stays absurd for N consecutive quotes.
+    Two tiers: slow (moderately absurd for long) and fast (grossly absurd for a few quotes). A hit is
+    persistent for the deployment (spec) and records when/why so the dashboard can show it; lift one
+    by hand by removing its key from `mismatch_blacklist` in the state file."""
 
     def __init__(self, slow_pct: float, slow_n: int, fast_pct: float, fast_n: int,
-                 blacklisted: set[str] | None = None):
+                 blacklisted: dict[str, dict] | None = None, clock=time.time):
+        if not (slow_pct > 0.0 and fast_pct > 0.0) or slow_n < 1 or fast_n < 1:
+            raise ValueError(f"mismatch thresholds must be positive: slow {slow_pct}%x{slow_n}, fast {fast_pct}%x{fast_n}")
         self.slow_pct, self.slow_n, self.fast_pct, self.fast_n = slow_pct, slow_n, fast_pct, fast_n
-        self.blacklisted: set[str] = set(blacklisted or ())
+        self.blacklisted: dict[str, dict] = dict(blacklisted or {})   # key -> {"ts", "spread_pct", "tier"}
+        self.clock = clock
         self._slow: dict[str, int] = {}
         self._fast: dict[str, int] = {}
 
     def observe(self, key: str, raw_spread_pct: float) -> bool:
-        """Returns True when this observation newly blacklists the pair."""
+        """Returns True when this observation newly blacklists the pair (NaN never counts as absurd)."""
+        if key in self.blacklisted:
+            return False
         a = abs(raw_spread_pct)
         self._slow[key] = self._slow.get(key, 0) + 1 if a > self.slow_pct else 0
         self._fast[key] = self._fast.get(key, 0) + 1 if a > self.fast_pct else 0
-        if key not in self.blacklisted and (self._slow[key] >= self.slow_n or self._fast[key] >= self.fast_n):
-            self.blacklisted.add(key)
-            return True
-        return False
+        tier = "fast" if self._fast[key] >= self.fast_n else "slow" if self._slow[key] >= self.slow_n else ""
+        if not tier:
+            return False
+        self.blacklist(key, raw_spread_pct, tier)
+        return True
+
+    def blacklist(self, key: str, spread_pct: float = 0.0, tier: str = "manual") -> None:
+        self.blacklisted[key] = {"ts": self.clock(), "spread_pct": spread_pct, "tier": tier}
+        self._slow.pop(key, None)
+        self._fast.pop(key, None)
+        log.warning("MISMATCH_BLACKLIST %s spread=%.2f%% tier=%s", key, spread_pct, tier)
 
     def is_blacklisted(self, key: str) -> bool:
         return key in self.blacklisted
@@ -2698,57 +2911,116 @@ class RiskManager:
     def __init__(self, cfg: Config, clock=time.time):
         self.cfg = cfg
         self.clock = clock
+        self._venues = {v.name: v for v in cfg.venues}
         self.halted = False
         self.halt_reason = ""
-        self.pair_strikes: dict[str, int] = {}
+        self.pair_strikes: dict[str, dict] = {}         # key -> {"n": strikes, "ts": last strike}
         self.pair_blacklist: dict[str, float] = {}      # key -> until ts
         self.symbol_blacklist: dict[str, float] = {}    # symbol -> until ts
         self.cooldowns: dict[str, float] = {}           # symbol -> until ts
         self.venue_symbol_blacklist: set[str] = set()   # "venue|symbol"
-        self.balances: dict[str, dict] = {}             # venue -> {"available","total","ts"}
-        self.funding: dict[str, tuple[float, float]] = {}  # "venue|symbol" -> (rate, next_settle_ts)
-        self.pair_stats: dict[str, dict] = {}           # key -> {"wins","losses","total_pnl"}
+        self.balances: dict[str, dict] = {}             # venue -> {"available","total","locked","ts"}
+        self.funding: dict[str, tuple[float, float]] = {}  # "venue|symbol" -> (rate fraction, next_settle_ts)
+        self.stale_funding: set[str] = set()            # "venue|symbol" whose settle stamp is in the past (dead feed)
+        self.pair_stats: dict[str, dict] = {}           # key -> {"wins","losses","total_pnl","recent": [[ts, won],..]}
         self.mismatch = MismatchGuard(cfg.mismatch_slow_pct, cfg.mismatch_slow_n,
-                                      cfg.mismatch_fast_pct, cfg.mismatch_fast_n)
+                                      cfg.mismatch_fast_pct, cfg.mismatch_fast_n, clock=clock)
+        self._dead_flags: dict[Path, tuple[int, int]] = {}   # undeletable flag -> (inode, mtime_ns): ignored until replaced
 
     # ---- halt ----------------------------------------------------------------
     def halt(self, reason: str) -> None:
         self.halted, self.halt_reason = True, reason
+        self._consume_flags()
 
     def resume(self) -> None:
         self.halted, self.halt_reason = False, ""
+        self._consume_flags()          # a stale stop.flag must never re-halt a deliberate resume
+
+    def _flag_path(self, name: str) -> Path:
+        return self.cfg.data_dir / name
+
+    @staticmethod
+    def _signature(p: Path) -> tuple[int, int] | None:
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        return st.st_ino, st.st_mtime_ns
+
+    def _flag_present(self, p: Path) -> bool:
+        try:
+            if p in self._dead_flags:
+                if self._signature(p) == self._dead_flags[p]:
+                    return False       # the very file we could not unlink: keep ignoring it
+                del self._dead_flags[p]    # gone or replaced: treat the new one as a fresh flag
+            return p.is_file()         # a directory or a socket is not a flag
+        except OSError as e:
+            log.error("FLAG_CHECK_FAILED %s: %s", p, e)
+            return False
+
+    def _consume_flags(self) -> None:
+        for name in (self.cfg.halt_flag, self.cfg.resume_flag):
+            p = self._flag_path(name)
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.error("FLAG_UNLINK_FAILED %s: %s — ignoring this flag until it is removed by hand", p, e)
+                sig = self._signature(p)
+                if sig is not None:
+                    self._dead_flags[p] = sig
 
     def check_flags(self) -> str | None:
-        """Dashboard flags in DATA_DIR: stop.flag halts, start.flag resumes (and removes both)."""
-        stop = self.cfg.data_dir / self.cfg.halt_flag
-        start = self.cfg.data_dir / self.cfg.resume_flag
-        if start.exists():
-            for p in (start, stop):
-                try:
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
-            if self.halted:
-                self.resume()
-                return "resume"
+        """Dashboard/operator flags in DATA_DIR, edge-triggered and consumed on read: `stop.flag` halts,
+        `start.flag` resumes; both present → stop wins. Returns "halt" / "resume" on a transition,
+        "halt_noop" / "resume_noop" when the flag asked for the state we are already in, else None."""
+        has_stop = self._flag_present(self._flag_path(self.cfg.halt_flag))
+        has_start = self._flag_present(self._flag_path(self.cfg.resume_flag))
+        if not has_stop and not has_start:
             return None
-        if stop.exists() and not self.halted:
+        if has_stop:
+            if has_start:
+                log.warning("FLAGS %s and %s both present — stop wins", self.cfg.halt_flag, self.cfg.resume_flag)
+            if self.halted:
+                self._consume_flags()
+                return "halt_noop"
             self.halt("stop.flag")
             return "halt"
-        return None
+        if not self.halted:
+            self._consume_flags()
+            return "resume_noop"
+        self.resume()
+        return "resume"
 
     # ---- gates ---------------------------------------------------------------
     def venue_symbol_blocked(self, venue: str, symbol: str) -> bool:
         if f"{venue}|{symbol}" in self.venue_symbol_blacklist:
             return True
-        wl = self.cfg.venue(venue).symbol_whitelist
-        return bool(wl) and symbol not in wl
+        vc = self._venues.get(venue)
+        if vc is None or vc.role != "trade":
+            return True                # unknown or quote-only venue: fail closed, never raise from a gate
+        return bool(vc.symbol_whitelist) and symbol not in vc.symbol_whitelist
+
+    def _pair_win_rate_blocks(self, key: str, now: float) -> bool:
+        st = self.pair_stats.get(key)
+        if not st:
+            return False
+        recent = [won for ts, won in st.get("recent", []) if now - ts <= self.cfg.pair_stats_window_s]
+        if len(recent) < self.cfg.pair_min_trades:
+            return False
+        return sum(1 for won in recent if won) / len(recent) < self.cfg.pair_min_win_rate
 
     def entry_allowed(self, symbol: str, venue_a: str, venue_b: str, size_usd: float,
                       open_count: int) -> tuple[bool, str]:
+        """Cheap/global gates first, then per-route ones. The balance gate compares USDT `available`
+        against NOTIONAL × 1.05 (leverage is not modelled: conservative). In live mode a missing or
+        stale balance cache fails closed as "balance_unknown"; paper mode stays permissive."""
         now = self.clock()
         if self.halted:
             return False, "halted"
+        if venue_a == venue_b or not size_usd > 0.0:
+            return False, "invalid"
         if open_count >= self.cfg.max_concurrent:
             return False, "max_concurrent"
         if symbol in self.cfg.blocked_symbols:
@@ -2765,40 +3037,57 @@ class RiskManager:
             return False, "pair_blacklist"
         if self.mismatch.is_blacklisted(route_key(symbol, venue_a, venue_b)):
             return False, "mismatch"
-        st = self.pair_stats.get(key)
-        if st:
-            n = st.get("wins", 0) + st.get("losses", 0)
-            if n >= 5 and st.get("wins", 0) / n < 0.30:
-                return False, "pair_win_rate"
+        if self._pair_win_rate_blocks(key, now):
+            return False, "pair_win_rate"
         for v in (venue_a, venue_b):
             bal = self.balances.get(v)
-            if bal is not None and bal.get("available", 0.0) < size_usd * 1.05:
+            if bal is None or now - bal.get("ts", 0.0) > self.cfg.balance_max_age_s:
+                if self.cfg.mode == "live":
+                    return False, "balance_unknown"
+            elif bal.get("available", 0.0) < size_usd * BALANCE_HEADROOM:
                 return False, "balance"
         return True, "ok"
 
     def funding_blocks(self, symbol: str, venue_a: str, venue_b: str) -> bool:
-        """Short A receives A's rate, long B pays B's rate. Block when the net of the settlements
-        inside the window is negative (positive rate = longs pay shorts)."""
+        """Rates are FRACTIONS as exchanges deliver them (0.0001 = 0.01 %); positive = longs pay shorts.
+        Short on A receives A's rate, long on B pays B's rate. Blocks only when the settlements inside
+        `funding_block_s` net to a cost above `funding_block_min_pct` (percent points): both v1 venues
+        settle on the same 8-hour grid with near-identical rates, so a zero threshold would block half
+        of all routes over a few thousandths of a basis point. A settle stamp already in the past means
+        the feed is dead for that key: treated as unknown (allowed) and reported in `stale_funding`."""
         now = self.clock()
         net, in_window = 0.0, False
-        fa = self.funding.get(f"{venue_a}|{symbol}")
-        if fa and 0.0 <= fa[1] - now < self.cfg.funding_block_s:
-            net += fa[0]
-            in_window = True
-        fb = self.funding.get(f"{venue_b}|{symbol}")
-        if fb and 0.0 <= fb[1] - now < self.cfg.funding_block_s:
-            net -= fb[0]
-            in_window = True
-        return in_window and net < 0.0
+        for k, sign in ((f"{venue_a}|{symbol}", 1.0), (f"{venue_b}|{symbol}", -1.0)):
+            f = self.funding.get(k)
+            if f is None:
+                continue
+            rate, settle = f
+            dt = settle - now
+            if dt < -FUNDING_STALE_GRACE_S:
+                if k not in self.stale_funding:
+                    self.stale_funding.add(k)
+                    log.warning("FUNDING_STALE %s settle=%.0f now=%.0f — gate disabled for this key", k, settle, now)
+                continue
+            self.stale_funding.discard(k)
+            if 0.0 <= dt < self.cfg.funding_block_s:
+                net += sign * rate
+                in_window = True
+        return in_window and net * 100.0 < -self.cfg.funding_block_min_pct
 
     # ---- bookkeeping ---------------------------------------------------------
     def record_strike(self, symbol: str, venue_a: str, venue_b: str) -> bool:
+        """A failed/one-legged entry or failed hedge. Strikes older than `strike_decay_s` are forgotten;
+        `pair_strikes_to_blacklist` strikes inside that window blacklist the route for `pair_blacklist_s`."""
+        now = self.clock()
         key = pair_key(symbol, venue_a, venue_b)
-        self.pair_strikes[key] = self.pair_strikes.get(key, 0) + 1
-        if self.pair_strikes[key] >= self.cfg.pair_strikes_to_blacklist:
-            self.pair_blacklist[key] = self.clock() + self.cfg.pair_blacklist_s
-            self.pair_strikes[key] = 0
+        st = self.pair_strikes.get(key)
+        n = (st["n"] if st is not None and now - st["ts"] <= self.cfg.strike_decay_s else 0) + 1
+        if n >= self.cfg.pair_strikes_to_blacklist:
+            self.pair_blacklist[key] = now + self.cfg.pair_blacklist_s
+            self.pair_strikes.pop(key, None)
+            log.warning("PAIR_BLACKLIST %s for %.0fs after %d strikes", key, self.cfg.pair_blacklist_s, n)
             return True
+        self.pair_strikes[key] = {"n": n, "ts": now}
         return False
 
     def set_cooldown(self, symbol: str, seconds: float | None = None) -> None:
@@ -2807,51 +3096,78 @@ class RiskManager:
     def blacklist_venue_symbol(self, venue: str, symbol: str) -> None:
         self.venue_symbol_blacklist.add(f"{venue}|{symbol}")
 
-    def record_close(self, pos: Position) -> None:
+    def record_close(self, pos: Position, counts_as_trade: bool = True) -> None:
+        """Bookkeeping for a closed position. `counts_as_trade=False` (reconciliation, never-filled entries)
+        leaves the stats alone; a zero-P&L close is neither a win nor a loss."""
+        if not counts_as_trade:
+            return
+        now = self.clock()
         key = pair_key(pos.symbol, pos.venue_a, pos.venue_b)
-        st = self.pair_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0})
+        st = self.pair_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0, "recent": []})
+        st.setdefault("recent", [])
         st["total_pnl"] += pos.net_pnl_usd
-        st["wins" if pos.net_pnl_usd > 0 else "losses"] += 1
-        if pos.size_usd > 0 and pos.net_pnl_usd / pos.size_usd * 100.0 < -0.10:
-            self.symbol_blacklist[pos.symbol] = self.clock() + self.cfg.symbol_loss_blacklist_s
+        if pos.net_pnl_usd != 0.0:
+            won = pos.net_pnl_usd > 0.0
+            st["wins" if won else "losses"] += 1
+            st["recent"] = (st["recent"] + [[now, won]])[-RECENT_OUTCOMES_KEEP:]
+        if pos.size_usd > 0 and pos.net_pnl_usd / pos.size_usd * 100.0 < self.cfg.symbol_loss_pct:
+            self.symbol_blacklist[pos.symbol] = now + self.cfg.symbol_loss_blacklist_s
+            log.warning("SYMBOL_BLACKLIST %s for %.0fs after %+.4f on $%.2f", pos.symbol,
+                        self.cfg.symbol_loss_blacklist_s, pos.net_pnl_usd, pos.size_usd)
 
     def set_balance(self, venue: str, available: float, total: float) -> None:
         self.balances[venue] = {"available": available, "total": total, "locked": max(0.0, total - available),
                                 "ts": self.clock()}
 
     def set_funding(self, venue: str, rates: dict[str, tuple[float, float]]) -> None:
+        """`rates`: symbol -> (rate as a FRACTION, next settlement unix ts)."""
         for symbol, val in rates.items():
-            self.funding[f"{venue}|{symbol}"] = val
+            try:
+                rate, settle = val
+                self.funding[f"{venue}|{symbol}"] = (float(rate), float(settle))
+            except (TypeError, ValueError):
+                log.warning("FUNDING_BAD %s %s %r", venue, symbol, val)
 
     # ---- persistence ---------------------------------------------------------
     def to_dict(self) -> dict:
+        """A snapshot: nothing here aliases live state (the saver serializes off the event loop)."""
         now = self.clock()
         return {"halted": self.halted, "halt_reason": self.halt_reason,
-                "pair_strikes": dict(self.pair_strikes),
+                "pair_strikes": {k: dict(v) for k, v in self.pair_strikes.items()
+                                 if now - v.get("ts", 0.0) <= self.cfg.strike_decay_s},
                 "pair_blacklist": {k: t for k, t in self.pair_blacklist.items() if t > now},
                 "symbol_blacklist": {k: t for k, t in self.symbol_blacklist.items() if t > now},
                 "cooldowns": {k: t for k, t in self.cooldowns.items() if t > now},
                 "venue_symbol_blacklist": sorted(self.venue_symbol_blacklist),
-                "pair_stats": self.pair_stats,
-                "mismatch_blacklist": sorted(self.mismatch.blacklisted)}
+                "pair_stats": {k: {**v, "recent": [list(r) for r in v.get("recent", [])]}
+                               for k, v in self.pair_stats.items()},
+                "mismatch_blacklist": {k: dict(v) for k, v in self.mismatch.blacklisted.items()},
+                "stale_funding": sorted(self.stale_funding)}
 
-    def load(self, d: dict) -> None:
+    def load(self, d: object) -> None:
+        """Tolerant: a malformed `risk` section degrades to empty risk state (with warnings), never to a
+        crash loop under systemd Restart=always."""
+        if not isinstance(d, dict):
+            if d:
+                log.warning("RISK_STATE_IGNORED not an object: %r", type(d).__name__)
+            d = {}
         now = self.clock()
         self.halted = bool(d.get("halted", False))
-        self.halt_reason = str(d.get("halt_reason", ""))
-        self.pair_strikes = {k: int(v) for k, v in d.get("pair_strikes", {}).items()}
-        self.pair_blacklist = {k: float(t) for k, t in d.get("pair_blacklist", {}).items() if float(t) > now}
-        self.symbol_blacklist = {k: float(t) for k, t in d.get("symbol_blacklist", {}).items() if float(t) > now}
-        self.cooldowns = {k: float(t) for k, t in d.get("cooldowns", {}).items() if float(t) > now}
-        self.venue_symbol_blacklist = set(d.get("venue_symbol_blacklist", []))
-        self.pair_stats = dict(d.get("pair_stats", {}))
-        self.mismatch.blacklisted = set(d.get("mismatch_blacklist", []))
+        self.halt_reason = str(d.get("halt_reason") or "")
+        self.pair_strikes = _strikes_from(d.get("pair_strikes"), now, self.cfg.strike_decay_s)
+        self.pair_blacklist = _float_map(d.get("pair_blacklist"), now)
+        self.symbol_blacklist = _float_map(d.get("symbol_blacklist"), now)
+        self.cooldowns = _float_map(d.get("cooldowns"), now)
+        raw_vs = d.get("venue_symbol_blacklist")
+        self.venue_symbol_blacklist = {str(x) for x in raw_vs} if isinstance(raw_vs, list) else set()
+        self.pair_stats = _stats_from(d.get("pair_stats"))
+        self.mismatch.blacklisted = _mismatch_from(d.get("mismatch_blacklist"))
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_risk.py -q`
-Expected: `5 passed`
+Expected: `9 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -3323,7 +3639,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `70 passed`
+Expected: `74 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -4476,7 +4792,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `84 passed`
+Expected: `88 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -4730,7 +5046,7 @@ async def test_enter_tt_one_leg_fails_flattens_and_records(tmp_path):
     assert closed.status == CLOSED and closed.exit_reason == "failed_entry"
     assert closed.exit_price_a > 0 and closed.exit_fees_usd > 0 and closed.net_pnl_usd < 0   # round-trip fees
     assert await h.sim("blofin").positions() == []                       # flat again
-    assert h.risk.pair_strikes["XYZUSDT|blofin>mexc"] == 1 and "XYZUSDT" in h.risk.cooldowns
+    assert h.risk.pair_strikes["XYZUSDT|blofin>mexc"]["n"] == 1 and "XYZUSDT" in h.risk.cooldowns
 
 
 async def test_exit_tt_closes_and_books_pnl(tmp_path):
@@ -5609,7 +5925,7 @@ Expected: `11 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `98 passed`
+Expected: `102 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -6066,7 +6382,7 @@ class App:
 
     def on_quote(self, symbol: str) -> None:
         positions = self.book.for_symbol(symbol)
-        if positions:
+        if positions:                     # one position per symbol: a held symbol is driven, never re-evaluated
             for pos in positions:
                 self._drive(pos)
             return
@@ -6151,6 +6467,8 @@ class App:
             await self.executor.cancel_all_resting()
         elif flag == "resume":
             log.info("RESUME entries re-enabled")
+        elif flag:
+            log.info("FLAG %s consumed (already in that state)", flag)
         for pos in list(self.book.open):
             self._drive(pos)
         await self.executor.retry_degraded()
@@ -6400,7 +6718,7 @@ Expected: `5 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `106 passed`
+Expected: `110 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -6523,7 +6841,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

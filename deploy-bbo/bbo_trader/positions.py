@@ -293,7 +293,8 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
         "blofin_risk_blacklist": sorted(k.split("|", 1)[1] for k in risk_state.get("venue_symbol_blacklist", [])
                                         if k.startswith("blofin|")),
         "symbol_blacklist": risk_state.get("symbol_blacklist", {}),
-        "pair_failure_counts": risk_state.get("pair_strikes", {}),
+        "pair_failure_counts": {k: (v.get("n", 0) if isinstance(v, dict) else v)
+                                for k, v in risk_state.get("pair_strikes", {}).items()},
         "pair_blacklist": risk_state.get("pair_blacklist", {}),
         "balance_cache": {k: dict(v) for k, v in balances.items()},
         "spread_scanner": scanner,
