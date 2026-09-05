@@ -1752,6 +1752,21 @@ def test_state_store_roundtrip_and_dashboard_schema(tmp_path):
     book2.load(loaded)
     assert book2.open[0] == p and book2.next_id == 2
     assert StateStore(tmp_path / "missing.json").load() is None
+
+
+def test_closed_dicts_are_cached_and_reloaded():
+    book = PositionBook(closed_keep=2)
+    for i in range(3):
+        q = book.new("QQQUSDT", "blofin", "mexc", TT_ENTERING, "TT", size_usd=10.0)
+        q.status = TT_EXITING
+        book.close(q, "timeout", now=100.0 + i)
+    d = book.to_dict()
+    assert [c["id"] for c in d["closed_positions"]] == [2, 3]            # capped like `closed`
+    assert d["closed_positions"] is not book.to_dict()["closed_positions"]  # fresh list each call
+    assert d["closed_positions"][0] == book.closed[0].to_dict()          # cached dict equals a fresh one
+    book2 = PositionBook(closed_keep=2)
+    book2.load(d)
+    assert [c["id"] for c in book2.to_dict()["closed_positions"]] == [2, 3]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1810,11 +1825,15 @@ def finalize_pnl(pos: Position) -> None:
 
 
 class PositionBook:
-    """All non-terminal positions live in `open` (resting, hedging, open, exiting, degraded)."""
+    """All non-terminal positions live in `open` (resting, hedging, open, exiting, degraded).
 
-    def __init__(self, closed_keep: int = 500):
+    Closed positions are immutable once closed, so their dashboard dicts are cached at close time:
+    state saves (up to 2/s) must not re-serialize hundreds of closed positions."""
+
+    def __init__(self, closed_keep: int = 200):
         self.open: list[Position] = []
         self.closed: list[Position] = []
+        self._closed_dicts: list[dict] = []
         self.next_id = 1
         self.total_trades = 0
         self.total_wins = 0
@@ -1862,7 +1881,9 @@ class PositionBook:
         if pos in self.open:
             self.open.remove(pos)
         self.closed.append(pos)
+        self._closed_dicts.append(pos.to_dict())
         del self.closed[:-self.closed_keep]
+        del self._closed_dicts[:-self.closed_keep]
         if counts_as_trade:
             self.total_trades += 1
             self.total_pnl_usd += pos.net_pnl_usd
@@ -1895,7 +1916,7 @@ class PositionBook:
                 "total_pnl_usd": self.total_pnl_usd, "peak_equity": self.peak_equity,
                 "max_drawdown_pct": self.max_drawdown_pct, "equity_history": self.equity_history[-10000:],
                 "open_positions": [p.to_dict() for p in self.open],
-                "closed_positions": [p.to_dict() for p in self.closed[-self.closed_keep:]],
+                "closed_positions": list(self._closed_dicts),
                 "order_audit_log": self.audit[-200:]}
 
     def load(self, d: dict) -> None:
@@ -1908,7 +1929,8 @@ class PositionBook:
         self.equity_history = list(d.get("equity_history", []))
         self.audit = list(d.get("order_audit_log", []))
         self.open = [Position.from_dict(x) for x in d.get("open_positions", [])]
-        self.closed = [Position.from_dict(x) for x in d.get("closed_positions", [])]
+        self.closed = [Position.from_dict(x) for x in d.get("closed_positions", [])][-self.closed_keep:]
+        self._closed_dicts = [p.to_dict() for p in self.closed]
 
 
 class StateStore:
@@ -1961,7 +1983,7 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_positions.py -q`
-Expected: `4 passed`
+Expected: `5 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -2773,7 +2795,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `51 passed`
+Expected: `52 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -3926,7 +3948,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `65 passed`
+Expected: `66 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -5024,7 +5046,7 @@ Expected: `10 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `78 passed`
+Expected: `79 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -5790,7 +5812,7 @@ Expected: `4 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `85 passed`
+Expected: `86 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -5913,7 +5935,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

@@ -133,8 +133,8 @@ Worked example (MEXC↔BloFin, defaults): TT needs `spread_tt ≥ 0.08 + 0.08 + 
 
 **Pegged maker price** (make on A, sell). The resting price must both join the queue and still clear the edge against B's live quote:
 - `p_floor = ask_B × (1 + (MIN_EDGE_PCT + TM_EXTRA_EDGE_PCT + m_A + t_B + FEES_OUT_EST + EXIT_SPREAD_PCT + SLIP_PCT) / 100)`
-- `p_rest = round_up_to_tick(max(ask_A − IMPROVE_TICKS × tick, p_floor))`; requires `p_rest > bid_A` (post-only would otherwise be rejected) — else cancel/skip.
-- Make on B (buy) mirrors: `p_cap = bid_A × (1 − (...) / 100)`, `p_rest = round_down_to_tick(min(bid_B + IMPROVE_TICKS × tick, p_cap))`, requires `p_rest < ask_B`.
+- `p_rest = round_up_to_tick(max(ask_A − IMPROVE_TICKS × tick, p_floor))`; requires `p_rest > bid_A` (post-only would otherwise be rejected) — else cancel/skip. Every peg must also be strictly positive; a glitched quote that rounds a peg to 0 yields no order, never a zero-priced one.
+- Make on B (buy) mirrors with the exact form: `p_cap = bid_A / (1 + (...) / 100)` (solves `(bid_A − p)/p ≥ req`; the linearized `bid_A × (1 − req/100)` is 0.19 bp over-conservative at req = 0.44%), `p_rest = round_down_to_tick(min(bid_B + IMPROVE_TICKS × tick, p_cap))`, requires `0 < p_rest < ask_B`.
 - **Requote** when the recomputed `p_rest` differs from the working price by `≥ REQUOTE_TICKS`, at most once per `MIN_REQUOTE_MS` (per venue) per order, subject to the venue's rate budget. **Cancel** when the edge condition has failed continuously for `EDGE_GONE_MS`, when either quote is stale, or at `MAKER_TTL_S`.
 - **Upgrade to TT**: if `edge_tt ≥ MIN_EDGE_PCT` appears while a maker rests, cancel it and enter TT (a fill that races the cancel is simply hedged).
 
