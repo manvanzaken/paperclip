@@ -80,13 +80,14 @@ def test_state_store_roundtrip_and_dashboard_schema(tmp_path):
     p.client_ids["maker"] = "bp1-maker-1"
     state = build_state(book, equity=210.0, cash=200.0, starting_capital=200.0, mode="paper",
                         risk_state={"pair_stats": {}, "venue_symbol_blacklist": ["blofin|HNTUSDT"],
-                                    "symbol_blacklist": {}, "pair_strikes": {}, "pair_blacklist": {}, "halted": True},
+                                    "symbol_blacklist": {}, "pair_strikes": {"k": {"n": 2, "ts": 1.0}, "legacy": 1}, "pair_blacklist": {}, "halted": True},
                         balances={"mexc": {"available": 100.0}}, scanner=[], bbo={"latency": {}},
                         saved_at=1_700_000_100.0)
     for key in ("state_saved_at_ts", "cash", "equity", "open_positions", "closed_positions", "total_pnl_usd",
                 "pair_stats", "blofin_risk_blacklist", "balance_cache", "spread_scanner", "dry_run",
                 "kill_switch", "saved_at", "bbo", "risk", "order_audit_log", "equity_history"):
         assert key in state, key
+    assert state["pair_failure_counts"] == {"k": 2, "legacy": 1}     # dashboard wants bare counts
     assert state["blofin_risk_blacklist"] == ["HNTUSDT"] and state["kill_switch"] is True   # mirrors the manual halt
     store = StateStore(tmp_path / "real_state.json")
     store.save(state)

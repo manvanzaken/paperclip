@@ -66,20 +66,32 @@ def _strikes_from(raw: object, now: float, decay_s: float) -> dict[str, dict]:
         except (TypeError, ValueError):
             log.warning("RISK_STATE_DROP pair_strikes %r=%r", k, v)
             continue
-        if n > 0 and now - ts <= decay_s:
+        if n > 0 and math.isfinite(ts) and now - ts <= decay_s:   # an inf/NaN stamp would make a strike immortal
             out[str(k)] = {"n": n, "ts": ts}
     return out
 
 
 def _stats_from(raw: object) -> dict[str, dict]:
+    """One bad `recent` entry drops that entry, not the route (dropping the route would unblock it)."""
     out: dict[str, dict] = {}
     if not isinstance(raw, dict):
         return out
     for k, v in raw.items():
         try:
-            recent = [[float(ts), bool(won)] for ts, won in (v.get("recent") or [])]
+            recent = []
+            for item in (v.get("recent") or []):
+                try:
+                    ts, won = item
+                    ts = float(ts)
+                    if math.isfinite(ts):
+                        recent.append([ts, bool(won)])
+                    else:
+                        log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
+                except (TypeError, ValueError):
+                    log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
+            total = float(v.get("total_pnl", 0.0))
             out[str(k)] = {"wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
-                           "total_pnl": float(v.get("total_pnl", 0.0)), "recent": recent[-RECENT_OUTCOMES_KEEP:]}
+                           "total_pnl": total if math.isfinite(total) else 0.0, "recent": recent[-RECENT_OUTCOMES_KEEP:]}
         except (TypeError, ValueError, AttributeError):
             log.warning("RISK_STATE_DROP pair_stats %r=%r", k, v)
     return out
@@ -163,11 +175,11 @@ class RiskManager:
     # ---- halt ----------------------------------------------------------------
     def halt(self, reason: str) -> None:
         self.halted, self.halt_reason = True, reason
-        self._consume_flags()
+        self._consume_flags(self.cfg.halt_flag, self.cfg.resume_flag)   # stop wins: a pending start is void
 
     def resume(self) -> None:
         self.halted, self.halt_reason = False, ""
-        self._consume_flags()          # a stale stop.flag must never re-halt a deliberate resume
+        self._consume_flags(self.cfg.resume_flag)   # only the start flag: a stop.flag written meanwhile is still honoured
 
     def _flag_path(self, name: str) -> Path:
         return self.cfg.data_dir / name
@@ -180,19 +192,29 @@ class RiskManager:
             return None
         return st.st_ino, st.st_mtime_ns
 
-    def _flag_present(self, p: Path) -> bool:
+    def _flag_present(self, p: Path, files_only: bool) -> bool:
+        """`files_only=False` (stop): any path counts — a directory named stop.flag still means stop.
+        `files_only=True` (start): only a regular file resumes; anything else is logged once and ignored."""
         try:
+            sig = self._signature(p)
+            if sig is None:
+                self._dead_flags.pop(p, None)
+                return False
             if p in self._dead_flags:
-                if self._signature(p) == self._dead_flags[p]:
-                    return False       # the very file we could not unlink: keep ignoring it
-                del self._dead_flags[p]    # gone or replaced: treat the new one as a fresh flag
-            return p.is_file()         # a directory or a socket is not a flag
+                if sig == self._dead_flags[p]:
+                    return False       # the very path we could not unlink: keep ignoring it
+                del self._dead_flags[p]    # replaced: treat the new one as a fresh flag
+            if files_only and not p.is_file():
+                log.error("FLAG_NOT_A_FILE %s is not a regular file — ignored until replaced", p)
+                self._dead_flags[p] = sig
+                return False
+            return True
         except OSError as e:
             log.error("FLAG_CHECK_FAILED %s: %s", p, e)
             return False
 
-    def _consume_flags(self) -> None:
-        for name in (self.cfg.halt_flag, self.cfg.resume_flag):
+    def _consume_flags(self, *names: str) -> None:
+        for name in names:
             p = self._flag_path(name)
             try:
                 p.unlink()
@@ -208,20 +230,20 @@ class RiskManager:
         """Dashboard/operator flags in DATA_DIR, edge-triggered and consumed on read: `stop.flag` halts,
         `start.flag` resumes; both present → stop wins. Returns "halt" / "resume" on a transition,
         "halt_noop" / "resume_noop" when the flag asked for the state we are already in, else None."""
-        has_stop = self._flag_present(self._flag_path(self.cfg.halt_flag))
-        has_start = self._flag_present(self._flag_path(self.cfg.resume_flag))
+        has_stop = self._flag_present(self._flag_path(self.cfg.halt_flag), files_only=False)
+        has_start = self._flag_present(self._flag_path(self.cfg.resume_flag), files_only=True)
         if not has_stop and not has_start:
             return None
         if has_stop:
             if has_start:
                 log.warning("FLAGS %s and %s both present — stop wins", self.cfg.halt_flag, self.cfg.resume_flag)
             if self.halted:
-                self._consume_flags()
+                self._consume_flags(self.cfg.halt_flag, self.cfg.resume_flag)
                 return "halt_noop"
             self.halt("stop.flag")
             return "halt"
         if not self.halted:
-            self._consume_flags()
+            self._consume_flags(self.cfg.resume_flag)
             return "resume_noop"
         self.resume()
         return "resume"
@@ -330,19 +352,19 @@ class RiskManager:
         self.venue_symbol_blacklist.add(f"{venue}|{symbol}")
 
     def record_close(self, pos: Position, counts_as_trade: bool = True) -> None:
-        """Bookkeeping for a closed position. `counts_as_trade=False` (reconciliation, never-filled entries)
-        leaves the stats alone; a zero-P&L close is neither a win nor a loss."""
-        if not counts_as_trade:
-            return
+        """Bookkeeping for a closed position. `counts_as_trade=False` (Plan 2 reconciliation closes) leaves the
+        win-rate stats alone; a zero-P&L close is neither a win nor a loss."""
         now = self.clock()
-        key = pair_key(pos.symbol, pos.venue_a, pos.venue_b)
-        st = self.pair_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0, "recent": []})
-        st.setdefault("recent", [])
-        st["total_pnl"] += pos.net_pnl_usd
-        if pos.net_pnl_usd != 0.0:
-            won = pos.net_pnl_usd > 0.0
-            st["wins" if won else "losses"] += 1
-            st["recent"] = (st["recent"] + [[now, won]])[-RECENT_OUTCOMES_KEEP:]
+        if counts_as_trade:
+            key = pair_key(pos.symbol, pos.venue_a, pos.venue_b)
+            st = self.pair_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0, "recent": []})
+            st.setdefault("recent", [])
+            st["total_pnl"] += pos.net_pnl_usd
+            if pos.net_pnl_usd != 0.0:
+                won = pos.net_pnl_usd > 0.0
+                st["wins" if won else "losses"] += 1
+                st["recent"] = (st["recent"] + [[now, won]])[-RECENT_OUTCOMES_KEEP:]
+        # a real loss blacklists the symbol even when the close does not count as a trade (reconciliation)
         if pos.size_usd > 0 and pos.net_pnl_usd / pos.size_usd * 100.0 < self.cfg.symbol_loss_pct:
             self.symbol_blacklist[pos.symbol] = now + self.cfg.symbol_loss_blacklist_s
             log.warning("SYMBOL_BLACKLIST %s for %.0fs after %+.4f on $%.2f", pos.symbol,
@@ -357,7 +379,10 @@ class RiskManager:
         for symbol, val in rates.items():
             try:
                 rate, settle = val
-                self.funding[f"{venue}|{symbol}"] = (float(rate), float(settle))
+                rate, settle = float(rate), float(settle)
+                if not (math.isfinite(rate) and math.isfinite(settle)):
+                    raise ValueError("non-finite")      # a NaN rate would silently disable the gate for this route
+                self.funding[f"{venue}|{symbol}"] = (rate, settle)
             except (TypeError, ValueError):
                 log.warning("FUNDING_BAD %s %s %r", venue, symbol, val)
 
@@ -375,7 +400,7 @@ class RiskManager:
                 "pair_stats": {k: {**v, "recent": [list(r) for r in v.get("recent", [])]}
                                for k, v in self.pair_stats.items()},
                 "mismatch_blacklist": {k: dict(v) for k, v in self.mismatch.blacklisted.items()},
-                "stale_funding": sorted(self.stale_funding)}
+                "stale_funding": sorted(self.stale_funding)}      # diagnostic only: recomputed, not restored by load()
 
     def load(self, d: object) -> None:
         """Tolerant: a malformed `risk` section degrades to empty risk state (with warnings), never to a

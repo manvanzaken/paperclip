@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 
 import pytest
@@ -99,19 +100,32 @@ def test_halt_flags_are_consumed_and_stop_wins(tmp_path, clock):
     assert not (tmp_path / "stop.flag").exists() and not (tmp_path / "start.flag").exists()
     (tmp_path / "start.flag").write_text("")
     assert r.check_flags() == "resume" and not r.halted
+    (tmp_path / "stop.flag").write_text("")
+    r.resume()                                                          # /start must not eat a stop written meanwhile
+    assert r.check_flags() == "halt" and r.halted
+    (tmp_path / "stop.flag").write_text("")
+    assert r.check_flags() == "halt_noop" and r.halted and not (tmp_path / "stop.flag").exists()
 
 
-def test_undeletable_flag_never_disables_the_stop(tmp_path, clock):
+def test_non_file_and_undeletable_flags(tmp_path, clock, caplog):
     r = RiskManager(make_cfg(tmp_path), clock)
-    (tmp_path / "start.flag").mkdir()                                   # a directory is not a flag
+    (tmp_path / "start.flag").mkdir()                                   # a directory is not a start flag
     (tmp_path / "stop.flag").write_text("")
     assert r.check_flags() == "halt" and r.halted                       # no exception, stop honoured
     assert r.check_flags() is None and r.halted                         # the directory does not resume the bot
+    assert "FLAG_NOT_A_FILE" in caplog.text
     (tmp_path / "start.flag").rmdir()
+    (tmp_path / "stop.flag").mkdir()                                    # ...but a directory named stop.flag still halts
+    r.resume()
+    assert r.check_flags() == "halt" and r.halted and r.halt_reason == "stop.flag"
+    assert r.check_flags() is None and r.halted                         # cannot be unlinked: remembered, not re-processed
+    (tmp_path / "stop.flag").rmdir()
     (tmp_path / "start.flag").write_text("")
     tmp_path.chmod(0o555)                                               # a real flag that cannot be unlinked
     try:
         assert r.check_flags() == "resume" and not r.halted             # honoured once...
+        if os.geteuid() != 0:
+            assert r._dead_flags                                        # (root can always unlink: guard is vacuous there)
         r.halt("telegram")
         assert r.check_flags() is None and r.halted                     # ...then ignored: it must not undo a later halt
     finally:
@@ -136,6 +150,7 @@ def test_funding_gate_net_of_both_legs(tmp_path, clock):
     r.set_funding("mexc", {"XYZUSDT": (0.0005, now + 300)})
     assert r.funding_blocks("XYZUSDT", "blofin", "mexc") and not r.stale_funding
     r.set_funding("mexc", {"XYZUSDT": ("bad", None)})                  # malformed feed value: logged, ignored
+    r.set_funding("mexc", {"XYZUSDT": (float("nan"), now + 300)})      # NaN would silently disable the gate
     assert r.funding["mexc|XYZUSDT"] == (0.0005, now + 300)
 
 
@@ -146,9 +161,12 @@ def test_record_close_win_rate_window_and_symbol_blacklist(tmp_path, clock):
     r.record_close(mk(-0.05))                            # -0.2% of size -> 6 h symbol blacklist
     assert r.symbol_blacklist["XYZUSDT"] == clock() + 21_600.0
     r.record_close(mk(0.0))                              # zero P&L: neither win nor loss
-    r.record_close(mk(0.01), counts_as_trade=False)      # reconciliation close: ignored
+    r.record_close(mk(0.01), counts_as_trade=False)      # reconciliation close: not a trade
     assert r.pair_stats[key]["wins"] == 0 and r.pair_stats[key]["losses"] == 1
     assert r.pair_stats[key]["total_pnl"] == pytest.approx(-0.05)
+    r.symbol_blacklist.clear()
+    r.record_close(mk(-0.05), counts_as_trade=False)     # ...but a real loss still blacklists the symbol
+    assert "XYZUSDT" in r.symbol_blacklist and r.pair_stats[key]["losses"] == 1
     ok = lambda: r.entry_allowed("XYZUSDT", "blofin", "mexc", 25.0, 0)
     clock.tick(21_601)
     for pnl in (-0.01, -0.01, -0.01, 0.02):              # 1 win / 4 losses inside the window -> 20 % < 30 %
@@ -184,11 +202,16 @@ def test_strikes_decay_and_state_roundtrip(tmp_path, clock):
 def test_load_tolerates_corrupt_and_legacy_state(tmp_path, clock):
     r = RiskManager(make_cfg(tmp_path), clock)
     now = clock()
-    r.load({"pair_blacklist": {"k": "soon", "ok": now + 100}, "pair_strikes": {"k": None, "old": 1},
-            "cooldowns": None, "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1}},
+    r.load({"pair_blacklist": {"k": "soon", "ok": now + 100},
+            "pair_strikes": {"k": None, "old": 1, "immortal": {"n": 1, "ts": float("inf")}},
+            "cooldowns": None,
+            "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1},
+                           "r": {"wins": 1, "losses": 4, "total_pnl": float("inf"),
+                                 "recent": [[now, False], [float("inf"), False], ["x", 1, 2], [now, True]]}},
             "mismatch_blacklist": ["legacy|a|b"], "venue_symbol_blacklist": "notalist", "halted": 1})
     assert r.pair_blacklist == {"ok": now + 100} and r.pair_strikes == {"old": {"n": 1, "ts": now}}
     assert r.cooldowns == {} and "p" not in r.pair_stats and r.pair_stats["q"]["recent"] == []
+    assert r.pair_stats["r"]["recent"] == [[now, False], [now, True]] and r.pair_stats["r"]["total_pnl"] == 0.0
     assert r.mismatch.is_blacklisted("legacy|a|b") and r.venue_symbol_blacklist == set() and r.halted
     r.load("garbage")                                                   # not even an object: fresh state, no raise
     assert not r.halted and r.pair_blacklist == {}

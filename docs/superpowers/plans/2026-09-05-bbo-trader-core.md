@@ -2084,13 +2084,14 @@ def test_state_store_roundtrip_and_dashboard_schema(tmp_path):
     p.client_ids["maker"] = "bp1-maker-1"
     state = build_state(book, equity=210.0, cash=200.0, starting_capital=200.0, mode="paper",
                         risk_state={"pair_stats": {}, "venue_symbol_blacklist": ["blofin|HNTUSDT"],
-                                    "symbol_blacklist": {}, "pair_strikes": {}, "pair_blacklist": {}, "halted": True},
+                                    "symbol_blacklist": {}, "pair_strikes": {"k": {"n": 2, "ts": 1.0}, "legacy": 1}, "pair_blacklist": {}, "halted": True},
                         balances={"mexc": {"available": 100.0}}, scanner=[], bbo={"latency": {}},
                         saved_at=1_700_000_100.0)
     for key in ("state_saved_at_ts", "cash", "equity", "open_positions", "closed_positions", "total_pnl_usd",
                 "pair_stats", "blofin_risk_blacklist", "balance_cache", "spread_scanner", "dry_run",
                 "kill_switch", "saved_at", "bbo", "risk", "order_audit_log", "equity_history"):
         assert key in state, key
+    assert state["pair_failure_counts"] == {"k": 2, "legacy": 1}     # dashboard wants bare counts
     assert state["blofin_risk_blacklist"] == ["HNTUSDT"] and state["kill_switch"] is True   # mirrors the manual halt
     store = StateStore(tmp_path / "real_state.json")
     store.save(state)
@@ -2561,6 +2562,7 @@ def make_cfg(tmp_path=None, **over):
 `tests/test_risk.py`:
 
 ```python
+import os
 from dataclasses import replace
 
 import pytest
@@ -2662,19 +2664,32 @@ def test_halt_flags_are_consumed_and_stop_wins(tmp_path, clock):
     assert not (tmp_path / "stop.flag").exists() and not (tmp_path / "start.flag").exists()
     (tmp_path / "start.flag").write_text("")
     assert r.check_flags() == "resume" and not r.halted
+    (tmp_path / "stop.flag").write_text("")
+    r.resume()                                                          # /start must not eat a stop written meanwhile
+    assert r.check_flags() == "halt" and r.halted
+    (tmp_path / "stop.flag").write_text("")
+    assert r.check_flags() == "halt_noop" and r.halted and not (tmp_path / "stop.flag").exists()
 
 
-def test_undeletable_flag_never_disables_the_stop(tmp_path, clock):
+def test_non_file_and_undeletable_flags(tmp_path, clock, caplog):
     r = RiskManager(make_cfg(tmp_path), clock)
-    (tmp_path / "start.flag").mkdir()                                   # a directory is not a flag
+    (tmp_path / "start.flag").mkdir()                                   # a directory is not a start flag
     (tmp_path / "stop.flag").write_text("")
     assert r.check_flags() == "halt" and r.halted                       # no exception, stop honoured
     assert r.check_flags() is None and r.halted                         # the directory does not resume the bot
+    assert "FLAG_NOT_A_FILE" in caplog.text
     (tmp_path / "start.flag").rmdir()
+    (tmp_path / "stop.flag").mkdir()                                    # ...but a directory named stop.flag still halts
+    r.resume()
+    assert r.check_flags() == "halt" and r.halted and r.halt_reason == "stop.flag"
+    assert r.check_flags() is None and r.halted                         # cannot be unlinked: remembered, not re-processed
+    (tmp_path / "stop.flag").rmdir()
     (tmp_path / "start.flag").write_text("")
     tmp_path.chmod(0o555)                                               # a real flag that cannot be unlinked
     try:
         assert r.check_flags() == "resume" and not r.halted             # honoured once...
+        if os.geteuid() != 0:
+            assert r._dead_flags                                        # (root can always unlink: guard is vacuous there)
         r.halt("telegram")
         assert r.check_flags() is None and r.halted                     # ...then ignored: it must not undo a later halt
     finally:
@@ -2699,6 +2714,7 @@ def test_funding_gate_net_of_both_legs(tmp_path, clock):
     r.set_funding("mexc", {"XYZUSDT": (0.0005, now + 300)})
     assert r.funding_blocks("XYZUSDT", "blofin", "mexc") and not r.stale_funding
     r.set_funding("mexc", {"XYZUSDT": ("bad", None)})                  # malformed feed value: logged, ignored
+    r.set_funding("mexc", {"XYZUSDT": (float("nan"), now + 300)})      # NaN would silently disable the gate
     assert r.funding["mexc|XYZUSDT"] == (0.0005, now + 300)
 
 
@@ -2709,9 +2725,12 @@ def test_record_close_win_rate_window_and_symbol_blacklist(tmp_path, clock):
     r.record_close(mk(-0.05))                            # -0.2% of size -> 6 h symbol blacklist
     assert r.symbol_blacklist["XYZUSDT"] == clock() + 21_600.0
     r.record_close(mk(0.0))                              # zero P&L: neither win nor loss
-    r.record_close(mk(0.01), counts_as_trade=False)      # reconciliation close: ignored
+    r.record_close(mk(0.01), counts_as_trade=False)      # reconciliation close: not a trade
     assert r.pair_stats[key]["wins"] == 0 and r.pair_stats[key]["losses"] == 1
     assert r.pair_stats[key]["total_pnl"] == pytest.approx(-0.05)
+    r.symbol_blacklist.clear()
+    r.record_close(mk(-0.05), counts_as_trade=False)     # ...but a real loss still blacklists the symbol
+    assert "XYZUSDT" in r.symbol_blacklist and r.pair_stats[key]["losses"] == 1
     ok = lambda: r.entry_allowed("XYZUSDT", "blofin", "mexc", 25.0, 0)
     clock.tick(21_601)
     for pnl in (-0.01, -0.01, -0.01, 0.02):              # 1 win / 4 losses inside the window -> 20 % < 30 %
@@ -2747,11 +2766,16 @@ def test_strikes_decay_and_state_roundtrip(tmp_path, clock):
 def test_load_tolerates_corrupt_and_legacy_state(tmp_path, clock):
     r = RiskManager(make_cfg(tmp_path), clock)
     now = clock()
-    r.load({"pair_blacklist": {"k": "soon", "ok": now + 100}, "pair_strikes": {"k": None, "old": 1},
-            "cooldowns": None, "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1}},
+    r.load({"pair_blacklist": {"k": "soon", "ok": now + 100},
+            "pair_strikes": {"k": None, "old": 1, "immortal": {"n": 1, "ts": float("inf")}},
+            "cooldowns": None,
+            "pair_stats": {"p": {"wins": "x"}, "q": {"wins": 2, "losses": 1, "total_pnl": 0.1},
+                           "r": {"wins": 1, "losses": 4, "total_pnl": float("inf"),
+                                 "recent": [[now, False], [float("inf"), False], ["x", 1, 2], [now, True]]}},
             "mismatch_blacklist": ["legacy|a|b"], "venue_symbol_blacklist": "notalist", "halted": 1})
     assert r.pair_blacklist == {"ok": now + 100} and r.pair_strikes == {"old": {"n": 1, "ts": now}}
     assert r.cooldowns == {} and "p" not in r.pair_stats and r.pair_stats["q"]["recent"] == []
+    assert r.pair_stats["r"]["recent"] == [[now, False], [now, True]] and r.pair_stats["r"]["total_pnl"] == 0.0
     assert r.mismatch.is_blacklisted("legacy|a|b") and r.venue_symbol_blacklist == set() and r.halted
     r.load("garbage")                                                   # not even an object: fresh state, no raise
     assert not r.halted and r.pair_blacklist == {}
@@ -2833,20 +2857,32 @@ def _strikes_from(raw: object, now: float, decay_s: float) -> dict[str, dict]:
         except (TypeError, ValueError):
             log.warning("RISK_STATE_DROP pair_strikes %r=%r", k, v)
             continue
-        if n > 0 and now - ts <= decay_s:
+        if n > 0 and math.isfinite(ts) and now - ts <= decay_s:   # an inf/NaN stamp would make a strike immortal
             out[str(k)] = {"n": n, "ts": ts}
     return out
 
 
 def _stats_from(raw: object) -> dict[str, dict]:
+    """One bad `recent` entry drops that entry, not the route (dropping the route would unblock it)."""
     out: dict[str, dict] = {}
     if not isinstance(raw, dict):
         return out
     for k, v in raw.items():
         try:
-            recent = [[float(ts), bool(won)] for ts, won in (v.get("recent") or [])]
+            recent = []
+            for item in (v.get("recent") or []):
+                try:
+                    ts, won = item
+                    ts = float(ts)
+                    if math.isfinite(ts):
+                        recent.append([ts, bool(won)])
+                    else:
+                        log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
+                except (TypeError, ValueError):
+                    log.warning("RISK_STATE_DROP pair_stats %r recent %r", k, item)
+            total = float(v.get("total_pnl", 0.0))
             out[str(k)] = {"wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
-                           "total_pnl": float(v.get("total_pnl", 0.0)), "recent": recent[-RECENT_OUTCOMES_KEEP:]}
+                           "total_pnl": total if math.isfinite(total) else 0.0, "recent": recent[-RECENT_OUTCOMES_KEEP:]}
         except (TypeError, ValueError, AttributeError):
             log.warning("RISK_STATE_DROP pair_stats %r=%r", k, v)
     return out
@@ -2930,11 +2966,11 @@ class RiskManager:
     # ---- halt ----------------------------------------------------------------
     def halt(self, reason: str) -> None:
         self.halted, self.halt_reason = True, reason
-        self._consume_flags()
+        self._consume_flags(self.cfg.halt_flag, self.cfg.resume_flag)   # stop wins: a pending start is void
 
     def resume(self) -> None:
         self.halted, self.halt_reason = False, ""
-        self._consume_flags()          # a stale stop.flag must never re-halt a deliberate resume
+        self._consume_flags(self.cfg.resume_flag)   # only the start flag: a stop.flag written meanwhile is still honoured
 
     def _flag_path(self, name: str) -> Path:
         return self.cfg.data_dir / name
@@ -2947,19 +2983,29 @@ class RiskManager:
             return None
         return st.st_ino, st.st_mtime_ns
 
-    def _flag_present(self, p: Path) -> bool:
+    def _flag_present(self, p: Path, files_only: bool) -> bool:
+        """`files_only=False` (stop): any path counts — a directory named stop.flag still means stop.
+        `files_only=True` (start): only a regular file resumes; anything else is logged once and ignored."""
         try:
+            sig = self._signature(p)
+            if sig is None:
+                self._dead_flags.pop(p, None)
+                return False
             if p in self._dead_flags:
-                if self._signature(p) == self._dead_flags[p]:
-                    return False       # the very file we could not unlink: keep ignoring it
-                del self._dead_flags[p]    # gone or replaced: treat the new one as a fresh flag
-            return p.is_file()         # a directory or a socket is not a flag
+                if sig == self._dead_flags[p]:
+                    return False       # the very path we could not unlink: keep ignoring it
+                del self._dead_flags[p]    # replaced: treat the new one as a fresh flag
+            if files_only and not p.is_file():
+                log.error("FLAG_NOT_A_FILE %s is not a regular file — ignored until replaced", p)
+                self._dead_flags[p] = sig
+                return False
+            return True
         except OSError as e:
             log.error("FLAG_CHECK_FAILED %s: %s", p, e)
             return False
 
-    def _consume_flags(self) -> None:
-        for name in (self.cfg.halt_flag, self.cfg.resume_flag):
+    def _consume_flags(self, *names: str) -> None:
+        for name in names:
             p = self._flag_path(name)
             try:
                 p.unlink()
@@ -2975,20 +3021,20 @@ class RiskManager:
         """Dashboard/operator flags in DATA_DIR, edge-triggered and consumed on read: `stop.flag` halts,
         `start.flag` resumes; both present → stop wins. Returns "halt" / "resume" on a transition,
         "halt_noop" / "resume_noop" when the flag asked for the state we are already in, else None."""
-        has_stop = self._flag_present(self._flag_path(self.cfg.halt_flag))
-        has_start = self._flag_present(self._flag_path(self.cfg.resume_flag))
+        has_stop = self._flag_present(self._flag_path(self.cfg.halt_flag), files_only=False)
+        has_start = self._flag_present(self._flag_path(self.cfg.resume_flag), files_only=True)
         if not has_stop and not has_start:
             return None
         if has_stop:
             if has_start:
                 log.warning("FLAGS %s and %s both present — stop wins", self.cfg.halt_flag, self.cfg.resume_flag)
             if self.halted:
-                self._consume_flags()
+                self._consume_flags(self.cfg.halt_flag, self.cfg.resume_flag)
                 return "halt_noop"
             self.halt("stop.flag")
             return "halt"
         if not self.halted:
-            self._consume_flags()
+            self._consume_flags(self.cfg.resume_flag)
             return "resume_noop"
         self.resume()
         return "resume"
@@ -3097,19 +3143,19 @@ class RiskManager:
         self.venue_symbol_blacklist.add(f"{venue}|{symbol}")
 
     def record_close(self, pos: Position, counts_as_trade: bool = True) -> None:
-        """Bookkeeping for a closed position. `counts_as_trade=False` (reconciliation, never-filled entries)
-        leaves the stats alone; a zero-P&L close is neither a win nor a loss."""
-        if not counts_as_trade:
-            return
+        """Bookkeeping for a closed position. `counts_as_trade=False` (Plan 2 reconciliation closes) leaves the
+        win-rate stats alone; a zero-P&L close is neither a win nor a loss."""
         now = self.clock()
-        key = pair_key(pos.symbol, pos.venue_a, pos.venue_b)
-        st = self.pair_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0, "recent": []})
-        st.setdefault("recent", [])
-        st["total_pnl"] += pos.net_pnl_usd
-        if pos.net_pnl_usd != 0.0:
-            won = pos.net_pnl_usd > 0.0
-            st["wins" if won else "losses"] += 1
-            st["recent"] = (st["recent"] + [[now, won]])[-RECENT_OUTCOMES_KEEP:]
+        if counts_as_trade:
+            key = pair_key(pos.symbol, pos.venue_a, pos.venue_b)
+            st = self.pair_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0, "recent": []})
+            st.setdefault("recent", [])
+            st["total_pnl"] += pos.net_pnl_usd
+            if pos.net_pnl_usd != 0.0:
+                won = pos.net_pnl_usd > 0.0
+                st["wins" if won else "losses"] += 1
+                st["recent"] = (st["recent"] + [[now, won]])[-RECENT_OUTCOMES_KEEP:]
+        # a real loss blacklists the symbol even when the close does not count as a trade (reconciliation)
         if pos.size_usd > 0 and pos.net_pnl_usd / pos.size_usd * 100.0 < self.cfg.symbol_loss_pct:
             self.symbol_blacklist[pos.symbol] = now + self.cfg.symbol_loss_blacklist_s
             log.warning("SYMBOL_BLACKLIST %s for %.0fs after %+.4f on $%.2f", pos.symbol,
@@ -3124,7 +3170,10 @@ class RiskManager:
         for symbol, val in rates.items():
             try:
                 rate, settle = val
-                self.funding[f"{venue}|{symbol}"] = (float(rate), float(settle))
+                rate, settle = float(rate), float(settle)
+                if not (math.isfinite(rate) and math.isfinite(settle)):
+                    raise ValueError("non-finite")      # a NaN rate would silently disable the gate for this route
+                self.funding[f"{venue}|{symbol}"] = (rate, settle)
             except (TypeError, ValueError):
                 log.warning("FUNDING_BAD %s %s %r", venue, symbol, val)
 
@@ -3142,7 +3191,7 @@ class RiskManager:
                 "pair_stats": {k: {**v, "recent": [list(r) for r in v.get("recent", [])]}
                                for k, v in self.pair_stats.items()},
                 "mismatch_blacklist": {k: dict(v) for k, v in self.mismatch.blacklisted.items()},
-                "stale_funding": sorted(self.stale_funding)}
+                "stale_funding": sorted(self.stale_funding)}      # diagnostic only: recomputed, not restored by load()
 
     def load(self, d: object) -> None:
         """Tolerant: a malformed `risk` section degrades to empty risk state (with warnings), never to a
@@ -6841,7 +6890,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
