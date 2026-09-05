@@ -22,12 +22,12 @@ def test_parse_depth_top_level_with_contract_size():
 
 def test_parse_specs_tickers_funding():
     specs = mexc.parse_specs({"success": True, "data": [
-        {"symbol": "XYZ_USDT", "quoteCoin": "USDT", "state": 0, "contractSize": 10, "volUnit": 1, "minVol": 1, "priceUnit": 0.0001},
+        {"symbol": "XYZ_USDT", "quoteCoin": "USDT", "state": 0, "contractSize": 10, "volUnit": 1, "minVol": 5, "priceUnit": 0.0001},
         {"symbol": "OLD_USDT", "quoteCoin": "USDT", "state": 1, "contractSize": 1, "volUnit": 1, "minVol": 1, "priceUnit": 0.01},
         {"symbol": "BTC_USDC", "quoteCoin": "USDC", "state": 0, "contractSize": 1, "volUnit": 1, "minVol": 1, "priceUnit": 0.1}]})
     assert list(specs) == ["XYZUSDT"]
     s = specs["XYZUSDT"]
-    assert (s.instrument, s.contract_size, s.lot, s.min_qty, s.tick) == ("XYZ_USDT", 10.0, 1.0, 1.0, 0.0001)
+    assert (s.instrument, s.contract_size, s.lot, s.min_qty, s.tick) == ("XYZ_USDT", 10.0, 1.0, 5.0, 0.0001)   # lot ≠ min
     vols = mexc.parse_tickers({"data": [{"symbol": "XYZ_USDT", "amount24": "123456.5", "bid1": 1.0, "ask1": 1.1},
                                         {"symbol": "ABC_USDC", "amount24": "1"}]})
     assert vols == {"XYZUSDT": 123456.5}
@@ -125,6 +125,9 @@ def test_unknown_instrument_and_malformed_frames_yield_nothing(caplog):
                             {"BTC_USDT": 1.0}, 1.0) == []                                 # one-sided book
     assert mexc.parse_depth({"channel": "push.depth.full", "symbol": "BTC_USDT", "ts": 5000,
                              "data": {"bids": [["1.5", "2"]], "asks": [["1.6", "3"]]}}, {"BTC_USDT": 1.0}, 1.0)[0].bid == 1.5
+    with pytest.raises(ValueError):                                                        # a NaN price must never become a BBO
+        mexc.parse_depth({"channel": "push.depth.full", "symbol": "BTC_USDT", "ts": 5000,
+                          "data": {"bids": [[float("nan"), 2]], "asks": [[1.6, 3]]}}, {"BTC_USDT": 1.0}, 1.0)
     from bbo_trader.config import VenueConfig
     got = []
     feed = mexc.MexcPublic(VenueConfig("mexc", "trade", 0.02, 0.0, max_topics=30), got.append)

@@ -8,8 +8,9 @@ WS and a one-element LIST on REST, prices/sizes are strings, keepalive is a bare
 "code": "60012", ...} and subscribes NONE of the other args in that message while the socket stays open —
 hence one message per instrument. `fundingTime` is the UPCOMING settlement and `fundingInterval` is 4 or
 8 hours (three 1 h contracts); every instrument is `state: live` today (delistings simply vanish from the
-list), `expireTime` is a year-2124 sentinel, contract values span 1e-4 … 1e7, and the USDT set includes
-equity/index/commodity perps (`assetClass`), which are excluded: their underlying markets close."""
+list), every row is `instType: SWAP` (`expireTime` is a far-future per-instrument value, 2028…2126, not a
+settlement date), contract values span 1e-4 … 1e7, and the USDT set includes stock/index/commodity perps
+(`assetClass` Stocks/Indices/Commodities), which are excluded: their underlying markets close."""
 from __future__ import annotations
 
 import json

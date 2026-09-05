@@ -28,12 +28,12 @@ def test_parse_books5_dict_and_list_shapes():
 
 def test_parse_instruments_tickers_funding_books():
     specs = blofin.parse_instruments({"code": "0", "data": [
-        {"instId": "XYZ-USDT", "contractValue": "0.1", "lotSize": "1", "minSize": "1", "tickSize": "0.0001", "state": "live"},
+        {"instId": "XYZ-USDT", "contractValue": "0.1", "lotSize": "1", "minSize": "5", "tickSize": "0.0001", "state": "live"},
         {"instId": "DEAD-USDT", "contractValue": "1", "lotSize": "1", "minSize": "1", "tickSize": "0.01", "state": "suspend"},
         {"instId": "BTC-USDC", "contractValue": "1", "lotSize": "1", "minSize": "1", "tickSize": "0.1", "state": "live"}]})
     assert list(specs) == ["XYZUSDT"]
     s = specs["XYZUSDT"]
-    assert (s.instrument, s.contract_size, s.lot, s.min_qty, s.tick) == ("XYZ-USDT", 0.1, 1.0, 1.0, 0.0001)
+    assert (s.instrument, s.contract_size, s.lot, s.min_qty, s.tick) == ("XYZ-USDT", 0.1, 1.0, 5.0, 0.0001)   # lot ≠ min
     vols = blofin.parse_tickers({"data": [{"instId": "XYZ-USDT", "last": "2.0", "volCurrency24h": "1000", "bidPrice": "1.9", "askPrice": "2.1"}]})
     assert vols == {"XYZUSDT": 2000.0}
     fund = blofin.parse_funding({"data": [{"instId": "XYZ-USDT", "fundingRate": "-0.0002", "fundingTime": "1700003600000"}]})
@@ -115,7 +115,7 @@ def test_instruments_isolate_bad_rows_and_unknown_instruments_yield_nothing(capl
     rows = [LIVE_INSTRUMENT, dict(LIVE_INSTRUMENT, instId="BAD-USDT", contractValue="n/a"),
             dict(LIVE_INSTRUMENT, instId="NUL-USDT", tickSize=None), "not-a-row", dict(LIVE_INSTRUMENT, instId="OK2-USDT"),
             dict(LIVE_INSTRUMENT, instId="BTC-USDC", quoteCurrency="USDC"),
-            dict(LIVE_INSTRUMENT, instId="SPY-USDT", assetClass="Equity"),          # equity perp: gaps when Wall St is closed
+            dict(LIVE_INSTRUMENT, instId="SPY-USDT", assetClass="Stocks"),          # stock perp: gaps when Wall St is closed
             dict(LIVE_INSTRUMENT, instId="INV-USDT", contractType="inverse"),
             dict(LIVE_INSTRUMENT, instId="NAN-USDT", contractValue=float("nan"))]   # json.loads accepts a bare NaN
     with caplog.at_level(logging.WARNING, logger="bbo.blofin"):
@@ -124,6 +124,8 @@ def test_instruments_isolate_bad_rows_and_unknown_instruments_yield_nothing(capl
     # the REAL subscribe ack for a KNOWN instrument carries arg.channel == books5 but no data
     assert blofin.parse_books5({"event": "subscribe", "arg": {"channel": "books5", "instId": "BTC-USDT"}}, {"BTC-USDT": 0.001}, 1.0) == []
     assert blofin.parse_books5(dict(LIVE_PUSH, action="update"), {"BTC-USDT": 0.001}, 1.0) == []   # only snapshots are a top of book
+    with pytest.raises(ValueError):                                                        # a NaN price must never become a BBO
+        blofin.parse_books5(dict(LIVE_PUSH, data={"bids": [[float("nan"), "1"]], "asks": [["1", "1"]], "ts": "1"}), {"BTC-USDT": 1.0}, 1.0)
     assert blofin.parse_tickers({"data": [dict(LIVE_TICKER, instId="BAD-USDT", last=None), LIVE_TICKER, 5]}) == {
         "BTCUSDT": pytest.approx(float(LIVE_TICKER["volCurrency24h"]) * float(LIVE_TICKER["last"]))}
     assert blofin.parse_funding({"data": [dict(LIVE_FUNDING, instId="BAD-USDT", fundingTime=""), LIVE_FUNDING]}) == {"HOLOUSDT": (pytest.approx(7.7429202847014e-05), 1788638400.0)}
