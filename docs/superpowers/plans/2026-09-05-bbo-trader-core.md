@@ -1995,6 +1995,7 @@ git commit -m "feat(bbo): per-venue token-bucket rate budgets with reserve"
 `tests/test_positions.py`:
 
 ```python
+import asyncio
 import json
 
 import pytest
@@ -2131,6 +2132,37 @@ def test_state_never_emits_nan_and_load_repairs_next_id(tmp_path):
     assert book.next_id == 8                                              # never reuse an id the file holds
     book.load({})                                                         # tolerant of missing keys
     assert book.open == [] and book.total_trades == 0
+
+
+def test_state_file_is_never_absent_and_saves_do_not_race(tmp_path):
+    store = StateStore(tmp_path / "real_state.json")
+    store.save({"n": 1})
+    store.save({"n": 2})
+    assert store.load() == {"n": 2} and store.load_backup() == {"n": 1}
+    assert not (tmp_path / "real_state.json.bak.tmp").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]      # no stray temp files
+
+    async def concurrent():
+        await asyncio.gather(store.save_async({"n": 3}), store.save_async({"n": 4}))
+    asyncio.run(concurrent())
+    assert store.load()["n"] in (3, 4) and (tmp_path / "real_state.json").exists()
+    (tmp_path / "real_state.json").unlink()                                   # torn save: only the backup survives
+    with pytest.raises(StateCorrupt, match="torn save"):
+        store.load()
+
+
+def test_non_object_state_and_stranded_closed_entries(tmp_path):
+    store = StateStore(tmp_path / "real_state.json")
+    (tmp_path / "real_state.json").write_text("[]")
+    with pytest.raises(StateCorrupt, match="expected object"):
+        store.load()
+    closed = Position(3, "X", "a", "b", CLOSED, "TT", exit_reason="convergence").to_dict()
+    live = Position(4, "X", "a", "b", OPEN, "TT").to_dict()
+    book = PositionBook()
+    book.load({"open_positions": [closed, live]})                             # a CLOSED entry under open_positions
+    assert [p.id for p in book.open] == [4] and [p.id for p in book.closed] == [3] and book.next_id == 5
+    store.save({"weird": {1, 2}})                                             # unserializable -> str fallback, no crash
+    assert "weird" in store.load()
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2149,11 +2181,12 @@ import json
 import logging
 import math
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import (Position, TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING,
-                     TT_EXITING, EXIT_HEDGING, DEGRADED, CLOSED)
+                     TT_EXITING, EXIT_HEDGING, DEGRADED, CLOSED, NON_TERMINAL)
 
 log = logging.getLogger("bbo.state")
 
@@ -2295,7 +2328,7 @@ class PositionBook:
         if self.peak_equity > 0:
             dd = (self.peak_equity - equity) / self.peak_equity * 100.0
             self.max_drawdown_pct = max(self.max_drawdown_pct, dd)
-        last_ts = float((self.equity_history[-1].get("_ts") or 0.0)) if self.equity_history else 0.0
+        last_ts = float(self.equity_history[-1].get("_ts", 0.0)) if self.equity_history else 0.0
         if not self.equity_history or now - last_ts >= every_s:
             self.equity_history.append({"t": _iso(now), "v": round(equity, 4), "_ts": now})
             del self.equity_history[:-self.EQUITY_POINTS]
@@ -2320,8 +2353,10 @@ class PositionBook:
         self.max_drawdown_pct = float(d.get("max_drawdown_pct", 0.0))
         self.equity_history = list(d.get("equity_history", []))[-self.EQUITY_POINTS:]
         self.audit = list(d.get("order_audit_log", []))
-        self.open = [Position.from_dict(x) for x in d.get("open_positions", [])]
-        self.closed = [Position.from_dict(x) for x in d.get("closed_positions", [])][-self.closed_keep:]
+        loaded_open = [Position.from_dict(x) for x in d.get("open_positions", [])]
+        self.open = [p for p in loaded_open if p.status in NON_TERMINAL]
+        stranded = [p for p in loaded_open if p.status not in NON_TERMINAL]   # a CLOSED entry under open_positions
+        self.closed = ([Position.from_dict(x) for x in d.get("closed_positions", [])] + stranded)[-self.closed_keep:]
         self._closed_dicts = [p.to_dict() for p in self.closed]
         highest = max((p.id for p in self.open + self.closed), default=0)
         self.next_id = max(int(d.get("next_id", 1)), highest + 1)   # never reuse an id the file still holds
@@ -2341,46 +2376,62 @@ def _sanitize(obj):
 def dumps_state(state: dict) -> str:
     try:
         return json.dumps(state, allow_nan=False)
-    except ValueError:
-        log.error("STATE_NAN non-finite float in state — sanitizing to null")
-        return json.dumps(_sanitize(state))
+    except (ValueError, TypeError) as e:
+        log.error("STATE_UNSERIALIZABLE %r — sanitizing (non-finite -> null, unknown types -> str)", e)
+        return json.dumps(_sanitize(state), default=str)
 
 
 class StateStore:
-    """Atomic, durable JSON state: write tmp → flush+fsync → keep the previous file as `.bak` → rename."""
+    """Atomic, durable JSON state. The live file is NEVER absent: write a uniquely named tmp →
+    flush+fsync → hard-link the current file to `.bak` → rename tmp over the live file. Saves are
+    serialized by a lock so an overlapping shutdown save cannot race the sweep's save."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.bak = self.path.with_suffix(self.path.suffix + ".bak")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
 
     def save(self, state: dict) -> None:
         payload = dumps_state(state)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp = self.path.with_suffix(f"{self.path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
         with open(tmp, "w") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        if self.path.exists():
-            os.replace(self.path, self.bak)
+        link = self.path.with_suffix(self.path.suffix + ".bak.tmp")
+        try:
+            link.unlink(missing_ok=True)
+            os.link(self.path, link)          # the live file itself is never unlinked
+            os.replace(link, self.bak)
+        except FileNotFoundError:
+            pass                              # first save: nothing to back up
         os.replace(tmp, self.path)
 
     async def save_async(self, state: dict) -> None:
         """Serialize + write off the event loop (state must be a snapshot the loop no longer mutates)."""
-        await asyncio.to_thread(self.save, state)
+        async with self._lock:
+            await asyncio.to_thread(self.save, state)
 
     def _read(self, path: Path) -> dict | None:
         try:
             with open(path, "r") as f:
-                return json.load(f)
+                data = json.load(f)
         except FileNotFoundError:
             return None
         except (json.JSONDecodeError, OSError) as e:
             raise StateCorrupt(f"{path}: {e}") from e
+        if not isinstance(data, dict):
+            raise StateCorrupt(f"{path}: top-level {type(data).__name__}, expected object")
+        return data
 
     def load(self) -> dict | None:
-        """None only when no state file exists (fresh start). Raises StateCorrupt otherwise."""
-        return self._read(self.path)
+        """None only when neither the state file nor a backup exists (fresh start). A missing live
+        file next to a backup is a torn save, not a fresh start. Raises StateCorrupt otherwise."""
+        d = self._read(self.path)
+        if d is None and self.bak.exists():
+            raise StateCorrupt(f"{self.path} missing but {self.bak} exists — torn save?")
+        return d
 
     def load_backup(self) -> dict | None:
         return self._read(self.bak)
@@ -2418,7 +2469,7 @@ def build_state(book: PositionBook, *, equity: float, cash: float, starting_capi
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_positions.py -q`
-Expected: `7 passed`
+Expected: `9 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -3230,7 +3281,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `68 passed`
+Expected: `70 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -4383,7 +4434,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `82 passed`
+Expected: `84 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -5516,7 +5567,7 @@ Expected: `11 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `96 passed`
+Expected: `98 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -6307,7 +6358,7 @@ Expected: `5 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `104 passed`
+Expected: `106 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -6430,7 +6481,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; 2 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
