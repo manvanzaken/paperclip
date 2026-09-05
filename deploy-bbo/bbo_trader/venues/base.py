@@ -29,7 +29,8 @@ class VenuePosition:
 
 class PublicFeed(Protocol):
     """Streams BBO updates for a set of symbols into the on_bbo callback it was built with.
-    `set_specs` must run before quotes flow: a BBO carries the contract size of its spec (1.0 if unknown)."""
+    `set_specs` must run before quotes flow: a BBO carries the contract size of its spec, and an instrument
+    without a known spec yields no BBO at all (sizes span 1e-5 … 1e7; a default would lie)."""
     async def run(self) -> None: ...
     def set_symbols(self, symbols: Iterable[str]) -> None: ...
     def set_specs(self, specs: dict[str, VenueSpec]) -> None: ...

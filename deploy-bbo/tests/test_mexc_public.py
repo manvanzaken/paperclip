@@ -15,7 +15,7 @@ def test_parse_depth_top_level_with_contract_size():
     assert len(out) == 1
     b = out[0]
     assert (b.venue, b.symbol, b.bid, b.bid_qty, b.ask, b.ask_qty) == ("mexc", "XYZUSDT", 1.0041, 500.0, 1.0061, 200.0)
-    assert b.ts_exchange == pytest.approx(1700000000.123) and b.ts_local == 42.0 and b.contract_size == 10.0
+    assert b.ts_exchange == pytest.approx(1700000000.123, abs=1e-6) and b.ts_local == 42.0 and b.contract_size == 10.0
     assert mexc.parse_depth({"channel": "pong", "data": 1}, {}, 0.0) == []
     assert mexc.parse_depth({"channel": "push.depth.full", "symbol": "X_USDT", "data": {"bids": [], "asks": []}}, {}, 0.0) == []
 
@@ -100,10 +100,10 @@ def test_live_shapes_round_trip():
     assert mexc.parse_tickers({"success": True, "data": [LIVE_TICKER_ROW]}) == {"BTCUSDT": 1828276834.31004}
     assert mexc.parse_funding({"success": True, "data": [LIVE_FUNDING_ROW]}) == {"BTCUSDT": (1.8e-05, 1788652800.0)}
     b = mexc.parse_depth(LIVE_PUSH, {"BTC_USDT": 0.0001}, now=1.0)[0]
-    assert b.bid == 79804.9 and b.ask_qty == 99907.0 and b.ts_exchange == pytest.approx(1788624282.010)   # book time (cts)
+    assert b.bid == 79804.9 and b.ask_qty == 99907.0 and b.ts_exchange == pytest.approx(1788624282.010, abs=1e-6)   # cts, not ts
     assert b.touch_notional("buy") == pytest.approx(99907 * 79805 * 0.0001)
     r = mexc.parse_depth_rest(LIVE_DEPTH_REST, "BTC_USDT", 0.0001, 2.0)
-    assert r.bid_qty == 276151.0 and r.ts_exchange == pytest.approx(1788624282.021) and r.contract_size == 0.0001
+    assert r.bid_qty == 276151.0 and r.ts_exchange == pytest.approx(1788624282.021, abs=1e-6) and r.contract_size == 0.0001
 
 
 def test_specs_skip_api_disallowed_and_isolate_bad_rows(caplog):
@@ -113,8 +113,8 @@ def test_specs_skip_api_disallowed_and_isolate_bad_rows(caplog):
     with caplog.at_level(logging.WARNING, logger="bbo.mexc"):
         specs = mexc.parse_specs({"success": True, "data": rows})
     assert list(specs) == ["BTCUSDT", "OK2USDT"] and "SPEC_ROWS_DROPPED mexc 3 of 6" in caplog.text
-    assert mexc.parse_tickers({"data": [dict(LIVE_TICKER_ROW, amount24=None), LIVE_TICKER_ROW, 5]}) == {"BTCUSDT": 1828276834.31004}
-    assert mexc.parse_funding({"data": [dict(LIVE_FUNDING_ROW, nextSettleTime="x"), LIVE_FUNDING_ROW]}) == {"BTCUSDT": (1.8e-05, 1788652800.0)}
+    assert mexc.parse_tickers({"data": [dict(LIVE_TICKER_ROW, symbol="BAD_USDT", amount24=None), LIVE_TICKER_ROW, 5]}) == {"BTCUSDT": 1828276834.31004}
+    assert mexc.parse_funding({"data": [dict(LIVE_FUNDING_ROW, symbol="BAD_USDT", nextSettleTime="x"), LIVE_FUNDING_ROW]}) == {"BTCUSDT": (1.8e-05, 1788652800.0)}
 
 
 def test_unknown_instrument_and_malformed_frames_yield_nothing(caplog):
@@ -142,7 +142,8 @@ def test_unknown_instrument_and_malformed_frames_yield_nothing(caplog):
 async def test_rest_client_raises_on_error_envelopes_and_never_returns_an_empty_universe():
     for status, body in ((200, json.dumps({"success": False, "code": 510, "message": "request frequency"})),
                          (404, json.dumps({"success": False, "code": 404, "message": "Not Found"})),
-                         (429, "Too Many Requests"), (200, "<html>Cloudflare</html>"), (200, json.dumps([1, 2]))):
+                         (429, "Too Many Requests"), (200, "<html>Cloudflare</html>"), (200, json.dumps([1, 2])),
+                         (500, json.dumps({"success": True, "code": 0, "data": [LIVE_DETAIL_ROW]}))):   # status alone must fail
         m = mexc.MexcMarket(_Session(status, body))
         with pytest.raises(VenueError):
             await m.fetch_specs()
