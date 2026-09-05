@@ -33,6 +33,7 @@ def test_entry_picks_tt_when_it_pays(tmp_path, clock):
     assert it.kind == "TT_ENTER" and (it.venue_a, it.venue_b) == ("blofin", "mexc")
     assert it.size_usd == 25.0 and it.maker_venue == "" and it.ts == now
     assert ev.funnel["candidate"] == 1 and ev.funnel["below_edge"] == 1   # the reverse direction
+    assert ev.funnel["evaluated"] == 1 and ev.funnel["volume_unknown"] == 1   # no volumes at all: once per evaluation
 
 
 def test_entry_picks_tm_with_price_and_respects_gates(tmp_path, clock):
@@ -220,9 +221,12 @@ def test_upgrade_needs_touch_depth_and_requote_waits_for_inflight(tmp_path, cloc
     assert it.kind != "UPGRADE_TT" and ev.funnel["upgrade_depth"] == 1
     board.set(mk_bbo("blofin", SYM, 1.0060, 1.0065, ts=now))
     assert ev.evaluate_resting(pos).kind == "UPGRADE_TT"
+    pos.maker_cancel_sent = True                                           # a cancel is in flight: no upgrade either
+    assert ev.evaluate_resting(pos).reason == "in_flight"
+    pos.maker_cancel_sent = False
     board.set(mk_bbo("blofin", SYM, 1.0041, 1.0065, ts=now))               # peg moved by 4 ticks
     pos.requote_pending = True                                             # cancel+new requote in flight
-    assert ev.evaluate_resting(pos).reason == "resting"
+    assert ev.evaluate_resting(pos).reason == "in_flight"
     pos.requote_pending = False
     assert ev.evaluate_resting(pos).kind == "REQUOTE"
 
@@ -297,23 +301,34 @@ def test_tm_exit_hedge_depth_and_stop_uses_tt_basis(tmp_path, clock):
     assert tm.stop_ref_spread_pct == pytest.approx((1.0050 - 1.0005) / 1.0005 * 100)   # 0.4498 on the TT basis
     board.set(mk_bbo("blofin", SYM, 1.0210, 1.0230, ts=now))               # s_now 2.049: >= 0.45 + 1.5, < 0.75 + 1.5
     assert ev.evaluate_exit(tm, {}).reason == "stop"
+    # a late first evaluation (restart, stale symbol) must not anchor the stop to an already diverged spread
+    late = book.new(SYM, "blofin", "mexc", OPEN, "TM", size_usd=25.0, entry_spread_pct=0.75, entry_time=now)
+    board.set(mk_bbo("blofin", SYM, 1.0500, 1.0510, ts=now))               # s_now 4.95 %
+    assert ev.evaluate_exit(late, {}).reason == "stop" and late.stop_ref_spread_pct == 0.75
+    # a resting exit maker with a cancel in flight gets no new intent
+    tm.status, tm.maker_venue, tm.maker_rest_price, tm.maker_cancel_sent = EXIT_MAKER_RESTING, "blofin", 1.0015, True
+    board.set(mk_bbo("blofin", SYM, 1.0020, 1.0030, ts=now))
+    assert ev.evaluate_exit(tm, {}).reason == "in_flight"
 
 
 def test_scan_skips_blacklisted_and_insane_pairs_and_sorts_by_edge(tmp_path, clock):
     cfg, board, risk, ev = build(tmp_path, clock)
     now = clock()
     for v in ("blofin", "mexc"):
-        for sym in ("BIGUSDT", "BADUSDT", "MISUSDT"):
+        for sym in ("BIGUSDT", "WIDEUSDT", "BADUSDT", "MISUSDT"):
             ev.specs[v][sym] = mk_spec(v, sym)
     board.set(mk_bbo("blofin", SYM, 1.0050, 1.0060, ts=now))
     board.set(mk_bbo("mexc", SYM, 1.0000, 1.0008, ts=now))
     board.set(mk_bbo("blofin", "BIGUSDT", 1.0500, 1.0510, ts=now))       # richer edge -> first row
     board.set(mk_bbo("mexc", "BIGUSDT", 1.0000, 1.0008, ts=now))
+    board.set(mk_bbo("blofin", "WIDEUSDT", 1.0030, 1.0090, ts=now))      # small TT spread, wide book: big TM edge
+    board.set(mk_bbo("mexc", "WIDEUSDT", 1.0000, 1.0008, ts=now))
     board.set(mk_bbo("blofin", "BADUSDT", 2.0, 2.001, ts=now))           # insane 2x: never a scanner row
     board.set(mk_bbo("mexc", "BADUSDT", 1.0, 1.001, ts=now))
     board.set(mk_bbo("blofin", "MISUSDT", 1.0050, 1.0060, ts=now))
     board.set(mk_bbo("mexc", "MISUSDT", 1.0000, 1.0008, ts=now))
     risk.mismatch.blacklist(route_key("MISUSDT", "blofin", "mexc"))
-    rows = ev.scan([SYM, "BIGUSDT", "BADUSDT", "MISUSDT"])
-    assert [r["symbol"] for r in rows] == ["BIGUSDT", SYM]
-    assert rows[1]["price_short"] == 1.0050 and rows[1]["price_long"] == 1.0008 and rows[0]["edge_pct"] > rows[1]["edge_pct"]
+    rows = ev.scan([SYM, "BIGUSDT", "WIDEUSDT", "BADUSDT", "MISUSDT"])
+    assert [r["symbol"] for r in rows] == ["BIGUSDT", "WIDEUSDT", SYM]     # by edge, not by TT spread
+    assert rows[1]["spread_pct"] < rows[2]["spread_pct"] and rows[1]["edge_pct"] > rows[2]["edge_pct"]
+    assert rows[2]["price_short"] == 1.0050 and rows[2]["price_long"] == 1.0008

@@ -152,7 +152,7 @@ class Position:
     entry_spread_pct: float = 0.0
     current_spread_pct: float = 0.0
     peak_spread_pct: float = 0.0
-    stop_ref_spread_pct: float = 0.0   # divergence-stop reference on the (bid_A − ask_B) basis; set on first fresh eval
+    stop_ref_spread_pct: float | None = None   # divergence-stop reference on the (bid_A − ask_B) basis; None until set
     entry_time: float = 0.0
     exit_time: float = 0.0
     exit_spread_pct: float = 0.0

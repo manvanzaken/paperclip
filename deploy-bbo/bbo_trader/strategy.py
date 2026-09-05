@@ -1,12 +1,12 @@
 """PairEvaluator: turns fresh quotes into Intents.
 
 - evaluate_entry: every ordered pair of TRADE venues with a fresh quote for the symbol; gates run
-  cheapest-first and every rejection increments the funnel. Routes are ranked TT before TM, then by
-  surplus over the mode's own bar (spec "Route rule" + TT priority): a certain taker/taker fill beats a
-  wider-looking maker edge, which is inflated by the maker venue's touch width and carries fill risk.
+  cheapest-first and every rejection increments the funnel. Routes are ranked TT before TM, then by edge
+  (spec "Route rule" + TT priority): a certain taker/taker fill beats a wider-looking maker edge, which is
+  inflated by the maker venue's touch width and carries fill risk.
   A TT route whose taker legs would sweep a thin touch falls back to TM on the same pair.
 - evaluate_resting: manage an entry maker order — upgrade to TT (same touch-depth gate as an entry),
-  requote (suppressed while a requote is in flight), cancel on TTL / edge gone / stale quotes.
+  requote, cancel on TTL / edge gone / stale quotes; nothing while a cancel or requote is in flight.
 - evaluate_exit: the time stop fires even on stale quotes (a market close needs no quote); TT exit
   triggers (convergence, divergence stop on the (bid_A − ask_B) basis); TM exit posting gated on the
   hedge touch; requoting. Exit makers have no TTL by design: they rest until convergence/timeout/stop
@@ -27,16 +27,17 @@ from functools import cached_property
 from itertools import permutations
 from typing import Iterable
 
-from .config import Config
-from .edge import (EdgeParams, PairEval, evaluate_pair, choose_mode, maker_entry_price, maker_exit_price,
+from .config import Config, VenueConfig
+from .edge import (EdgeParams, evaluate_pair, choose_mode, maker_entry_price, maker_exit_price,
                    exit_spread_tt, needs_requote, best_fee_venue, spread_pct)
-from .models import BBO, Fees, Intent, Position, VenueSpec, none, EXIT_MAKER_RESTING
+from .models import BBO, Fees, Intent, Position, VenueSpec, none, OPEN, EXIT_MAKER_RESTING
 from .quotes import QuoteBoard
 from .risk import RiskManager, route_key
 
 log = logging.getLogger("bbo.strategy")
 
-DEFAULT_MIN_REQUOTE_MS = 500
+# only reachable if `fees` and `cfg.venues` disagree; mirrors the VenueConfig default rather than duplicating it
+_DEFAULT_MIN_REQUOTE_MS = VenueConfig.__dataclass_fields__["min_requote_ms"].default
 
 
 def raw_mid_spread_pct(qa: BBO, qb: BBO) -> float:
@@ -86,11 +87,7 @@ class PairEvaluator:
 
     def _min_gap_s(self, venue: str) -> float:
         vc = self._venue_cfgs.get(venue)
-        return (vc.min_requote_ms if vc is not None else DEFAULT_MIN_REQUOTE_MS) / 1000.0
-
-    def _bar(self, pe: PairEval) -> float:
-        c = self.cfg
-        return c.min_edge_pct if pe.mode == "TT" else c.min_edge_pct + c.tm_extra_edge_pct
+        return (vc.min_requote_ms if vc is not None else _DEFAULT_MIN_REQUOTE_MS) / 1000.0
 
     def _venue_unknown(self, pos: Position) -> bool:
         missing = {v for v in (pos.venue_a, pos.venue_b, pos.maker_venue) if v and v not in self.fees}
@@ -185,7 +182,7 @@ class PairEvaluator:
                 if px is None:
                     self.funnel["maker_price"] += 1
                     continue
-            rank = (1 if pe.mode == "TT" else 0, pe.edge - self._bar(pe))
+            rank = (1 if pe.mode == "TT" else 0, pe.edge)   # TT always beats TM; edge decides within a mode
             if best_rank is None or rank > best_rank:
                 best_rank = rank
                 if pe.mode == "TT":
@@ -196,7 +193,8 @@ class PairEvaluator:
                               reason=f"edge={pe.edge:.3f}", symbol=symbol,
                               venue_a=qa.venue, venue_b=qb.venue, maker_venue=pe.maker_venue,
                               rest_price=px, size_usd=size, edge_pct=pe.edge, spread_pct=spread, ts=now)
-        self.funnel["volume_unknown"] += len(volume_unknown)
+        if volume_unknown:
+            self.funnel["volume_unknown"] += 1
         if best is None:
             return none("no_candidate")
         self.funnel["candidate"] += 1
@@ -211,6 +209,8 @@ class PairEvaluator:
         qa = self.board.fresh(pos.venue_a, pos.symbol, now)
         qb = self.board.fresh(pos.venue_b, pos.symbol, now)
         base = dict(symbol=pos.symbol, venue_a=pos.venue_a, venue_b=pos.venue_b, maker_venue=pos.maker_venue, ts=now)
+        if pos.requote_pending or pos.maker_cancel_sent:
+            return none("in_flight")                         # the executor is mid-cancel: any new intent is moot
         if qa is None or qb is None:
             return Intent(kind="CANCEL", reason="stale", **base)
         if now - pos.maker_posted_ts >= cfg.maker_ttl_s:
@@ -233,8 +233,7 @@ class PairEvaluator:
                 return Intent(kind="CANCEL", reason="edge_gone", **base)
             return none("edge_gone_wait")
         pos.edge_gone_since = 0.0
-        if (not pos.requote_pending
-                and needs_requote(pos.maker_rest_price, px, self.tick(pos.maker_venue, pos.symbol), cfg.requote_ticks)
+        if (needs_requote(pos.maker_rest_price, px, self.tick(pos.maker_venue, pos.symbol), cfg.requote_ticks)
                 and now - pos.maker_last_requote_ts >= self._min_gap_s(pos.maker_venue)):
             return Intent(kind="REQUOTE", reason="peg_moved", rest_price=px, **base)
         return none("resting")
@@ -265,10 +264,12 @@ class PairEvaluator:
         s_now = spread_pct(qa.bid, qb.ask)
         pos.current_spread_pct = s_now
         pos.peak_spread_pct = max(pos.peak_spread_pct, s_now)
-        if pos.stop_ref_spread_pct == 0.0:
+        if pos.stop_ref_spread_pct is None:
             # the stop reference must sit on the same (bid_A − ask_B) basis as s_now: a TM fill's
-            # entry_spread_pct is one touch width higher and would loosen the stop by that width
-            pos.stop_ref_spread_pct = pos.entry_spread_pct if pos.mode == "TT" else s_now
+            # entry_spread_pct is one touch width higher and would loosen the stop by that width. For TM the
+            # entry spread is the looser bound, so min() can only tighten — it protects against a late first
+            # evaluation (restart, stale symbol) anchoring the stop to an already diverged spread.
+            pos.stop_ref_spread_pct = pos.entry_spread_pct if pos.mode == "TT" else min(s_now, pos.entry_spread_pct)
         reason = ""
         if x <= cfg.exit_spread_pct:
             reason = "convergence"
@@ -283,7 +284,7 @@ class PairEvaluator:
                 return Intent(kind="CANCEL", reason=why, maker_venue=pos.maker_venue, **base)
             return none("hold")
         px = maker_exit_price(qa, qb, cfg.exit_spread_pct, mv, self.tick(mv, pos.symbol), cfg.improve_ticks)
-        if not resting:                                  # OPEN: post a take-profit maker?
+        if pos.status == OPEN:                           # post a take-profit maker?
             if px is None:
                 return none("hold")
             hedge_touch = qb.touch_notional("sell") if mv == pos.venue_a else qa.touch_notional("buy")
@@ -292,13 +293,16 @@ class PairEvaluator:
             if resting_counts.get(mv, 0) >= cfg.max_resting_makers_per_venue:
                 return none("maker_slots")
             return Intent(kind="TM_EXIT", reason="take_profit", maker_venue=mv, rest_price=px, spread_pct=x, **base)
+        if not resting:
+            return none("hold")
         # EXIT_MAKER_RESTING: keep the peg current
+        if pos.requote_pending or pos.maker_cancel_sent:
+            return none("in_flight")
         if mv != pos.maker_venue:
             return Intent(kind="CANCEL", reason="venue_changed", maker_venue=pos.maker_venue, **base)
         if px is None:
             return Intent(kind="CANCEL", reason="edge_gone", maker_venue=pos.maker_venue, **base)
-        if (not pos.requote_pending
-                and needs_requote(pos.maker_rest_price, px, self.tick(mv, pos.symbol), cfg.requote_ticks)
+        if (needs_requote(pos.maker_rest_price, px, self.tick(mv, pos.symbol), cfg.requote_ticks)
                 and now - pos.maker_last_requote_ts >= self._min_gap_s(mv)):
             return Intent(kind="REQUOTE", reason="peg_moved", maker_venue=mv, rest_price=px, **base)
         return none("resting")
