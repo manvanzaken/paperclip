@@ -32,7 +32,7 @@
 ```
 deploy-bbo/
 ├── README.md
-├── requirements.txt                 # aiohttp, pytest, pytest-asyncio
+├── requirements.txt                 # aiohttp (runtime only); requirements-dev.txt adds pytest, pytest-asyncio
 ├── pytest.ini                       # asyncio_mode = auto, testpaths = tests
 ├── start.sh                         # .venv/bin/python -m bbo_trader.main
 ├── config/
@@ -86,8 +86,9 @@ cd "/Users/vandenboogaard/Claude projects/Claude Paperclip/.claude/worktrees/tra
 mkdir -p deploy-bbo/bbo_trader/venues deploy-bbo/config deploy-bbo/tests
 cd deploy-bbo
 python3 -m venv .venv
-printf 'aiohttp>=3.9\npytest>=8.0\npytest-asyncio>=0.23\n' > requirements.txt
-.venv/bin/pip install -q -r requirements.txt
+printf 'aiohttp>=3.9\n' > requirements.txt
+printf -- '-r requirements.txt\npytest>=8.0\npytest-asyncio>=0.23\n' > requirements-dev.txt
+.venv/bin/pip install -q -r requirements-dev.txt
 printf '[pytest]\nasyncio_mode = auto\ntestpaths = tests\n' > pytest.ini
 printf '.venv/\n__pycache__/\n*.pyc\ndata/\n.pytest_cache/\n' > .gitignore
 touch bbo_trader/__init__.py bbo_trader/venues/__init__.py tests/__init__.py
@@ -2375,7 +2376,7 @@ ALLOWED: dict[str, set[str]] = {
     MAKER_RESTING: {HEDGING, CLOSED, TT_ENTERING},
     HEDGING: {OPEN, CLOSED, DEGRADED},
     OPEN: {TT_EXITING, EXIT_MAKER_RESTING, CLOSED, DEGRADED},
-    EXIT_MAKER_RESTING: {EXIT_HEDGING, TT_EXITING, OPEN},
+    EXIT_MAKER_RESTING: {EXIT_HEDGING, TT_EXITING, OPEN, CLOSED},   # CLOSED: venue removed (paper) / reconciliation
     TT_EXITING: {CLOSED, DEGRADED},
     EXIT_HEDGING: {CLOSED, DEGRADED, TT_EXITING},
     DEGRADED: {CLOSED},
@@ -3964,6 +3965,8 @@ class PairEvaluator:
         base = dict(symbol=pos.symbol, venue_a=pos.venue_a, venue_b=pos.venue_b, maker_venue=pos.maker_venue, ts=now)
         if pos.requote_pending or pos.maker_cancel_sent:
             return none("in_flight")                         # the executor is mid-cancel: any new intent is moot
+        if self.risk.halted:                                 # the halt edge's cancel may have failed: nothing rests while halted
+            return Intent(kind="CANCEL", reason="halted", **base)
         if qa is None or qb is None:
             return Intent(kind="CANCEL", reason="stale", **base)
         if now - pos.maker_posted_ts >= cfg.maker_ttl_s:
@@ -7110,6 +7113,10 @@ FLATTEN_LADDER_S = (1.0, 2.0, 5.0, 10.0, 10.0, 10.0)
 DEGRADED_RETRY_S = 30.0
 MAX_CLOSE_RETRIES = 40           # ~20 min of DEGRADED retries, then the position waits for a human
 HEDGING_SWEEP_AFTER_S = 2.0      # a HEDGING position whose maker order is still live this long gets its cancel retried
+HEDGING_STUCK_S = 60.0           # cancel sent, no terminal event, the order query silent this long → DEGRADED (a human is told)
+FEE_MISMATCH_TOL = 0.20          # spec: a fill fee > 20 % off the configured rate for its liquidity type is a FEE_MISMATCH
+FEE_ALERT_EVERY_S = 3600.0       # one FEE_MISMATCH Telegram warning per venue per hour
+TM_EXIT_SLIP_TOL_PCT = 0.05      # a TM exit realized this far above EXIT_SPREAD_PCT is `tm_exit_slipped`, not a take-profit
 #                                  (the sweep runs inside retry_degraded, which the App calls from its 500 ms sweep)
 MAX_CID_LEN = 32                 # MEXC externalOid / BloFin clientOrderId
 STALE_CANCEL_COOLDOWN_S = 5.0    # a maker cancelled for stale quotes must not be re-posted on the very next quote
@@ -7152,6 +7159,9 @@ class Executor:
         self._tasks: set[asyncio.Task] = set()
         self._notify_tasks: set[asyncio.Task] = set()   # never in the shutdown drain: a hung Telegram must not hold up order legs
         self.stopping = False          # set by App.shutdown(): no NEW order may rest or open once we are going down
+        self._naked_alerted: set[int] = set()
+        self._last_query: dict[int, float] = {}
+        self._fee_alert_ts: dict[str, float] = {}
 
     # ---- plumbing ----------------------------------------------------------------
     def _new_cid(self, pos: Position, leg: str) -> str:
@@ -7168,6 +7178,8 @@ class Executor:
         while len(self._tracks) > MAX_TRACKS:
             self._tracks.pop(next(iter(self._tracks)))
         self._locks.pop(pos.id, None)
+        self._naked_alerted.discard(pos.id)
+        self._last_query.pop(pos.id, None)
 
     @staticmethod
     def _maker_phase(pos: Position) -> str:
@@ -7543,6 +7555,7 @@ class Executor:
             return
         if v.trading.supports_amend:
             if not v.budget.try_take("amend", now):
+                self.metrics.funnel["requote_budget"] += 1      # invisible starvation otherwise (shared BloFin bucket)
                 return
             pos.maker_last_requote_ts = now    # stamped on the attempt: a failing amend must not retry every quote
             try:
@@ -7557,6 +7570,7 @@ class Executor:
                 log.info("TM_REQUOTE_FAILED #%d %s: %s", pos.id, v.name, ack.error)
             return
         if v.budget.available("cancel", now) < 1 or v.budget.available("order", now) < 1:
+            self.metrics.funnel["requote_budget"] += 1
             return
         pos.requote_pending = True
         pos.requote_price = new_price
@@ -7787,7 +7801,27 @@ class Executor:
         pos.last_close_attempt = self.clock()
         self.book.dirty = True
 
+    def _check_fee(self, pos: Position, venue: str, ev: OrderEvent) -> None:
+        """Spec: a fill whose fee is more than FEE_MISMATCH_TOL off the configured rate for its liquidity type is a
+        FEE_MISMATCH — the edge math runs on those rates, so a changed schedule must be seen, not absorbed."""
+        spec = self._spec(venue, pos.symbol)
+        if spec is None or ev.filled_qty <= 0 or ev.avg_price <= 0 or ev.liquidity not in ("maker", "taker"):
+            return
+        fees = self.venues[venue].fees
+        rate = fees.maker if ev.liquidity == "maker" else fees.taker
+        expected = notional(ev.filled_qty, ev.avg_price, spec) * rate / 100.0
+        if abs(ev.fee - expected) <= max(FEE_MISMATCH_TOL * expected, 1e-6):
+            return
+        self.metrics.funnel["fee_mismatch"] += 1
+        log.warning("FEE_MISMATCH %s %s %s fill: fee $%.6f, configured %.3f%% => $%.6f (%s)", venue, pos.symbol, ev.liquidity,
+                    ev.fee, rate, expected, ev.client_id)
+        now = self.clock()
+        if now - self._fee_alert_ts.get(venue, float("-inf")) >= FEE_ALERT_EVERY_S:
+            self._fee_alert_ts[venue] = now
+            self._say(f"FEE_MISMATCH {venue} {ev.liquidity}: paid ${ev.fee:.6f} vs configured {rate:.3f}% (${expected:.6f}) on {pos.symbol}")
+
     def _accumulate_leg(self, pos: Position, venue: str, phase: str, ev: OrderEvent) -> None:
+        self._check_fee(pos, venue, ev)
         is_a = venue == pos.venue_a
         if phase == "entry":
             q_attr, p_attr = ("filled_a", "entry_price_a") if is_a else ("filled_b", "entry_price_b")
@@ -7875,12 +7909,19 @@ class Executor:
             if pos.status == MAKER_RESTING:
                 transition(pos, HEDGING)
             transition(pos, OPEN)
-            if pos.signal_ts:
-                self.metrics.record("signal_to_open", (now - pos.signal_ts) * 1000.0)
+            if pos.signal_ts:                     # includes the resting time: kept apart from the TT figure
+                self.metrics.record("signal_to_open_tm", (now - pos.signal_ts) * 1000.0)
             log.info("OPEN #%d %s TM maker=%s fill_spread=%.3f%% size=$%.2f fees=$%.4f", pos.id, pos.symbol,
                      pos.maker_venue, pos.entry_spread_pct, pos.size_usd, pos.entry_fees_usd)
             self._say(f"OPEN #{pos.id} {pos.symbol} TM maker {pos.maker_venue} spread {pos.entry_spread_pct:.3f}% ${pos.size_usd:.2f}")
             self.book.dirty = True
+            if pos.entry_spread_pct < self.cfg.min_fill_spread_pct:
+                # same guard as the TT legs: a maker that filled because the book moved through it, hedged at a
+                # market that had already gone, is the legacy bot's inverted-fill loss — close it, cool the symbol
+                log.warning("FILL_QUALITY_ABORT #%d %s TM fill_spread=%.3f%% < %.3f%%", pos.id, pos.symbol,
+                            pos.entry_spread_pct, self.cfg.min_fill_spread_pct)
+                self.risk.set_cooldown(pos.symbol)
+                self._spawn(self.exit_tt(pos, "fill_quality_abort"))   # spawned: we hold the position lock here
             return
         # exit phase
         if pos.status == DEGRADED:
@@ -7924,7 +7965,17 @@ class Executor:
             transition(pos, TT_EXITING)
             await self._close_remainder_tt(pos)
             return
-        self._close(pos, pos.exit_reason or "take_profit")
+        self._close(pos, pos.exit_reason or self._tm_exit_reason(pos))
+
+    def _tm_exit_reason(self, pos: Position) -> str:
+        """Label a completed TM exit by what it REALIZED: the maker leg rested at the target but the hedge crossed a
+        market that may have moved — a spread far above EXIT_SPREAD_PCT is a slipped exit, not a take-profit."""
+        if pos.exit_price_a > 0 and pos.exit_price_b > 0:
+            realized = spread_pct(pos.exit_price_a, pos.exit_price_b)
+            if realized > self.cfg.exit_spread_pct + TM_EXIT_SLIP_TOL_PCT:
+                self.metrics.funnel["tm_exit_slipped"] += 1
+                return "tm_exit_slipped"
+        return "take_profit"
 
     # ---- exits ---------------------------------------------------------------------
     async def exit_tm(self, pos: Position, intent: Intent) -> bool:
@@ -8018,21 +8069,61 @@ class Executor:
         mark = q.mid if q is not None else (pos.entry_price_a if leg == "a" else pos.entry_price_b)
         log.error("LEG_FLAT_AT_VENUE #%d %s leg %s on %s: venue holds no position — booked closed at mark %s",
                   pos.id, pos.symbol, leg, venue, mark)
-        if leg == "a":
-            pos.exit_filled_a, pos.exit_price_a = pos.filled_a, mark
-        else:
-            pos.exit_filled_b, pos.exit_price_b = pos.filled_b, mark
+        q_attr, p_attr, total = (("exit_filled_a", "exit_price_a", pos.filled_a) if leg == "a"
+                                 else ("exit_filled_b", "exit_price_b", pos.filled_b))
+        done, px = getattr(pos, q_attr), getattr(pos, p_attr)     # the remainder at the mark, a partial exit fill kept
+        rem = max(0.0, round(total - done, 10))
+        setattr(pos, p_attr, (px * done + mark * rem) / total if total > 0 else mark)
+        setattr(pos, q_attr, total)
+
+    def _check_naked(self, pos: Position, now: float) -> None:
+        """Spec: naked exposure is bounded by MAX_NAKED_MS — alert (once per position) when a maker fill has sat
+        unhedged longer than that; the hedge/flatten ladder keeps running, this is the operator's signal."""
+        unhedged = round(pos.maker_filled_qty - pos.hedged_qty, 10)
+        if unhedged <= 1e-12 or not pos.maker_fill_ts or pos.id in self._naked_alerted:
+            return
+        naked_ms = (now - pos.maker_fill_ts) * 1000.0
+        if naked_ms > self.cfg.max_naked_ms:
+            self._naked_alerted.add(pos.id)
+            self.metrics.funnel["naked_exposure"] += 1
+            log.warning("NAKED_EXPOSURE #%d %s: %s maker contracts on %s unhedged for %.0f ms (> %d ms)", pos.id, pos.symbol,
+                        unhedged, pos.maker_venue, naked_ms, self.cfg.max_naked_ms)
+            self._say(f"NAKED_EXPOSURE #{pos.id} {pos.symbol}: {unhedged} contracts unhedged for {naked_ms:.0f} ms")
 
     async def _sweep_stuck_hedging(self, now: float) -> None:
-        """A HEDGING/EXIT_HEDGING position whose maker order is still live (the cancel inside _hedge_delta failed):
-        retry the cancel so no more fills arrive; the fill/cancel events then drive it to finalize."""
+        """A HEDGING/EXIT_HEDGING position whose maker order is still live: retry the cancel (the one inside
+        _hedge_delta failed) so no more fills arrive. If the cancel WAS sent but no terminal event ever came (private
+        feed dropped, venue status lag — both venues do this), pull the order state ourselves and feed it in; a venue
+        silent past HEDGING_STUCK_S hands the position to retry_degraded, which needs no event. Also the naked-exposure
+        alarm."""
         for pos in list(self.book.by_status(HEDGING, EXIT_HEDGING)):
+            self._check_naked(pos, now)
             tr = self._tracks.get(pos.maker_client_id)
             live = tr is not None and (tr.last is None or not tr.last.terminal)
             since = pos.maker_fill_ts or pos.maker_posted_ts
-            if live and not pos.maker_cancel_sent and now - since >= HEDGING_SWEEP_AFTER_S:
+            if not live or now - since < HEDGING_SWEEP_AFTER_S:
+                continue
+            if not pos.maker_cancel_sent:
                 log.warning("HEDGING_SWEEP #%d %s: maker order still live on %s — cancelling", pos.id, pos.symbol, pos.maker_venue)
                 await self._cancel_maker_order(pos, priority=True)
+                continue
+            if now - self._last_query.get(pos.id, float("-inf")) >= HEDGING_SWEEP_AFTER_S:
+                self._last_query[pos.id] = now
+                v = self.venues[pos.maker_venue]
+                try:
+                    ev = await v.trading.query_order(pos.symbol, pos.maker_client_id, pos.maker_order_id)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("query_order failed %s %s: %r", v.name, pos.maker_client_id, e)
+                    ev = None
+                if ev is not None and ev.terminal:
+                    log.warning("HEDGING_SWEEP #%d %s: no terminal event for %s — pulled %s from the venue", pos.id, pos.symbol,
+                                pos.maker_client_id, ev.state)
+                    self.on_order_event(ev)
+                    continue
+            if now - since >= HEDGING_STUCK_S:
+                log.error("HEDGING_STUCK #%d %s: maker order %s on %s reported nothing for %.0fs — DEGRADED, closing what the books show",
+                          pos.id, pos.symbol, pos.maker_client_id, pos.maker_venue, now - since)
+                await self._degrade(pos, "both", f"maker order silent for {now - since:.0f}s")
 
     def adopt_restored(self, pos: Position) -> None:
         """Own a position restored mid-flight (the task behind it died with the process). Whatever its resting order
@@ -9004,6 +9095,160 @@ async def test_shutdown_flushes_pending_alerts(tmp_path):
     app.executor._say("DEGRADED #1 XYZUSDT: check the venue by hand")
     await app.shutdown()
     assert delivered == ["DEGRADED #1 XYZUSDT: check the venue by hand"]         # the alert survives the process exit
+
+
+# ---- final-review round --------------------------------------------------------------------------------------
+
+async def test_restored_exit_maker_on_a_removed_venue_is_closed_in_paper(tmp_path):
+    app = build_app(tmp_path)
+    app.book.new(SYM, "gate", "mexc", EXIT_MAKER_RESTING, "TT", size_usd=25.0, maker_venue="gate", entry_time=app.clock())
+    app._check_position_venues()                       # EXIT_MAKER_RESTING -> CLOSED must be legal, or this crash-loops under systemd
+    assert app.book.open == [] and app.book.closed[-1].exit_reason == "venue_removed"
+
+
+async def _stuck_hedging(app):
+    """A partial maker fill hedged, the remainder cancelled — but the venue's `canceled` event never arrives."""
+    sim = app.harness.sim("blofin")
+    orig, dropped = sim._handler, []
+
+    def lossy(ev):
+        if ev.state == "canceled":
+            dropped.append(ev)
+            return
+        orig(ev)
+    sim._handler = lossy
+    pos = await _resting_tm(app)
+    await asyncio.sleep(0.005)
+    app.on_bbo(bbo("blofin", 1.0061, 1.0062, 1.0, bq=20.0))        # 50 % of 20 -> 10 of the 20 contracts fill
+    await settle()
+    assert pos.status == "HEDGING" and pos.maker_cancel_sent and dropped and pos.hedged_qty >= 9.9   # residual waits for the terminal
+    return pos
+
+
+async def test_hedging_without_a_terminal_event_is_rescued_by_the_sweep(tmp_path, caplog):
+    import time
+    app = build_app(tmp_path)
+    pos = await _stuck_hedging(app)
+    await app.executor.retry_degraded()                             # too early: nothing to do yet
+    assert pos.status == "HEDGING"
+    app.executor.clock = lambda: time.time() + 3.0                  # past HEDGING_SWEEP_AFTER_S
+    await app.executor.retry_degraded()                             # the sweep asks the venue and feeds the terminal state in
+    await settle()
+    assert pos.status == OPEN and pos.filled_a == 10.0 and pos.filled_b == 1.0 and "pulled canceled" in caplog.text
+
+
+async def test_hedging_on_a_silent_venue_degrades_after_stuck_s(tmp_path, caplog, monkeypatch):
+    import time
+    from bbo_trader import execution
+    app = build_app(tmp_path)
+    pos = await _stuck_hedging(app)
+    sim = app.harness.sim("blofin")
+
+    async def silent(*a, **k):
+        return None
+    sim.query_order = silent
+    app.executor.clock = lambda: time.time() + 61.0                 # past HEDGING_STUCK_S
+    await app.executor.retry_degraded()
+    await settle()
+    assert pos.status == "DEGRADED" and "HEDGING_STUCK" in caplog.text and pos.filled_a == 10.0
+    assert any("DEGRADED #1" in n for n in app.harness.notes)
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    app.harness.quote("blofin", 1.0061, 1.0062)
+    app.harness.quote("mexc", 1.0000, 1.0010)
+    await app.executor.retry_degraded()                             # retry_degraded now owns it: both legs closed
+    await settle()
+    assert pos.status == CLOSED and await sim.positions() == [] and await app.harness.sim("mexc").positions() == []
+
+
+async def test_naked_exposure_alert_fires_once(tmp_path, caplog):
+    app = build_app(tmp_path)
+    now = app.clock()
+    pos = app.book.new(SYM, "blofin", "mexc", "HEDGING", "TM", size_usd=25.0, maker_venue="blofin", maker_side="sell",
+                       maker_client_id="m-1", maker_filled_qty=10.0, hedged_qty=0.0, maker_fill_ts=now - 2.0, entry_time=now)
+    await app.executor.retry_degraded()
+    await asyncio.sleep(0.01)
+    assert f"NAKED_EXPOSURE #{pos.id}" in caplog.text and app.metrics.funnel["naked_exposure"] == 1
+    assert any("NAKED_EXPOSURE" in n for n in app.harness.notes)
+    await app.executor.retry_degraded()
+    assert app.metrics.funnel["naked_exposure"] == 1                 # once per position
+
+
+async def test_fee_mismatch_is_logged_and_alerted_once_per_venue_per_hour(tmp_path, caplog):
+    from dataclasses import replace as dc_replace
+    from tests.conftest import MEXC_FEES
+    app = build_app(tmp_path)
+    h = app.harness
+    app.venues["mexc"].fees = dc_replace(MEXC_FEES, taker=0.05)       # we believe 0.05 %; the venue charges 0.02 %
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    pos = await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0))
+    await asyncio.sleep(0.01)
+    assert "FEE_MISMATCH mexc" in caplog.text and "FEE_MISMATCH blofin" not in caplog.text
+    assert app.metrics.funnel["fee_mismatch"] == 1 and sum("FEE_MISMATCH" in n for n in h.notes) == 1
+    await h.ex.exit_tt(pos, "test")                                  # the exit fill mismatches too: counted, not re-alerted
+    await asyncio.sleep(0.01)
+    assert app.metrics.funnel["fee_mismatch"] == 2 and sum("FEE_MISMATCH" in n for n in h.notes) == 1
+
+
+async def test_fill_quality_abort_covers_tt_and_tm_entries(tmp_path, caplog):
+    app = build_app(tmp_path, min_fill_spread_pct=0.50)             # every realized entry spread below 0.50 % is refused
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    assert await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0)) is None
+    await settle()
+    tt = app.book.closed[-1]
+    assert tt.exit_reason == "fill_quality_abort" and app.risk.cooldowns.get(SYM, 0) > app.clock()
+    assert await h.sim("blofin").positions() == [] and await h.sim("mexc").positions() == []
+    (tmp_path / "tm").mkdir()
+    app = build_app(tmp_path / "tm", min_fill_spread_pct=0.60)      # fresh books (the TT loss blacklisted the symbol); TM realizes 0.51 %
+    h = app.harness
+    pos = await _resting_tm(app)                                     # TM: the maker fills, the hedge lands, the spread is poor
+    await asyncio.sleep(0.005)
+    app.on_bbo(bbo("blofin", 1.0061, 1.0062, 1.0, bq=100.0))
+    await settle()
+    assert pos.status == CLOSED and pos.exit_reason == "fill_quality_abort" and "FILL_QUALITY_ABORT #%d %s TM" % (pos.id, SYM) in caplog.text
+    assert await h.sim("blofin").positions() == [] and await h.sim("mexc").positions() == []
+
+
+async def test_tm_exit_reason_labels_slipped_exits(tmp_path):
+    app = build_app(tmp_path)
+    pos = app.book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, exit_price_a=1.0010, exit_price_b=1.0000)
+    assert app.executor._tm_exit_reason(pos) == "take_profit"        # realized 0.10 % <= 0.15 % target
+    pos.exit_price_a = 1.0060                                         # realized 0.60 %: the hedge crossed a market that had moved
+    assert app.executor._tm_exit_reason(pos) == "tm_exit_slipped" and app.metrics.funnel["tm_exit_slipped"] == 1
+
+
+async def test_requote_is_not_double_fired_before_the_task_runs(tmp_path):
+    import time
+    app = build_app(tmp_path)
+    pos = await _resting_tm(app)
+    requotes = _count_calls(app.executor, "requote")
+    t1 = time.time() + 1.5                                            # past blofin's 1 s min requote gap
+    app.clock = app.evaluator.clock = lambda: t1
+    app.on_bbo(bbo("blofin", 1.0043, 1.0065, 1.0))                   # the peg moved: one requote
+    app.on_bbo(bbo("blofin", 1.0043, 1.0065, 1.0))                   # the same book again before that task ran
+    await settle()
+    assert len(requotes) == 1 and pos.maker_rest_price != 1.0061
+
+
+async def test_halt_cancels_a_resting_entry_even_if_the_sweep_cancel_failed(tmp_path):
+    app = build_app(tmp_path)
+    pos = await _resting_tm(app)
+    app.risk.halt("test")                                             # the halt edge's cancel_all_resting did not reach this order
+    app._drive(pos)
+    await settle()
+    assert app.book.open == [] and app.metrics.funnel["maker_cancelled"] == 1
+
+
+async def test_book_leg_flat_accumulates_a_partial_exit(tmp_path):
+    app = build_app(tmp_path)
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    pos = app.book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, filled_a=20.0, exit_filled_a=5.0, exit_price_a=1.0010,
+                       entry_time=app.clock())
+    app.executor._book_leg_flat(pos, "a", "blofin")
+    assert pos.exit_filled_a == 20.0 and pos.exit_price_a == pytest.approx((1.0010 * 5 + 1.0055 * 15) / 20)   # mark = mid
 ```
 
 - [x] **Step 1b: Write the registry tests**
@@ -9322,6 +9567,7 @@ class App:
             log.info("STOPPING #%d %s: %s refused, cancel_all_resting/TT exits only", pos.id, pos.symbol, it.kind)
             return
         if it.kind == "REQUOTE":
+            pos.maker_last_requote_ts = self.clock()     # stamped NOW: the next quote must not spawn a second requote
             self._spawn(self.executor.requote(pos, it.rest_price))
         elif it.kind == "CANCEL":
             self._spawn(self.executor.cancel_maker(pos, it.reason))
@@ -9820,7 +10066,7 @@ Expected: `13 passed`
 - [x] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `178 passed`
+Expected: `188 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py deploy-bbo/tests/test_registry.py
@@ -9908,6 +10154,7 @@ cancels resting orders, `data/start.flag` resumes. Telegram: `/stop /start /clos
 
 ## Tests
 
+    .venv/bin/pip install -r requirements-dev.txt
     .venv/bin/python -m pytest -q
 
 ## Layout
@@ -9954,7 +10201,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Third round (approved): the shipped-defaults test pins `receive_timeout is None`/`heartbeat == 20`/`data_timeout == 120`, and a close caused by a heartbeat timeout logs the socket's exception instead of "by server". **Tasks 12/13 amended after the Task 12 code review (2026-09-05, verified against both live APIs):** `_get` raises `VenueError` (new, `venues/base.py`) on a non-200 status, a non-JSON body or an error ENVELOPE (MEXC `success != true`, BloFin `code != "0"` — both venues report errors as HTTP 200), and `fetch_specs` raises rather than returning an empty set; `parse_specs` also requires `apiAllowed` (MEXC: `state` is 0 for every contract, `apiAllowed` false for ~30 live ones); every row parser isolates a malformed row (`SPEC_ROWS_DROPPED`) and uses strict numerics (no `or` defaults); an instrument without a known contract size yields no BBO (sizes span 1e-5…1e7) and `fetch_bbo` returns None without a spec; `to_instrument` rejects non-USDT symbols; MEXC `ts_exchange` prefers `data.cts`; rejected subscriptions (`rs.error` / `event: error`) are logged with escalating sparsity; BloFin sends a User-Agent. Task 19: `refresh_market_data` never applies an empty spec set, funding has its own 5-minute loop (`refresh_funding`; both venues run 4 h and 8 h grids), `_quote_fallback` fetches legs concurrently with a per-call guard (`QUOTE_FALLBACK_FAILED`). Live-shape fixtures + fake-session REST tests: 4 MEXC and 3 BloFin tests added. Re-review (approved): timestamp assertions use `abs=1e-6`, malformed rows carry distinct symbols so a fabricated zero cannot hide behind the good row, a status-only failure case is covered, and the `PublicFeed` docstring states that unknown instruments yield no BBO. **Task 13 amended after code review (2026-09-05, verified live):** `subscribe()` sends ONE message per instrument — BloFin validates a subscribe message atomically, so one delisted instId in a batched message subscribed nothing for the whole shard while our text pings kept the empty socket alive; `parse_books5` ignores non-snapshot actions; `parse_instruments` also requires `contractType == linear` and `assetClass == Crypto` (BloFin lists equity/index/commodity USDT perps that gap when their market is closed); both adapters' `_top` use strict `_num` for levels; the BloFin fixture is a verbatim live BTC-USDT row (contract value 0.001, 0.1-contract lots) with assertions derived from it; tests pin the WS wiring (url, 50 topics, 25 s text ping, 120 s data timeout), the real subscribe ack for a known instrument, `action: update` frames, a JSON NaN literal, and the too-short-symbol guard. Re-review (approved): NaN prices are pinned to raise in both adapters, the synthetic spec rows use lot ≠ min so a transposed `VenueSpec` argument fails, the fixture uses BloFin's real `Stocks` label, and the docstring describes `expireTime` correctly (per-instrument far-future values; `instType` is always SWAP). **Task 14 amended after code review (2026-09-05):** the paper venue no longer flatters the strategy — taker orders fill at the touch that exists AFTER the latency (paper now shows spread decay) and push an `ack` event first, the maker cap is granted once per DISTINCT touch (an unchanged book re-pushed 10×/s is not new flow) and a sub-lot touch fills nothing, reduce-only fills are clamped to the open position (a close against a flat position is rejected with `nothing to reduce`, like the real venues), every fill needs a FRESH quote, resting orders are indexed per symbol (`on_quote` no longer scans every order ever placed) and terminal orders are bounded (`MAX_ORDERS`), positions carry an average cost so realized P&L and fees flow into `balance()`, `place_post_only` rejects `qty <= 0`, `cancel` distinguishes unknown from terminal, `amend` refuses without a fresh quote, the fill task is exception-guarded and a missing spec is logged once; 5 tests added (9 total). Task 16 accordingly: `retry_degraded` books a leg closed at the mark when the venue confirms it holds no position after a `nothing to reduce` rejection (`LEG_FLAT_AT_VENUE`) and stops after `MAX_CLOSE_RETRIES` (`DEGRADED_STUCK`, Telegram) instead of spinning. Re-review (approved) + follow-ups: the sim's maker cap uses `lots_floor`, a flip test pins the average re-anchor; Task 16's `_on_maker_event` no longer swallows a POST-rest rejection (`LegTrack.acked`; a resting reduce-only exit maker refused with `nothing to reduce` books the leg flat after the venue confirms it and closes the other leg TT, exit reason `venue_flat`); 2 executor tests added. **Task 15 amended after code review (2026-09-05):** histograms report lifetime `total`/`max_ever` beside the windowed `n`/`max` and clamp negative/NaN samples, `LOOP_LAG` is one summary line per `summary_s` (not one per second), uptime is monotonic, `CoverageWatchdog` warns under max(`coverage_floor`, `coverage_frac` × the venue's high-water mark) after a start-up grace, has no `run()` (the App schedules `check()`), and its `to_dict()` (fresh/high/floor) is what the App persists as `coverage`; Config gained `coverage_floor`/`coverage_frac`; 1 metrics test added. **Task 16 amended after code review (2026-09-05):** every close path decides on the REMAINING quantity (a partial reduce-only fill leaves the position DEGRADED with the remainder owned; `_flatten_leg` continues its ladder with what is left); a venue exception on `place_market` leaves the order IN DOUBT — polled, then reported rejected as `in_doubt` (never assumed filled, `ORDER_UNRESOLVED` to Telegram) — and `_tt_legs`/`_close_remainder_tt` gather with `return_exceptions`; `place_post_only`, `amend`, `cancel`, `query_order` exceptions are caught (`TM_POST_IN_DOUBT` queries the venue); a fill on a superseded maker order or on a position outside the maker flow is a `TM_STRAY_FILL`: booked on the leg (`LegTrack.filled_seen` delta) and the position is handed to `retry_degraded` via `_degrade` (cancels the live order, walks MAKER_RESTING→HEDGING→DEGRADED), never written onto the live order's counters; `_finalize_maker` is total over HEDGING (a flattened fill closes as `hedge_unwound`) and DEGRADED (books the fill and resizes); an exit-phase hedge failure no longer sends a re-opening flatten — the remainder closes taker/taker; maker-fill flattens realize their P&L into `Position.pnl_adjust_usd` (new, Task 2; `finalize_pnl` adds it, Task 7) and continue on partial fills; `_apply_maker_leg` books incrementally (`maker_booked_qty/fee`); a cancel that fails inside `_hedge_delta` is retried and `_sweep_stuck_hedging` (run from `retry_degraded`) plus `cancel_all_resting` cover HEDGING positions with a live order; `_close` is idempotent and prunes tracks/locks; `exit_tt` only acts on OPEN/EXIT_MAKER_RESTING; hedges size off fresh quotes; the TT upgrade re-sizes at the current touch; `submit_to_fill` only records fills; `busy` removed; CID truncation logged; 9 tests added (23 total). Second round: maker `LegTrack`s carry `phase` and venue as posted (a late fill on a cancelled exit maker whose `maker_venue` was cleared books on the right leg in the right phase), stray fills are booked additively without touching `maker_booked_qty` (the live order is booked later by finalize/degrade), `_tt_legs` accumulates its fills and defers to a concurrent degrade (a stray during the TT upgrade is added, not overwritten; a both-legs-failed entry with something on the books degrades instead of discarding), `hedge_unwound` requires flat legs (`UNWOUND_BUT_NOT_FLAT` → DEGRADED), a flatten that nets already-booked quantity books it as the leg's exit fill, an in-doubt order with a known partial books the partial, maker tracks outlive their position (bounded by `MAX_TRACKS`) so `STRAY_FILL_AFTER_CLOSE`/`STRAY_FILL_NO_POSITION`/`UNKNOWN_FILL` reach Telegram, DEGRADED transitions mark the book dirty, `EXIT_IGNORED` is logged; 5 tests added (28 total). Plan 2 acceptance criteria for the live `Trading` adapters: raise (never `ok=False`) on transport/envelope failures, and support `query_order` by client id — the in-doubt path depends on both. Third round: the LEG_DESYNC branch closes `failed_entry` only when BOTH legs net flat (`DESYNC_NOT_FLAT` → DEGRADED otherwise) and the both-legs-failed-with-a-stray branch resizes; 1 test added (29 total). **Task 17 reviewed (2026-09-05, approved):** the test also pins that an empty whitelist means unrestricted and that a symbol delisted on one venue drops out. Notes for later plans: Plan 3's quote-only wiring must pass `symbols_for_quote_venue` the venue's SPEC MAP (a venue name silently yields `[]`); when Plan 4 flips OKX to `trade`, `apply_universe`/config should warn on an empty `symbol_whitelist` for a venue known to need one (OKX-EEA's 10 pairs), otherwise every OKX leg is rejected one-legged. **Task 18 amended after code review (2026-09-05):** the poller can no longer wedge — `parse_commands` never raises (a whitespace-only message used to raise `IndexError` before the offset advanced, so Telegram redelivered it forever and every operator command went dark for 24 h), every update with an id advances the offset, commands match case-insensitively and with a `@botname` suffix, the chat id is normalized (whitespace), updates dated before process start are consumed but not executed (no replay of a stale `/close_all` against reloaded positions), the first failure per process (HTTP status, `ok:false` with Telegram's description, or an exception TYPE — never the repr, the URL carries the token) is a WARNING and later ones DEBUG, a half configuration (one of token/chat id) warns at start-up (`main.py` builds the client when either is set), long messages are truncated with an ellipsis; fake-session tests cover a 401 body, a raising session, the offset across polls and the pre-start filter; 2 tests added (4 total). Re-review (approved): a non-dict `chat` is skipped like a non-dict `message`, and the deliberate sub-second bias of the pre-start filter is documented. **Task 19 amended after code review (2026-09-05, review included a 4-minute live paper smoke run: universe 364, coverage mexc 287 / blofin 364, a full TT round trip, clean shutdown):** `shutdown()` DRAINS in-flight order tasks (`_drain`, `SHUTDOWN_DRAIN_S`) before cancelling resting orders (bounded by `SHUTDOWN_CANCEL_S`) and saving, and logs `SHUTDOWN complete`; `_adopt_transients` runs at load — TT_ENTERING/HEDGING/EXIT_HEDGING/TT_EXITING → DEGRADED (`STUCK_TRANSIENT`), a restored MAKER_RESTING is discarded (`STUCK_RESTING`), a restored EXIT_MAKER_RESTING reopens as OPEN (`STUCK_EXIT_MAKER`); `/close_all` drains first and also exits EXIT_MAKER_RESTING positions; the strategy posts no new exit maker while halted and cancels resting ones (`halted`); every long-lived task is supervised (`TASK_DIED` → Telegram → `running=False` so systemd restarts); the heartbeat is `bbo_heartbeat_{mode}` and `main.py` refuses a DATA_DIR equal to the legacy bot's data dir (exit 5), wraps `build_venues` (exit 6; the registry now collects every live-mode problem into one message and requires key AND secret), treats an unreadable legacy heartbeat as running, and force-exits on a second signal; market data retries every 60 s while the universe is empty (`UNIVERSE_EMPTY`); `_quote_fallback` runs every 0.5 s and refreshes a leg at HALF the staleness budget (before, it always lost the race to `evaluate_resting`'s stale-cancel: 12 of 14 TM entries in the smoke run died `stale`), a stale-cancel puts the symbol on a 5 s cooldown (`STALE_CANCEL_COOLDOWN_S`), `on_quote` is guarded (`QUOTE_ERROR`), `QUOTE_TS_SKEW` rejects quotes from the future, equity/starting capital count tradeable venues, open-position symbols stay subscribed and keep their specs across a refresh, the banner and `STATE loaded` report `halted`/open, `bbo_section` reports per-venue `connected`, balance refresh is guarded; MEXC gets `staleness_override_s: 5.0` in `config/venues.json` (its depth feed pushes only on change; ~80 of 364 symbols read stale at 2 s); 6 App tests + `tests/test_registry.py` (2) + 1 strategy test added. Deferred: Telegram session reuse; Plan 2 must cancel/adopt resting orders at start-up (reconciliation). Re-review round (approved; all seven findings resolved, follow-ups folded in): a restored MAKER_RESTING / EXIT_MAKER_RESTING whose resting order had filled — and a HEDGING/EXIT_HEDGING saved before `_finalize_maker` booked the fill — go through `Executor.adopt_restored`, which books the maker fill on its leg and walks the position to DEGRADED (before, the fill was discarded or the position closed as `recovered` with the fill orphaned at the venue); only a fill-less MAKER_RESTING is discarded and only a fill-less EXIT_MAKER_RESTING reopens; `_quote_fallback` bounds each REST call to the same half-budget it fires at (`asyncio.wait_for`; the adapters' 5 s timeout let one hung request sit through the whole budget — 10 of 14 BloFin fallback calls timed out in the instrumented run) with one fetch per leg in flight and `fallback_ok`/`fallback_timeout`/`fallback_failed` funnel counters; `shutdown()` waits for cancelled makers to settle (`_settle_makers`, `SHUTDOWN_SETTLE_S`) before saving, so a clean restart no longer reports `STUCK_EXIT_MAKER` for an order the bot itself cancelled; `_drive` refuses REQUOTE/TM_EXIT/UPGRADE_TT once stopping (`STOPPING`); Telegram sends live in their own task sets (`Executor._notify_tasks`, `App._notify`) so a hung send cannot eat the drain budget; `_adopt_transients` documents that nothing asks the venue (Plan 2 reconciliation); tests added for all of these plus the stale-cancel cooldown, the 60 s empty-universe retry, held-symbol spec preservation and the unreadable legacy heartbeat (174 total). MEXC's 5 s staleness override was measured, not assumed: median quote age 0.5–1.5 s, p90 2.5–3.5 s, inter-update p99 5.24 s over 30k updates; BloFin median 0.02–0.27 s, none needed. Open question for the paper soak: why in-app BloFin REST fallback calls exceed 5 s when the endpoint answers in ~300 ms in isolation (shared aiohttp session; `fresh` vs `shared` sessions measured equal). Follow-up round (both reviews approved, findings folded in): the open question was answered by a probe — with 8 BloFin books5 shards streaming from the same IP, a REST call on a NEW connection has p90 1.4 s / max 4.8 s (SYN-retransmit-shaped tail; bursts of new connections are what suffer) while a call on an already-open keep-alive connection stays ~300 ms even at 10–20 s idle gaps — so `_quote_fallback` now spawns per-leg fetch tasks (the tick never blocks; `_fallback_inflight` dedupe is load-bearing), serializes them per venue on `_rest_locks` so every call reuses the warm pooled connection, touches each venue with open positions every `REST_WARM_S` (10 s) to keep that connection alive, and bounds a call at the venue's FULL staleness budget (a late answer is still a fresh quote — `ts_local` is stamped at receipt — so the half-budget bound of the previous round was too tight: 6 of 22 fallbacks abandoned in the reviewer's run); `Executor.stopping` (set first thing in `shutdown()`) makes `_post_maker` refuse and the TT-upgrade branch discard, so a requote or upgrade whose cancel event lands during the drain can no longer leave a fresh order resting or open a new position (`STOPPING`); `shutdown()` flushes pending Telegram alerts for `NOTIFY_FLUSH_S` after the save (they were dropped when the session closed); `_drain`/`_settle_makers` deadlines run on the loop clock; `_adopt_transients` runs from `run()` AFTER the first market-data refresh so an adopted position's size is re-derived from its legs with known specs (`load_state` no longer adopts); `exit_tm` documents that `_post_maker` resets the maker counters; the README lists every module and names the legacy dashboard's location. Tests: +4 (warm connection + one-call-at-a-time, no re-post on shutdown, TT upgrade dropped on shutdown, alerts flushed) → 178 total. **Task 20 acceptance run (2026-09-05, paper, 9 min, live public feeds, commit 84ea4ba40):** universe 364; coverage mexc 358→362, blofin 267→349 (BloFin ramps over several minutes; no FEED_COVERAGE_LOW); 22 INTENT / 22 TM_POST / 211 TM_REQUOTE / 2 TM_FILL / 14 TM_CANCEL (13 ttl, 1 stale — down from 8 of 12 in the pre-fix run); 7 round trips (6 TT convergence, 1 TM take_profit), net −$0.001; fallback_ok 108 / fallback_timeout 4 (3.6 %, down from 27 %); loop lag p50 1.1 ms / max 21 ms; no tracebacks, no ERROR lines, state saved every ≤ 5 s, `bbo_heartbeat_paper` written; SIGINT → both SHUTDOWN lines, 0 open, exit 0. Soak watch-list: maker TTL cancels dominate (13 of 14) — tune `maker_ttl_s`/peg aggressiveness from soak data, not from the historical live trades. **Task 9 re-review round (approved):** nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Third round (approved): the shipped-defaults test pins `receive_timeout is None`/`heartbeat == 20`/`data_timeout == 120`, and a close caused by a heartbeat timeout logs the socket's exception instead of "by server". **Tasks 12/13 amended after the Task 12 code review (2026-09-05, verified against both live APIs):** `_get` raises `VenueError` (new, `venues/base.py`) on a non-200 status, a non-JSON body or an error ENVELOPE (MEXC `success != true`, BloFin `code != "0"` — both venues report errors as HTTP 200), and `fetch_specs` raises rather than returning an empty set; `parse_specs` also requires `apiAllowed` (MEXC: `state` is 0 for every contract, `apiAllowed` false for ~30 live ones); every row parser isolates a malformed row (`SPEC_ROWS_DROPPED`) and uses strict numerics (no `or` defaults); an instrument without a known contract size yields no BBO (sizes span 1e-5…1e7) and `fetch_bbo` returns None without a spec; `to_instrument` rejects non-USDT symbols; MEXC `ts_exchange` prefers `data.cts`; rejected subscriptions (`rs.error` / `event: error`) are logged with escalating sparsity; BloFin sends a User-Agent. Task 19: `refresh_market_data` never applies an empty spec set, funding has its own 5-minute loop (`refresh_funding`; both venues run 4 h and 8 h grids), `_quote_fallback` fetches legs concurrently with a per-call guard (`QUOTE_FALLBACK_FAILED`). Live-shape fixtures + fake-session REST tests: 4 MEXC and 3 BloFin tests added. Re-review (approved): timestamp assertions use `abs=1e-6`, malformed rows carry distinct symbols so a fabricated zero cannot hide behind the good row, a status-only failure case is covered, and the `PublicFeed` docstring states that unknown instruments yield no BBO. **Task 13 amended after code review (2026-09-05, verified live):** `subscribe()` sends ONE message per instrument — BloFin validates a subscribe message atomically, so one delisted instId in a batched message subscribed nothing for the whole shard while our text pings kept the empty socket alive; `parse_books5` ignores non-snapshot actions; `parse_instruments` also requires `contractType == linear` and `assetClass == Crypto` (BloFin lists equity/index/commodity USDT perps that gap when their market is closed); both adapters' `_top` use strict `_num` for levels; the BloFin fixture is a verbatim live BTC-USDT row (contract value 0.001, 0.1-contract lots) with assertions derived from it; tests pin the WS wiring (url, 50 topics, 25 s text ping, 120 s data timeout), the real subscribe ack for a known instrument, `action: update` frames, a JSON NaN literal, and the too-short-symbol guard. Re-review (approved): NaN prices are pinned to raise in both adapters, the synthetic spec rows use lot ≠ min so a transposed `VenueSpec` argument fails, the fixture uses BloFin's real `Stocks` label, and the docstring describes `expireTime` correctly (per-instrument far-future values; `instType` is always SWAP). **Task 14 amended after code review (2026-09-05):** the paper venue no longer flatters the strategy — taker orders fill at the touch that exists AFTER the latency (paper now shows spread decay) and push an `ack` event first, the maker cap is granted once per DISTINCT touch (an unchanged book re-pushed 10×/s is not new flow) and a sub-lot touch fills nothing, reduce-only fills are clamped to the open position (a close against a flat position is rejected with `nothing to reduce`, like the real venues), every fill needs a FRESH quote, resting orders are indexed per symbol (`on_quote` no longer scans every order ever placed) and terminal orders are bounded (`MAX_ORDERS`), positions carry an average cost so realized P&L and fees flow into `balance()`, `place_post_only` rejects `qty <= 0`, `cancel` distinguishes unknown from terminal, `amend` refuses without a fresh quote, the fill task is exception-guarded and a missing spec is logged once; 5 tests added (9 total). Task 16 accordingly: `retry_degraded` books a leg closed at the mark when the venue confirms it holds no position after a `nothing to reduce` rejection (`LEG_FLAT_AT_VENUE`) and stops after `MAX_CLOSE_RETRIES` (`DEGRADED_STUCK`, Telegram) instead of spinning. Re-review (approved) + follow-ups: the sim's maker cap uses `lots_floor`, a flip test pins the average re-anchor; Task 16's `_on_maker_event` no longer swallows a POST-rest rejection (`LegTrack.acked`; a resting reduce-only exit maker refused with `nothing to reduce` books the leg flat after the venue confirms it and closes the other leg TT, exit reason `venue_flat`); 2 executor tests added. **Task 15 amended after code review (2026-09-05):** histograms report lifetime `total`/`max_ever` beside the windowed `n`/`max` and clamp negative/NaN samples, `LOOP_LAG` is one summary line per `summary_s` (not one per second), uptime is monotonic, `CoverageWatchdog` warns under max(`coverage_floor`, `coverage_frac` × the venue's high-water mark) after a start-up grace, has no `run()` (the App schedules `check()`), and its `to_dict()` (fresh/high/floor) is what the App persists as `coverage`; Config gained `coverage_floor`/`coverage_frac`; 1 metrics test added. **Task 16 amended after code review (2026-09-05):** every close path decides on the REMAINING quantity (a partial reduce-only fill leaves the position DEGRADED with the remainder owned; `_flatten_leg` continues its ladder with what is left); a venue exception on `place_market` leaves the order IN DOUBT — polled, then reported rejected as `in_doubt` (never assumed filled, `ORDER_UNRESOLVED` to Telegram) — and `_tt_legs`/`_close_remainder_tt` gather with `return_exceptions`; `place_post_only`, `amend`, `cancel`, `query_order` exceptions are caught (`TM_POST_IN_DOUBT` queries the venue); a fill on a superseded maker order or on a position outside the maker flow is a `TM_STRAY_FILL`: booked on the leg (`LegTrack.filled_seen` delta) and the position is handed to `retry_degraded` via `_degrade` (cancels the live order, walks MAKER_RESTING→HEDGING→DEGRADED), never written onto the live order's counters; `_finalize_maker` is total over HEDGING (a flattened fill closes as `hedge_unwound`) and DEGRADED (books the fill and resizes); an exit-phase hedge failure no longer sends a re-opening flatten — the remainder closes taker/taker; maker-fill flattens realize their P&L into `Position.pnl_adjust_usd` (new, Task 2; `finalize_pnl` adds it, Task 7) and continue on partial fills; `_apply_maker_leg` books incrementally (`maker_booked_qty/fee`); a cancel that fails inside `_hedge_delta` is retried and `_sweep_stuck_hedging` (run from `retry_degraded`) plus `cancel_all_resting` cover HEDGING positions with a live order; `_close` is idempotent and prunes tracks/locks; `exit_tt` only acts on OPEN/EXIT_MAKER_RESTING; hedges size off fresh quotes; the TT upgrade re-sizes at the current touch; `submit_to_fill` only records fills; `busy` removed; CID truncation logged; 9 tests added (23 total). Second round: maker `LegTrack`s carry `phase` and venue as posted (a late fill on a cancelled exit maker whose `maker_venue` was cleared books on the right leg in the right phase), stray fills are booked additively without touching `maker_booked_qty` (the live order is booked later by finalize/degrade), `_tt_legs` accumulates its fills and defers to a concurrent degrade (a stray during the TT upgrade is added, not overwritten; a both-legs-failed entry with something on the books degrades instead of discarding), `hedge_unwound` requires flat legs (`UNWOUND_BUT_NOT_FLAT` → DEGRADED), a flatten that nets already-booked quantity books it as the leg's exit fill, an in-doubt order with a known partial books the partial, maker tracks outlive their position (bounded by `MAX_TRACKS`) so `STRAY_FILL_AFTER_CLOSE`/`STRAY_FILL_NO_POSITION`/`UNKNOWN_FILL` reach Telegram, DEGRADED transitions mark the book dirty, `EXIT_IGNORED` is logged; 5 tests added (28 total). Plan 2 acceptance criteria for the live `Trading` adapters: raise (never `ok=False`) on transport/envelope failures, and support `query_order` by client id — the in-doubt path depends on both. Third round: the LEG_DESYNC branch closes `failed_entry` only when BOTH legs net flat (`DESYNC_NOT_FLAT` → DEGRADED otherwise) and the both-legs-failed-with-a-stray branch resizes; 1 test added (29 total). **Task 17 reviewed (2026-09-05, approved):** the test also pins that an empty whitelist means unrestricted and that a symbol delisted on one venue drops out. Notes for later plans: Plan 3's quote-only wiring must pass `symbols_for_quote_venue` the venue's SPEC MAP (a venue name silently yields `[]`); when Plan 4 flips OKX to `trade`, `apply_universe`/config should warn on an empty `symbol_whitelist` for a venue known to need one (OKX-EEA's 10 pairs), otherwise every OKX leg is rejected one-legged. **Task 18 amended after code review (2026-09-05):** the poller can no longer wedge — `parse_commands` never raises (a whitespace-only message used to raise `IndexError` before the offset advanced, so Telegram redelivered it forever and every operator command went dark for 24 h), every update with an id advances the offset, commands match case-insensitively and with a `@botname` suffix, the chat id is normalized (whitespace), updates dated before process start are consumed but not executed (no replay of a stale `/close_all` against reloaded positions), the first failure per process (HTTP status, `ok:false` with Telegram's description, or an exception TYPE — never the repr, the URL carries the token) is a WARNING and later ones DEBUG, a half configuration (one of token/chat id) warns at start-up (`main.py` builds the client when either is set), long messages are truncated with an ellipsis; fake-session tests cover a 401 body, a raising session, the offset across polls and the pre-start filter; 2 tests added (4 total). Re-review (approved): a non-dict `chat` is skipped like a non-dict `message`, and the deliberate sub-second bias of the pre-start filter is documented. **Task 19 amended after code review (2026-09-05, review included a 4-minute live paper smoke run: universe 364, coverage mexc 287 / blofin 364, a full TT round trip, clean shutdown):** `shutdown()` DRAINS in-flight order tasks (`_drain`, `SHUTDOWN_DRAIN_S`) before cancelling resting orders (bounded by `SHUTDOWN_CANCEL_S`) and saving, and logs `SHUTDOWN complete`; `_adopt_transients` runs at load — TT_ENTERING/HEDGING/EXIT_HEDGING/TT_EXITING → DEGRADED (`STUCK_TRANSIENT`), a restored MAKER_RESTING is discarded (`STUCK_RESTING`), a restored EXIT_MAKER_RESTING reopens as OPEN (`STUCK_EXIT_MAKER`); `/close_all` drains first and also exits EXIT_MAKER_RESTING positions; the strategy posts no new exit maker while halted and cancels resting ones (`halted`); every long-lived task is supervised (`TASK_DIED` → Telegram → `running=False` so systemd restarts); the heartbeat is `bbo_heartbeat_{mode}` and `main.py` refuses a DATA_DIR equal to the legacy bot's data dir (exit 5), wraps `build_venues` (exit 6; the registry now collects every live-mode problem into one message and requires key AND secret), treats an unreadable legacy heartbeat as running, and force-exits on a second signal; market data retries every 60 s while the universe is empty (`UNIVERSE_EMPTY`); `_quote_fallback` runs every 0.5 s and refreshes a leg at HALF the staleness budget (before, it always lost the race to `evaluate_resting`'s stale-cancel: 12 of 14 TM entries in the smoke run died `stale`), a stale-cancel puts the symbol on a 5 s cooldown (`STALE_CANCEL_COOLDOWN_S`), `on_quote` is guarded (`QUOTE_ERROR`), `QUOTE_TS_SKEW` rejects quotes from the future, equity/starting capital count tradeable venues, open-position symbols stay subscribed and keep their specs across a refresh, the banner and `STATE loaded` report `halted`/open, `bbo_section` reports per-venue `connected`, balance refresh is guarded; MEXC gets `staleness_override_s: 5.0` in `config/venues.json` (its depth feed pushes only on change; ~80 of 364 symbols read stale at 2 s); 6 App tests + `tests/test_registry.py` (2) + 1 strategy test added. Deferred: Telegram session reuse; Plan 2 must cancel/adopt resting orders at start-up (reconciliation). Re-review round (approved; all seven findings resolved, follow-ups folded in): a restored MAKER_RESTING / EXIT_MAKER_RESTING whose resting order had filled — and a HEDGING/EXIT_HEDGING saved before `_finalize_maker` booked the fill — go through `Executor.adopt_restored`, which books the maker fill on its leg and walks the position to DEGRADED (before, the fill was discarded or the position closed as `recovered` with the fill orphaned at the venue); only a fill-less MAKER_RESTING is discarded and only a fill-less EXIT_MAKER_RESTING reopens; `_quote_fallback` bounds each REST call to the same half-budget it fires at (`asyncio.wait_for`; the adapters' 5 s timeout let one hung request sit through the whole budget — 10 of 14 BloFin fallback calls timed out in the instrumented run) with one fetch per leg in flight and `fallback_ok`/`fallback_timeout`/`fallback_failed` funnel counters; `shutdown()` waits for cancelled makers to settle (`_settle_makers`, `SHUTDOWN_SETTLE_S`) before saving, so a clean restart no longer reports `STUCK_EXIT_MAKER` for an order the bot itself cancelled; `_drive` refuses REQUOTE/TM_EXIT/UPGRADE_TT once stopping (`STOPPING`); Telegram sends live in their own task sets (`Executor._notify_tasks`, `App._notify`) so a hung send cannot eat the drain budget; `_adopt_transients` documents that nothing asks the venue (Plan 2 reconciliation); tests added for all of these plus the stale-cancel cooldown, the 60 s empty-universe retry, held-symbol spec preservation and the unreadable legacy heartbeat (174 total). MEXC's 5 s staleness override was measured, not assumed: median quote age 0.5–1.5 s, p90 2.5–3.5 s, inter-update p99 5.24 s over 30k updates; BloFin median 0.02–0.27 s, none needed. Open question for the paper soak: why in-app BloFin REST fallback calls exceed 5 s when the endpoint answers in ~300 ms in isolation (shared aiohttp session; `fresh` vs `shared` sessions measured equal). Follow-up round (both reviews approved, findings folded in): the open question was answered by a probe — with 8 BloFin books5 shards streaming from the same IP, a REST call on a NEW connection has p90 1.4 s / max 4.8 s (SYN-retransmit-shaped tail; bursts of new connections are what suffer) while a call on an already-open keep-alive connection stays ~300 ms even at 10–20 s idle gaps — so `_quote_fallback` now spawns per-leg fetch tasks (the tick never blocks; `_fallback_inflight` dedupe is load-bearing), serializes them per venue on `_rest_locks` so every call reuses the warm pooled connection, touches each venue with open positions every `REST_WARM_S` (10 s) to keep that connection alive, and bounds a call at the venue's FULL staleness budget (a late answer is still a fresh quote — `ts_local` is stamped at receipt — so the half-budget bound of the previous round was too tight: 6 of 22 fallbacks abandoned in the reviewer's run); `Executor.stopping` (set first thing in `shutdown()`) makes `_post_maker` refuse and the TT-upgrade branch discard, so a requote or upgrade whose cancel event lands during the drain can no longer leave a fresh order resting or open a new position (`STOPPING`); `shutdown()` flushes pending Telegram alerts for `NOTIFY_FLUSH_S` after the save (they were dropped when the session closed); `_drain`/`_settle_makers` deadlines run on the loop clock; `_adopt_transients` runs from `run()` AFTER the first market-data refresh so an adopted position's size is re-derived from its legs with known specs (`load_state` no longer adopts); `exit_tm` documents that `_post_maker` resets the maker counters; the README lists every module and names the legacy dashboard's location. Tests: +4 (warm connection + one-call-at-a-time, no re-post on shutdown, TT upgrade dropped on shutdown, alerts flushed) → 178 total. **Task 20 acceptance run (2026-09-05, paper, 9 min, live public feeds, commit 84ea4ba40):** universe 364; coverage mexc 358→362, blofin 267→349 (BloFin ramps over several minutes; no FEED_COVERAGE_LOW); 22 INTENT / 22 TM_POST / 211 TM_REQUOTE / 2 TM_FILL / 14 TM_CANCEL (13 ttl, 1 stale — down from 8 of 12 in the pre-fix run); 7 round trips (6 TT convergence, 1 TM take_profit), net −$0.001; fallback_ok 108 / fallback_timeout 4 (3.6 %, down from 27 %); loop lag p50 1.1 ms / max 21 ms; no tracebacks, no ERROR lines, state saved every ≤ 5 s, `bbo_heartbeat_paper` written; SIGINT → both SHUTDOWN lines, 0 open, exit 0. Soak watch-list: maker TTL cancels dominate (13 of 14) — tune `maker_ttl_s`/peg aggressiveness from soak data, not from the historical live trades. **Final whole-implementation review (2026-09-05; merge gated on two fixes, both landed with the review's Important items):** `ALLOWED[EXIT_MAKER_RESTING]` gains `CLOSED` (a restored exit maker on a venue removed from the registry raised `InvalidTransition` from `_check_position_venues` — a crash loop under `Restart=always` in paper; live raised `VenueMissing` first); `_sweep_stuck_hedging` rescues a HEDGING/EXIT_HEDGING position whose cancel was sent but whose terminal event never arrived (private feed drop, venue status lag): it pulls `query_order` every `HEDGING_SWEEP_AFTER_S` and feeds a terminal state in, and after `HEDGING_STUCK_S` (60 s) of silence degrades the position (`HEDGING_STUCK`, Telegram) so retry_degraded owns it; spec items that had no code — `MAX_NAKED_MS` (`NAKED_EXPOSURE` alert once per position when a maker fill sits unhedged past `max_naked_ms`, funnel `naked_exposure`) and `FEE_MISMATCH` (`_check_fee` on every booked fill: fee > 20 % off the configured rate for its liquidity type → log + funnel `fee_mismatch` + one Telegram per venue per hour); the post-fill spread-quality guard (`MIN_FILL_SPREAD_PCT`) now covers TM entries too (the soak's dominant loss was a maker filled by a market moving through it, hedged after the spread had gone: #4 NOMUSDT −0.45 % fill, −$0.15) — the abort is spawned because `_finalize_maker` holds the position lock; a completed TM exit is labelled by what it realized (`take_profit` only within `TM_EXIT_SLIP_TOL_PCT` of `EXIT_SPREAD_PCT`, else `tm_exit_slipped`, funnel-counted); requotes no longer double-fire (the App stamps `maker_last_requote_ts` synchronously before spawning; budget-denied requotes count as `requote_budget`); `evaluate_resting` cancels a resting entry while halted (`halted`), mirroring `evaluate_exit`; `_book_leg_flat` accumulates the remainder at the mark instead of overwriting a partial exit fill; TM `signal_to_open` is recorded as `signal_to_open_tm` (it includes the resting time); `requirements.txt` is runtime-only (`requirements-dev.txt` adds pytest). Tests: +10 (188 total), each proven red against the previous commit. **Plan 2 carry-forwards from the final review:** the spec's ARM → prewarm `set_leverage` step has no caller (protocol + SimVenue no-op only) — implement it with the live adapters and persist the set of symbols already set; seed `Executor._seq` from a persisted counter so client ids stay unique across restarts; reuse one aiohttp session for Telegram; pin the Python version Tokyo runs (the venv here is 3.14, the spec says 3.12); state saves can reach 2/s (sweep + dirty flag) against the spec's 1/s — harmless, documented; funnel counters mix per-pair and per-direction semantics (`insane`/`mismatch` vs `below_edge`) and `no_candidate` is never counted; `finalize_pnl` prices both legs at the smaller notional (conservative by up to `max_leg_mismatch_pct`); watch BloFin shards for `no data for 127s` reconnects during the soak. **Task 9 re-review round (approved):** nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

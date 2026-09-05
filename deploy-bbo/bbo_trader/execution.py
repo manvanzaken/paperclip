@@ -50,6 +50,10 @@ FLATTEN_LADDER_S = (1.0, 2.0, 5.0, 10.0, 10.0, 10.0)
 DEGRADED_RETRY_S = 30.0
 MAX_CLOSE_RETRIES = 40           # ~20 min of DEGRADED retries, then the position waits for a human
 HEDGING_SWEEP_AFTER_S = 2.0      # a HEDGING position whose maker order is still live this long gets its cancel retried
+HEDGING_STUCK_S = 60.0           # cancel sent, no terminal event, the order query silent this long → DEGRADED (a human is told)
+FEE_MISMATCH_TOL = 0.20          # spec: a fill fee > 20 % off the configured rate for its liquidity type is a FEE_MISMATCH
+FEE_ALERT_EVERY_S = 3600.0       # one FEE_MISMATCH Telegram warning per venue per hour
+TM_EXIT_SLIP_TOL_PCT = 0.05      # a TM exit realized this far above EXIT_SPREAD_PCT is `tm_exit_slipped`, not a take-profit
 #                                  (the sweep runs inside retry_degraded, which the App calls from its 500 ms sweep)
 MAX_CID_LEN = 32                 # MEXC externalOid / BloFin clientOrderId
 STALE_CANCEL_COOLDOWN_S = 5.0    # a maker cancelled for stale quotes must not be re-posted on the very next quote
@@ -92,6 +96,9 @@ class Executor:
         self._tasks: set[asyncio.Task] = set()
         self._notify_tasks: set[asyncio.Task] = set()   # never in the shutdown drain: a hung Telegram must not hold up order legs
         self.stopping = False          # set by App.shutdown(): no NEW order may rest or open once we are going down
+        self._naked_alerted: set[int] = set()
+        self._last_query: dict[int, float] = {}
+        self._fee_alert_ts: dict[str, float] = {}
 
     # ---- plumbing ----------------------------------------------------------------
     def _new_cid(self, pos: Position, leg: str) -> str:
@@ -108,6 +115,8 @@ class Executor:
         while len(self._tracks) > MAX_TRACKS:
             self._tracks.pop(next(iter(self._tracks)))
         self._locks.pop(pos.id, None)
+        self._naked_alerted.discard(pos.id)
+        self._last_query.pop(pos.id, None)
 
     @staticmethod
     def _maker_phase(pos: Position) -> str:
@@ -483,6 +492,7 @@ class Executor:
             return
         if v.trading.supports_amend:
             if not v.budget.try_take("amend", now):
+                self.metrics.funnel["requote_budget"] += 1      # invisible starvation otherwise (shared BloFin bucket)
                 return
             pos.maker_last_requote_ts = now    # stamped on the attempt: a failing amend must not retry every quote
             try:
@@ -497,6 +507,7 @@ class Executor:
                 log.info("TM_REQUOTE_FAILED #%d %s: %s", pos.id, v.name, ack.error)
             return
         if v.budget.available("cancel", now) < 1 or v.budget.available("order", now) < 1:
+            self.metrics.funnel["requote_budget"] += 1
             return
         pos.requote_pending = True
         pos.requote_price = new_price
@@ -727,7 +738,27 @@ class Executor:
         pos.last_close_attempt = self.clock()
         self.book.dirty = True
 
+    def _check_fee(self, pos: Position, venue: str, ev: OrderEvent) -> None:
+        """Spec: a fill whose fee is more than FEE_MISMATCH_TOL off the configured rate for its liquidity type is a
+        FEE_MISMATCH — the edge math runs on those rates, so a changed schedule must be seen, not absorbed."""
+        spec = self._spec(venue, pos.symbol)
+        if spec is None or ev.filled_qty <= 0 or ev.avg_price <= 0 or ev.liquidity not in ("maker", "taker"):
+            return
+        fees = self.venues[venue].fees
+        rate = fees.maker if ev.liquidity == "maker" else fees.taker
+        expected = notional(ev.filled_qty, ev.avg_price, spec) * rate / 100.0
+        if abs(ev.fee - expected) <= max(FEE_MISMATCH_TOL * expected, 1e-6):
+            return
+        self.metrics.funnel["fee_mismatch"] += 1
+        log.warning("FEE_MISMATCH %s %s %s fill: fee $%.6f, configured %.3f%% => $%.6f (%s)", venue, pos.symbol, ev.liquidity,
+                    ev.fee, rate, expected, ev.client_id)
+        now = self.clock()
+        if now - self._fee_alert_ts.get(venue, float("-inf")) >= FEE_ALERT_EVERY_S:
+            self._fee_alert_ts[venue] = now
+            self._say(f"FEE_MISMATCH {venue} {ev.liquidity}: paid ${ev.fee:.6f} vs configured {rate:.3f}% (${expected:.6f}) on {pos.symbol}")
+
     def _accumulate_leg(self, pos: Position, venue: str, phase: str, ev: OrderEvent) -> None:
+        self._check_fee(pos, venue, ev)
         is_a = venue == pos.venue_a
         if phase == "entry":
             q_attr, p_attr = ("filled_a", "entry_price_a") if is_a else ("filled_b", "entry_price_b")
@@ -815,12 +846,19 @@ class Executor:
             if pos.status == MAKER_RESTING:
                 transition(pos, HEDGING)
             transition(pos, OPEN)
-            if pos.signal_ts:
-                self.metrics.record("signal_to_open", (now - pos.signal_ts) * 1000.0)
+            if pos.signal_ts:                     # includes the resting time: kept apart from the TT figure
+                self.metrics.record("signal_to_open_tm", (now - pos.signal_ts) * 1000.0)
             log.info("OPEN #%d %s TM maker=%s fill_spread=%.3f%% size=$%.2f fees=$%.4f", pos.id, pos.symbol,
                      pos.maker_venue, pos.entry_spread_pct, pos.size_usd, pos.entry_fees_usd)
             self._say(f"OPEN #{pos.id} {pos.symbol} TM maker {pos.maker_venue} spread {pos.entry_spread_pct:.3f}% ${pos.size_usd:.2f}")
             self.book.dirty = True
+            if pos.entry_spread_pct < self.cfg.min_fill_spread_pct:
+                # same guard as the TT legs: a maker that filled because the book moved through it, hedged at a
+                # market that had already gone, is the legacy bot's inverted-fill loss — close it, cool the symbol
+                log.warning("FILL_QUALITY_ABORT #%d %s TM fill_spread=%.3f%% < %.3f%%", pos.id, pos.symbol,
+                            pos.entry_spread_pct, self.cfg.min_fill_spread_pct)
+                self.risk.set_cooldown(pos.symbol)
+                self._spawn(self.exit_tt(pos, "fill_quality_abort"))   # spawned: we hold the position lock here
             return
         # exit phase
         if pos.status == DEGRADED:
@@ -864,7 +902,17 @@ class Executor:
             transition(pos, TT_EXITING)
             await self._close_remainder_tt(pos)
             return
-        self._close(pos, pos.exit_reason or "take_profit")
+        self._close(pos, pos.exit_reason or self._tm_exit_reason(pos))
+
+    def _tm_exit_reason(self, pos: Position) -> str:
+        """Label a completed TM exit by what it REALIZED: the maker leg rested at the target but the hedge crossed a
+        market that may have moved — a spread far above EXIT_SPREAD_PCT is a slipped exit, not a take-profit."""
+        if pos.exit_price_a > 0 and pos.exit_price_b > 0:
+            realized = spread_pct(pos.exit_price_a, pos.exit_price_b)
+            if realized > self.cfg.exit_spread_pct + TM_EXIT_SLIP_TOL_PCT:
+                self.metrics.funnel["tm_exit_slipped"] += 1
+                return "tm_exit_slipped"
+        return "take_profit"
 
     # ---- exits ---------------------------------------------------------------------
     async def exit_tm(self, pos: Position, intent: Intent) -> bool:
@@ -958,21 +1006,61 @@ class Executor:
         mark = q.mid if q is not None else (pos.entry_price_a if leg == "a" else pos.entry_price_b)
         log.error("LEG_FLAT_AT_VENUE #%d %s leg %s on %s: venue holds no position — booked closed at mark %s",
                   pos.id, pos.symbol, leg, venue, mark)
-        if leg == "a":
-            pos.exit_filled_a, pos.exit_price_a = pos.filled_a, mark
-        else:
-            pos.exit_filled_b, pos.exit_price_b = pos.filled_b, mark
+        q_attr, p_attr, total = (("exit_filled_a", "exit_price_a", pos.filled_a) if leg == "a"
+                                 else ("exit_filled_b", "exit_price_b", pos.filled_b))
+        done, px = getattr(pos, q_attr), getattr(pos, p_attr)     # the remainder at the mark, a partial exit fill kept
+        rem = max(0.0, round(total - done, 10))
+        setattr(pos, p_attr, (px * done + mark * rem) / total if total > 0 else mark)
+        setattr(pos, q_attr, total)
+
+    def _check_naked(self, pos: Position, now: float) -> None:
+        """Spec: naked exposure is bounded by MAX_NAKED_MS — alert (once per position) when a maker fill has sat
+        unhedged longer than that; the hedge/flatten ladder keeps running, this is the operator's signal."""
+        unhedged = round(pos.maker_filled_qty - pos.hedged_qty, 10)
+        if unhedged <= 1e-12 or not pos.maker_fill_ts or pos.id in self._naked_alerted:
+            return
+        naked_ms = (now - pos.maker_fill_ts) * 1000.0
+        if naked_ms > self.cfg.max_naked_ms:
+            self._naked_alerted.add(pos.id)
+            self.metrics.funnel["naked_exposure"] += 1
+            log.warning("NAKED_EXPOSURE #%d %s: %s maker contracts on %s unhedged for %.0f ms (> %d ms)", pos.id, pos.symbol,
+                        unhedged, pos.maker_venue, naked_ms, self.cfg.max_naked_ms)
+            self._say(f"NAKED_EXPOSURE #{pos.id} {pos.symbol}: {unhedged} contracts unhedged for {naked_ms:.0f} ms")
 
     async def _sweep_stuck_hedging(self, now: float) -> None:
-        """A HEDGING/EXIT_HEDGING position whose maker order is still live (the cancel inside _hedge_delta failed):
-        retry the cancel so no more fills arrive; the fill/cancel events then drive it to finalize."""
+        """A HEDGING/EXIT_HEDGING position whose maker order is still live: retry the cancel (the one inside
+        _hedge_delta failed) so no more fills arrive. If the cancel WAS sent but no terminal event ever came (private
+        feed dropped, venue status lag — both venues do this), pull the order state ourselves and feed it in; a venue
+        silent past HEDGING_STUCK_S hands the position to retry_degraded, which needs no event. Also the naked-exposure
+        alarm."""
         for pos in list(self.book.by_status(HEDGING, EXIT_HEDGING)):
+            self._check_naked(pos, now)
             tr = self._tracks.get(pos.maker_client_id)
             live = tr is not None and (tr.last is None or not tr.last.terminal)
             since = pos.maker_fill_ts or pos.maker_posted_ts
-            if live and not pos.maker_cancel_sent and now - since >= HEDGING_SWEEP_AFTER_S:
+            if not live or now - since < HEDGING_SWEEP_AFTER_S:
+                continue
+            if not pos.maker_cancel_sent:
                 log.warning("HEDGING_SWEEP #%d %s: maker order still live on %s — cancelling", pos.id, pos.symbol, pos.maker_venue)
                 await self._cancel_maker_order(pos, priority=True)
+                continue
+            if now - self._last_query.get(pos.id, float("-inf")) >= HEDGING_SWEEP_AFTER_S:
+                self._last_query[pos.id] = now
+                v = self.venues[pos.maker_venue]
+                try:
+                    ev = await v.trading.query_order(pos.symbol, pos.maker_client_id, pos.maker_order_id)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("query_order failed %s %s: %r", v.name, pos.maker_client_id, e)
+                    ev = None
+                if ev is not None and ev.terminal:
+                    log.warning("HEDGING_SWEEP #%d %s: no terminal event for %s — pulled %s from the venue", pos.id, pos.symbol,
+                                pos.maker_client_id, ev.state)
+                    self.on_order_event(ev)
+                    continue
+            if now - since >= HEDGING_STUCK_S:
+                log.error("HEDGING_STUCK #%d %s: maker order %s on %s reported nothing for %.0fs — DEGRADED, closing what the books show",
+                          pos.id, pos.symbol, pos.maker_client_id, pos.maker_venue, now - since)
+                await self._degrade(pos, "both", f"maker order silent for {now - since:.0f}s")
 
     def adopt_restored(self, pos: Position) -> None:
         """Own a position restored mid-flight (the task behind it died with the process). Whatever its resting order

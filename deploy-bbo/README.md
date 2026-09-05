@@ -17,6 +17,7 @@ cancels resting orders, `data/start.flag` resumes. Telegram: `/stop /start /clos
 
 ## Tests
 
+    .venv/bin/pip install -r requirements-dev.txt
     .venv/bin/python -m pytest -q
 
 ## Layout

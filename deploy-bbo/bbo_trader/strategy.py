@@ -211,6 +211,8 @@ class PairEvaluator:
         base = dict(symbol=pos.symbol, venue_a=pos.venue_a, venue_b=pos.venue_b, maker_venue=pos.maker_venue, ts=now)
         if pos.requote_pending or pos.maker_cancel_sent:
             return none("in_flight")                         # the executor is mid-cancel: any new intent is moot
+        if self.risk.halted:                                 # the halt edge's cancel may have failed: nothing rests while halted
+            return Intent(kind="CANCEL", reason="halted", **base)
         if qa is None or qb is None:
             return Intent(kind="CANCEL", reason="stale", **base)
         if now - pos.maker_posted_ts >= cfg.maker_ttl_s:

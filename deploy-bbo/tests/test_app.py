@@ -510,3 +510,157 @@ async def test_shutdown_flushes_pending_alerts(tmp_path):
     app.executor._say("DEGRADED #1 XYZUSDT: check the venue by hand")
     await app.shutdown()
     assert delivered == ["DEGRADED #1 XYZUSDT: check the venue by hand"]         # the alert survives the process exit
+
+
+# ---- final-review round --------------------------------------------------------------------------------------
+
+async def test_restored_exit_maker_on_a_removed_venue_is_closed_in_paper(tmp_path):
+    app = build_app(tmp_path)
+    app.book.new(SYM, "gate", "mexc", EXIT_MAKER_RESTING, "TT", size_usd=25.0, maker_venue="gate", entry_time=app.clock())
+    app._check_position_venues()                       # EXIT_MAKER_RESTING -> CLOSED must be legal, or this crash-loops under systemd
+    assert app.book.open == [] and app.book.closed[-1].exit_reason == "venue_removed"
+
+
+async def _stuck_hedging(app):
+    """A partial maker fill hedged, the remainder cancelled — but the venue's `canceled` event never arrives."""
+    sim = app.harness.sim("blofin")
+    orig, dropped = sim._handler, []
+
+    def lossy(ev):
+        if ev.state == "canceled":
+            dropped.append(ev)
+            return
+        orig(ev)
+    sim._handler = lossy
+    pos = await _resting_tm(app)
+    await asyncio.sleep(0.005)
+    app.on_bbo(bbo("blofin", 1.0061, 1.0062, 1.0, bq=20.0))        # 50 % of 20 -> 10 of the 20 contracts fill
+    await settle()
+    assert pos.status == "HEDGING" and pos.maker_cancel_sent and dropped and pos.hedged_qty >= 9.9   # residual waits for the terminal
+    return pos
+
+
+async def test_hedging_without_a_terminal_event_is_rescued_by_the_sweep(tmp_path, caplog):
+    import time
+    app = build_app(tmp_path)
+    pos = await _stuck_hedging(app)
+    await app.executor.retry_degraded()                             # too early: nothing to do yet
+    assert pos.status == "HEDGING"
+    app.executor.clock = lambda: time.time() + 3.0                  # past HEDGING_SWEEP_AFTER_S
+    await app.executor.retry_degraded()                             # the sweep asks the venue and feeds the terminal state in
+    await settle()
+    assert pos.status == OPEN and pos.filled_a == 10.0 and pos.filled_b == 1.0 and "pulled canceled" in caplog.text
+
+
+async def test_hedging_on_a_silent_venue_degrades_after_stuck_s(tmp_path, caplog, monkeypatch):
+    import time
+    from bbo_trader import execution
+    app = build_app(tmp_path)
+    pos = await _stuck_hedging(app)
+    sim = app.harness.sim("blofin")
+
+    async def silent(*a, **k):
+        return None
+    sim.query_order = silent
+    app.executor.clock = lambda: time.time() + 61.0                 # past HEDGING_STUCK_S
+    await app.executor.retry_degraded()
+    await settle()
+    assert pos.status == "DEGRADED" and "HEDGING_STUCK" in caplog.text and pos.filled_a == 10.0
+    assert any("DEGRADED #1" in n for n in app.harness.notes)
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    app.harness.quote("blofin", 1.0061, 1.0062)
+    app.harness.quote("mexc", 1.0000, 1.0010)
+    await app.executor.retry_degraded()                             # retry_degraded now owns it: both legs closed
+    await settle()
+    assert pos.status == CLOSED and await sim.positions() == [] and await app.harness.sim("mexc").positions() == []
+
+
+async def test_naked_exposure_alert_fires_once(tmp_path, caplog):
+    app = build_app(tmp_path)
+    now = app.clock()
+    pos = app.book.new(SYM, "blofin", "mexc", "HEDGING", "TM", size_usd=25.0, maker_venue="blofin", maker_side="sell",
+                       maker_client_id="m-1", maker_filled_qty=10.0, hedged_qty=0.0, maker_fill_ts=now - 2.0, entry_time=now)
+    await app.executor.retry_degraded()
+    await asyncio.sleep(0.01)
+    assert f"NAKED_EXPOSURE #{pos.id}" in caplog.text and app.metrics.funnel["naked_exposure"] == 1
+    assert any("NAKED_EXPOSURE" in n for n in app.harness.notes)
+    await app.executor.retry_degraded()
+    assert app.metrics.funnel["naked_exposure"] == 1                 # once per position
+
+
+async def test_fee_mismatch_is_logged_and_alerted_once_per_venue_per_hour(tmp_path, caplog):
+    from dataclasses import replace as dc_replace
+    from tests.conftest import MEXC_FEES
+    app = build_app(tmp_path)
+    h = app.harness
+    app.venues["mexc"].fees = dc_replace(MEXC_FEES, taker=0.05)       # we believe 0.05 %; the venue charges 0.02 %
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    pos = await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0))
+    await asyncio.sleep(0.01)
+    assert "FEE_MISMATCH mexc" in caplog.text and "FEE_MISMATCH blofin" not in caplog.text
+    assert app.metrics.funnel["fee_mismatch"] == 1 and sum("FEE_MISMATCH" in n for n in h.notes) == 1
+    await h.ex.exit_tt(pos, "test")                                  # the exit fill mismatches too: counted, not re-alerted
+    await asyncio.sleep(0.01)
+    assert app.metrics.funnel["fee_mismatch"] == 2 and sum("FEE_MISMATCH" in n for n in h.notes) == 1
+
+
+async def test_fill_quality_abort_covers_tt_and_tm_entries(tmp_path, caplog):
+    app = build_app(tmp_path, min_fill_spread_pct=0.50)             # every realized entry spread below 0.50 % is refused
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    assert await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0)) is None
+    await settle()
+    tt = app.book.closed[-1]
+    assert tt.exit_reason == "fill_quality_abort" and app.risk.cooldowns.get(SYM, 0) > app.clock()
+    assert await h.sim("blofin").positions() == [] and await h.sim("mexc").positions() == []
+    (tmp_path / "tm").mkdir()
+    app = build_app(tmp_path / "tm", min_fill_spread_pct=0.60)      # fresh books (the TT loss blacklisted the symbol); TM realizes 0.51 %
+    h = app.harness
+    pos = await _resting_tm(app)                                     # TM: the maker fills, the hedge lands, the spread is poor
+    await asyncio.sleep(0.005)
+    app.on_bbo(bbo("blofin", 1.0061, 1.0062, 1.0, bq=100.0))
+    await settle()
+    assert pos.status == CLOSED and pos.exit_reason == "fill_quality_abort" and "FILL_QUALITY_ABORT #%d %s TM" % (pos.id, SYM) in caplog.text
+    assert await h.sim("blofin").positions() == [] and await h.sim("mexc").positions() == []
+
+
+async def test_tm_exit_reason_labels_slipped_exits(tmp_path):
+    app = build_app(tmp_path)
+    pos = app.book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, exit_price_a=1.0010, exit_price_b=1.0000)
+    assert app.executor._tm_exit_reason(pos) == "take_profit"        # realized 0.10 % <= 0.15 % target
+    pos.exit_price_a = 1.0060                                         # realized 0.60 %: the hedge crossed a market that had moved
+    assert app.executor._tm_exit_reason(pos) == "tm_exit_slipped" and app.metrics.funnel["tm_exit_slipped"] == 1
+
+
+async def test_requote_is_not_double_fired_before_the_task_runs(tmp_path):
+    import time
+    app = build_app(tmp_path)
+    pos = await _resting_tm(app)
+    requotes = _count_calls(app.executor, "requote")
+    t1 = time.time() + 1.5                                            # past blofin's 1 s min requote gap
+    app.clock = app.evaluator.clock = lambda: t1
+    app.on_bbo(bbo("blofin", 1.0043, 1.0065, 1.0))                   # the peg moved: one requote
+    app.on_bbo(bbo("blofin", 1.0043, 1.0065, 1.0))                   # the same book again before that task ran
+    await settle()
+    assert len(requotes) == 1 and pos.maker_rest_price != 1.0061
+
+
+async def test_halt_cancels_a_resting_entry_even_if_the_sweep_cancel_failed(tmp_path):
+    app = build_app(tmp_path)
+    pos = await _resting_tm(app)
+    app.risk.halt("test")                                             # the halt edge's cancel_all_resting did not reach this order
+    app._drive(pos)
+    await settle()
+    assert app.book.open == [] and app.metrics.funnel["maker_cancelled"] == 1
+
+
+async def test_book_leg_flat_accumulates_a_partial_exit(tmp_path):
+    app = build_app(tmp_path)
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    pos = app.book.new(SYM, "blofin", "mexc", OPEN, "TT", size_usd=25.0, filled_a=20.0, exit_filled_a=5.0, exit_price_a=1.0010,
+                       entry_time=app.clock())
+    app.executor._book_leg_flat(pos, "a", "blofin")
+    assert pos.exit_filled_a == 20.0 and pos.exit_price_a == pytest.approx((1.0010 * 5 + 1.0055 * 15) / 20)   # mark = mid

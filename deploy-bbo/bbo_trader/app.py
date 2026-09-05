@@ -211,6 +211,7 @@ class App:
             log.info("STOPPING #%d %s: %s refused, cancel_all_resting/TT exits only", pos.id, pos.symbol, it.kind)
             return
         if it.kind == "REQUOTE":
+            pos.maker_last_requote_ts = self.clock()     # stamped NOW: the next quote must not spawn a second requote
             self._spawn(self.executor.requote(pos, it.rest_price))
         elif it.kind == "CANCEL":
             self._spawn(self.executor.cancel_maker(pos, it.reason))
