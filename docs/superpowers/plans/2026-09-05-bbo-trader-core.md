@@ -5452,7 +5452,7 @@ import asyncio
 
 import pytest
 
-from bbo_trader.models import Intent, OPEN, CLOSED, MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING
+from bbo_trader.models import Intent, OPEN, CLOSED, MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, OrderAck
 from tests.test_execution_tt import Harness, SYM
 
 
