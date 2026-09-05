@@ -30,8 +30,13 @@ log = logging.getLogger("bbo.app")
 SHUTDOWN_DRAIN_S = 15.0        # worst case per taker leg: EVENT_GRACE_S 1.5 + POLL_MAX_S 5, twice
 SHUTDOWN_CANCEL_S = 10.0       # a hung venue must not cost us the final state save
 SHUTDOWN_SETTLE_S = 5.0        # cancel acks arrive as order events; a save before them persists a status a restart calls stuck
+NOTIFY_FLUSH_S = 3.0           # after the save: let alerts raised during the drain reach Telegram before the session closes
 CLOSE_ALL_DRAIN_S = 10.0       # /close_all lets in-flight entries land first, or they open behind our back
-QUOTE_REFRESH_FRAC = 0.5       # REST-refresh an open position's leg at half the staleness budget, and give the call that long
+QUOTE_REFRESH_FRAC = 0.5       # REST-refresh an open position's leg once its quote is past half the staleness budget
+REST_WARM_S = 10.0             # while positions are open, touch each venue's REST at least this often so the pooled
+                               # connection stays warm (aiohttp drops it after 15 s idle): a fallback on a cold connection
+                               # pays a new TLS handshake, and bursts of those from an IP already streaming 8+ WS shards
+                               # to the same host showed SYN-retransmit tails of 1-5 s (probe 2026-09-05) — past the budget
 _MAKER_FLOW = (MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, EXIT_HEDGING)
 _STOPPING_REFUSES = ("REQUOTE", "TM_EXIT", "UPGRADE_TT")   # no NEW order may rest or open once we are shutting down
 UNIVERSE_RETRY_S = 60.0        # market-data refresh cadence while the universe is empty (start-up blip)
@@ -54,7 +59,10 @@ class App:
         self._pending_entries: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
         self._notify_tasks: set[asyncio.Task] = set()
+        self._fallback_tasks: set[asyncio.Task] = set()
         self._fallback_inflight: set[tuple[str, str]] = set()
+        self._rest_locks: dict[str, asyncio.Lock] = {}      # one fallback REST call per venue at a time: reuse the warm connection
+        self._last_rest: dict[str, float] = {}
         self._last_state_save = 0.0
         self._scanner: list[dict] = []
         self._last_scan = 0.0
@@ -62,29 +70,25 @@ class App:
         self.running = True
 
     # ---- helpers ------------------------------------------------------------------
-    def _spawn(self, coro: Awaitable) -> None:
+    def _spawn_into(self, coro: Awaitable, tasks: set, label: str) -> None:
         async def guard():
             try:
                 await coro
             except Exception:  # noqa: BLE001
-                log.exception("APP_TASK_ERROR")
+                log.exception("%s", label)
         t = asyncio.get_running_loop().create_task(guard())
-        self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
+    def _spawn(self, coro: Awaitable) -> None:
+        """Order tasks (entries, exits, hedges): the shutdown drain waits for these."""
+        self._spawn_into(coro, self._tasks, "APP_TASK_ERROR")
 
     def _notify(self, text: str) -> None:
-        """Telegram sends live in their own set: the shutdown drain waits for order legs, never for a hung send."""
-        if self.telegram is None:
-            return
-
-        async def guard():
-            try:
-                await self.telegram.send(text)
-            except Exception:  # noqa: BLE001
-                log.exception("NOTIFY_ERROR")
-        t = asyncio.get_running_loop().create_task(guard())
-        self._notify_tasks.add(t)
-        t.add_done_callback(self._notify_tasks.discard)
+        """Telegram sends live in their own set: the shutdown drain waits for order legs, never for a hung send;
+        `shutdown()` flushes them after the save."""
+        if self.telegram is not None:
+            self._spawn_into(self.telegram.send(text), self._notify_tasks, "NOTIFY_ERROR")
 
     @property
     def n_trade_venues(self) -> int:
@@ -113,13 +117,15 @@ class App:
         return t
 
     async def _drain(self, timeout: float) -> None:
-        """Wait for in-flight order tasks (entries, exits, hedges) so the book matches the venues before we act."""
-        deadline = self.clock() + timeout
+        """Wait for in-flight order tasks (entries, exits, hedges) so the book matches the venues before we act.
+        Deadlines run on the loop clock, not `self.clock` (a frozen test clock must not spin this forever)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while True:
             pending = [t for t in (self._tasks | self.executor._tasks) if not t.done()]
             if not pending:
                 return
-            left = deadline - self.clock()
+            left = deadline - loop.time()
             if left <= 0:
                 log.error("DRAIN_TIMEOUT %d order tasks unfinished after %.0fs — state may lag the venues", len(pending), timeout)
                 return
@@ -129,13 +135,14 @@ class App:
         """After cancel_all_resting: the acks arrive as order events and finalize in their own tasks. Wait until no
         position is in a maker-flow status (and nothing is in flight) so the saved state says OPEN/CLOSED, not a
         MAKER_RESTING a restart would adopt as stuck and an operator would be told to check by hand."""
-        deadline = self.clock() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while True:
             pending = [t for t in (self._tasks | self.executor._tasks) if not t.done()]
             unsettled = self.book.by_status(*_MAKER_FLOW)
             if not pending and not unsettled:
                 return
-            if self.clock() >= deadline:
+            if loop.time() >= deadline:
                 log.warning("SHUTDOWN_UNSETTLED %d maker-flow positions, %d tasks still pending after %.0fs — saving anyway",
                             len(unsettled), len(pending), timeout)
                 return
@@ -351,7 +358,6 @@ class App:
         self.book.load(d)
         self.risk.load(d.get("risk") or {})
         self._check_position_venues()
-        self._adopt_transients()
         log.info("STATE loaded: %d open, %d closed, pnl=$%.2f halted=%s", len(self.book.open), len(self.book.closed),
                  self.book.total_pnl_usd, self.risk.halted)
 
@@ -367,7 +373,8 @@ class App:
           exit is re-decided.
         None of this asks the venue: a zero-fill transient closes as `recovered` on our books alone, and a resting
         order at a live venue is only reported. Live reconciliation (Plan 2) must query positions and open orders at
-        start-up before trusting any of it."""
+        start-up before trusting any of it. `run()` calls this AFTER the first market-data refresh so the specs are
+        known and an adopted position's size is re-derived from the legs it really holds."""
         now = self.clock()
         for pos in list(self.book.open):
             maker_fill = pos.maker_filled_qty > 1e-12 or pos.maker_booked_qty > 1e-12
@@ -446,34 +453,15 @@ class App:
                 self.risk.set_balance(v.name, bal.get("available", 0.0), bal.get("total", 0.0))
 
     async def _quote_fallback(self) -> None:
-        """Open positions must never depend on WS health: REST-refresh a leg at HALF the staleness budget (a resting
-        maker is cancelled the moment a leg reads stale, so refreshing only after the boundary always loses that
-        race) and give the call that same half — an answer after the boundary is useless, and the adapters' 5 s
-        timeout let one hung request sit through the whole budget. One fetch per leg in flight; the next 0.5 s tick
-        retries after a timeout on a fresh connection."""
+        """Open positions must never depend on WS health. Every 0.5 s, for each open position's leg: REST-refresh it
+        once its quote is past half the staleness budget (a resting maker is cancelled the moment a leg reads stale,
+        so refreshing only after the boundary always loses that race), and refresh one leg per venue every
+        `REST_WARM_S` regardless so the pooled connection stays warm. Fetches run as their own tasks — one per leg in
+        flight, one REST call per venue at a time so each reuses that warm connection — bounded by the venue's full
+        staleness budget: a late answer is still a fresh quote (ts_local is stamped at receipt), so the bound only
+        caps how long a hung call blocks the leg's retry, and a hung call never delays the tick or the other legs."""
         now = self.clock()
-
-        async def one(v: Venue, symbol: str, budget: float) -> None:
-            key = (v.name, symbol)
-            self._fallback_inflight.add(key)
-            try:
-                bbo = await asyncio.wait_for(v.market.fetch_bbo(symbol), budget)
-            except asyncio.TimeoutError:
-                n = self.metrics.funnel["fallback_timeout"] = self.metrics.funnel["fallback_timeout"] + 1
-                if n in (1, 10, 100) or n % 1000 == 0:
-                    log.warning("QUOTE_FALLBACK_TIMEOUT #%d %s %s: no answer within %.1fs (leg reads stale at %.1fs)",
-                                n, v.name, symbol, budget, self.board.stale_for(v.name))
-                return
-            except Exception as e:  # noqa: BLE001
-                self.metrics.funnel["fallback_failed"] += 1
-                log.warning("QUOTE_FALLBACK_FAILED %s %s: %r", v.name, symbol, e)
-                return
-            finally:
-                self._fallback_inflight.discard(key)
-            if bbo is not None:
-                self.metrics.funnel["fallback_ok"] += 1
-                self.on_bbo(bbo)
-        jobs = []
+        warmed: set[str] = set()
         for pos in list(self.book.open):
             for venue in (pos.venue_a, pos.venue_b):
                 v = self.venues.get(venue)
@@ -481,12 +469,38 @@ class App:
                     continue
                 q = self.board.get(venue, pos.symbol)
                 age = (now - q.ts_local) if q is not None else float("inf")
-                budget = self.board.stale_for(venue) * QUOTE_REFRESH_FRAC
-                if age < budget:
+                warm = venue not in warmed and now - self._last_rest.get(venue, 0.0) >= REST_WARM_S
+                if age < self.board.stale_for(venue) * QUOTE_REFRESH_FRAC and not warm:
                     continue
-                jobs.append(one(v, pos.symbol, budget))
-        if jobs:
-            await asyncio.gather(*jobs)
+                warmed.add(venue)
+                self._last_rest[venue] = now
+                self._fallback_inflight.add((venue, pos.symbol))
+                self._spawn_into(self._fetch_quote(v, pos.symbol), self._fallback_tasks, "QUOTE_FALLBACK_ERROR")
+
+    async def _fetch_quote(self, v: Venue, symbol: str) -> None:
+        key = (v.name, symbol)
+        budget = self.board.stale_for(v.name)
+        lock = self._rest_locks.setdefault(v.name, asyncio.Lock())
+
+        async def fetch():
+            async with lock:
+                return await v.market.fetch_bbo(symbol)
+        try:
+            bbo = await asyncio.wait_for(fetch(), budget)
+        except asyncio.TimeoutError:
+            n = self.metrics.funnel["fallback_timeout"] = self.metrics.funnel["fallback_timeout"] + 1
+            if n in (1, 10, 100) or n % 1000 == 0:
+                log.warning("QUOTE_FALLBACK_TIMEOUT #%d %s %s: no answer within %.1fs", n, v.name, symbol, budget)
+            return
+        except Exception as e:  # noqa: BLE001
+            self.metrics.funnel["fallback_failed"] += 1
+            log.warning("QUOTE_FALLBACK_FAILED %s %s: %r", v.name, symbol, e)
+            return
+        finally:
+            self._fallback_inflight.discard(key)
+        if bbo is not None:
+            self.metrics.funnel["fallback_ok"] += 1
+            self.on_bbo(bbo)
 
     async def _poll_telegram(self) -> None:
         if self.telegram is None:
@@ -501,6 +515,7 @@ class App:
     async def run(self) -> None:
         self.load_state()
         await self.refresh_market_data()
+        self._adopt_transients()
         await self.refresh_funding()
         for v in self.venues.values():
             if v.private is not None:
@@ -529,15 +544,17 @@ class App:
                 await asyncio.sleep(0.5)
         finally:
             await self.shutdown()
-            for t in tasks:
+            stragglers = [*tasks, *self._fallback_tasks]
+            for t in stragglers:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*stragglers, return_exceptions=True)
 
     async def shutdown(self) -> None:
         """Drain in-flight order tasks (an entry must land before we cancel and save, or the state file says we hold
         nothing while both legs sit at the venues), cancel every resting order with a timeout, wait for the cancels
-        to settle, save, and say so."""
+        to settle, save, say so, then give pending alerts a moment to reach Telegram."""
         log.info("SHUTDOWN draining in-flight order tasks, cancelling resting orders, saving state")
+        self.executor.stopping = True            # a requote/upgrade completing during the drain posts nothing new
         await self._drain(SHUTDOWN_DRAIN_S)
         try:
             await asyncio.wait_for(self.executor.cancel_all_resting(), SHUTDOWN_CANCEL_S)
@@ -548,3 +565,6 @@ class App:
             await self.save_state(self.clock())
         log.info("SHUTDOWN complete: %d open, trades=%d pnl=$%+.2f, state saved",
                  len(self.book.open), self.book.total_trades, self.book.total_pnl_usd)
+        alerts = [t for t in (self._notify_tasks | self.executor._notify_tasks) if not t.done()]
+        if alerts:                               # the DEGRADED / ORDER_UNRESOLVED raised during the drain must still go out
+            await asyncio.wait(alerts, timeout=NOTIFY_FLUSH_S)

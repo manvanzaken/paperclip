@@ -91,6 +91,7 @@ class Executor:
         self._locks: dict[int, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
         self._notify_tasks: set[asyncio.Task] = set()   # never in the shutdown drain: a hung Telegram must not hold up order legs
+        self.stopping = False          # set by App.shutdown(): no NEW order may rest or open once we are going down
 
     # ---- plumbing ----------------------------------------------------------------
     def _new_cid(self, pos: Position, leg: str) -> str:
@@ -418,6 +419,9 @@ class Executor:
         return pos
 
     async def _post_maker(self, pos: Position, reduce_only: bool, keep_posted_ts: bool = False) -> bool:
+        if self.stopping:                      # a requote or entry landing mid-shutdown must not leave a fresh order resting
+            log.info("STOPPING #%d %s: maker order not posted", pos.id, pos.symbol)
+            return False
         v = self.venues[pos.maker_venue]
         now = self.clock()
         if not v.budget.try_take("order", now):
@@ -785,16 +789,19 @@ class Executor:
                         return
                 if pos.upgrade_pending and pos.status == MAKER_RESTING:
                     pos.upgrade_pending = False
-                    pos.mode = "TT"
-                    qa, qb = self.board.get(pos.venue_a, pos.symbol), self.board.get(pos.venue_b, pos.symbol)
-                    if qa is not None and qb is not None and spec_a is not None and spec_b is not None:
-                        legs = size_pair(pos.size_usd, qa.bid, qb.ask, spec_a, spec_b, self.cfg.max_leg_mismatch_pct,
-                                         min_usd=self.cfg.min_position_usd)     # re-size at the CURRENT touch
-                        if legs is not None:
-                            pos.qty_a, pos.qty_b = legs.qty_a, legs.qty_b
-                    transition(pos, TT_ENTERING)
-                    await self._tt_legs(pos)
-                    return
+                    if self.stopping:              # no NEW position may open during shutdown: the discard below
+                        log.info("STOPPING #%d %s: TT upgrade dropped", pos.id, pos.symbol)
+                    else:
+                        pos.mode = "TT"
+                        qa, qb = self.board.get(pos.venue_a, pos.symbol), self.board.get(pos.venue_b, pos.symbol)
+                        if qa is not None and qb is not None and spec_a is not None and spec_b is not None:
+                            legs = size_pair(pos.size_usd, qa.bid, qb.ask, spec_a, spec_b, self.cfg.max_leg_mismatch_pct,
+                                             min_usd=self.cfg.min_position_usd)     # re-size at the CURRENT touch
+                            if legs is not None:
+                                pos.qty_a, pos.qty_b = legs.qty_a, legs.qty_b
+                        transition(pos, TT_ENTERING)
+                        await self._tt_legs(pos)
+                        return
                 self.metrics.funnel["maker_cancelled"] += 1
                 self.book.discard(pos)
                 self._forget(pos)
@@ -861,6 +868,9 @@ class Executor:
 
     # ---- exits ---------------------------------------------------------------------
     async def exit_tm(self, pos: Position, intent: Intent) -> bool:
+        """Rest the exit's maker leg. `_post_maker` zeroes the maker counters (`maker_filled_qty`, `hedged_qty`,
+        `maker_booked_qty`, fees) on every post, so on an EXIT_MAKER_RESTING position they describe the EXIT fill —
+        `App._adopt_transients` relies on that to tell a filled exit maker from an unfilled one."""
         if pos.status != OPEN or intent.maker_venue not in (pos.venue_a, pos.venue_b):
             return False
         mv = intent.maker_venue

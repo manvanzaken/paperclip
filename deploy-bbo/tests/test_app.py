@@ -178,6 +178,7 @@ async def test_restored_transient_positions_are_adopted(tmp_path, monkeypatch):
     await app.save_state(now)
     app2 = build_app(tmp_path)
     app2.load_state()
+    app2._adopt_transients()                                        # run() does this after the first market-data refresh
     assert sorted(p.status for p in app2.book.open) == ["DEGRADED"] * 4 + [OPEN]   # resting entry discarded, exit maker reopened
     reopened = [p for p in app2.book.open if p.status == OPEN][0]
     assert reopened.maker_client_id == "" and reopened.maker_venue == ""
@@ -238,10 +239,13 @@ async def test_quote_fallback_refreshes_before_the_stale_boundary(tmp_path):
             calls.append(symbol)
             return mk_bbo("mexc", SYM, 1.0001, 1.0009, contract_size=10.0)
     app.venues["mexc"].market = FakeMarket()
+    app._last_rest["mexc"] = app.clock()                            # connection already warm
     await app._quote_fallback()
+    await settle()
     assert calls == []                                              # fresh leg: no REST call
     app.clock = lambda: time.time() + 1.2                           # the mexc leg is 1.2 s old: past half of the 2 s budget
     await app._quote_fallback()
+    await settle()
     assert calls == [SYM] and app.board.get("mexc", SYM).bid == 1.0001   # refreshed before it could read stale
 
 
@@ -263,9 +267,11 @@ async def test_restored_maker_fills_are_booked_not_discarded(tmp_path, monkeypat
     await app.save_state(now)
     app2 = build_app(tmp_path)
     app2.load_state()
+    app2._adopt_transients()
     p1, p2, p3 = sorted(app2.book.open, key=lambda p: p.id)
     assert [p.status for p in (p1, p2, p3)] == ["DEGRADED"] * 3
     assert p1.filled_a == 12.0 and p1.entry_price_a == pytest.approx(1.006) and p1.entry_fees_usd == pytest.approx(0.002)
+    assert p1.size_usd == pytest.approx(12.0 * 1.006)                    # sized by what it really holds (specs known by then)
     assert p2.filled_a == 20.0 and p2.filled_b == 2.0                    # the maker leg is on the books before retry_degraded looks
     assert p3.exit_filled_a == 5.0 and p3.filled_a == 20.0               # the exit fill reduced leg a: 15 remain to close
     monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
@@ -278,7 +284,7 @@ async def test_restored_maker_fills_are_booked_not_discarded(tmp_path, monkeypat
 
 async def test_quote_fallback_abandons_a_hung_fetch_within_the_budget(tmp_path, caplog):
     import time
-    app = build_app(tmp_path, stale_quote_s=0.4)                         # refresh at 0.2 s, and give the call 0.2 s
+    app = build_app(tmp_path, stale_quote_s=0.4)                         # refresh at 0.2 s, give the call the full 0.4 s
     h = app.harness
     h.quote("blofin", 1.0050, 1.0060)
     h.quote("mexc", 1.0000, 1.0008)
@@ -294,11 +300,12 @@ async def test_quote_fallback_abandons_a_hung_fetch_within_the_budget(tmp_path, 
     app.venues["blofin"].market = HungMarket()
     app.clock = lambda: time.time() + 0.3                                # the blofin leg is 0.3 s old: past half the budget
     t0 = time.time()
-    first = asyncio.create_task(app._quote_fallback())
+    await app._quote_fallback()                                          # spawns the fetch; the tick itself never blocks
+    assert time.time() - t0 < 0.05 and len(app._fallback_tasks) == 1
     await asyncio.sleep(0.05)
     await app._quote_fallback()                                          # the next tick while the fetch is in flight: no duplicate
-    await first
-    assert time.time() - t0 < 0.5 and calls == [SYM]                    # abandoned at the bound, not at the adapter's 5 s
+    await asyncio.gather(*app._fallback_tasks)
+    assert time.time() - t0 < 0.7 and calls == [SYM]                    # abandoned at the bound, not at the adapter's 5 s
     assert app.metrics.funnel["fallback_timeout"] == 1 and "QUOTE_FALLBACK_TIMEOUT" in caplog.text
     assert not app._fallback_inflight
 
@@ -403,3 +410,103 @@ async def test_stale_cancel_puts_the_symbol_on_a_short_cooldown(tmp_path):
     await settle()
     assert app.book.open == [] and app.metrics.funnel["maker_cancelled"] == 1
     assert 4.0 < app.risk.cooldowns[SYM] - time.time() <= 5.0            # STALE_CANCEL_COOLDOWN_S, not the 60 s entry-failure one
+
+
+async def test_quote_fallback_keeps_one_warm_rest_connection_per_venue(tmp_path):
+    import time
+    from tests.conftest import mk_spec
+    app = build_app(tmp_path)
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0))
+    other = "ABCUSDT"
+    for name, cs in (("blofin", 1.0), ("mexc", 10.0)):
+        app.venues[name].specs[other] = mk_spec(name, other, contract_size=cs)
+    app.book.new(other, "blofin", "mexc", OPEN, "TT", size_usd=25.0, filled_a=20.0, filled_b=2.0, entry_time=app.clock())
+    seen, inflight, peak = [], [0], [0]
+
+    class SlowMarket:
+        specs = {}
+
+        async def fetch_bbo(self, symbol):
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+            await asyncio.sleep(0.02)
+            inflight[0] -= 1
+            seen.append(symbol)
+            return mk_bbo("blofin", symbol, 1.0050, 1.0060, ts=app.clock())
+    app.venues["blofin"].market = SlowMarket()
+    for sym in (SYM, other):
+        app.board.set(mk_bbo("blofin", sym, 1.0050, 1.0060, ts=app.clock()))      # both blofin legs fresh...
+    await app._quote_fallback()
+    await settle()
+    assert seen == [SYM]                                                        # ...one warm-up call for the venue anyway
+    await app._quote_fallback()
+    await settle()
+    assert seen == [SYM]                                                        # warm within REST_WARM_S: nothing
+    t1 = time.time() + 1.5                                                      # both legs read 1.5 s old: past half the budget
+    app.clock = lambda: t1
+    await app._quote_fallback()
+    await asyncio.gather(*app._fallback_tasks)
+    assert sorted(seen[1:]) == [other, SYM] and peak[0] == 1                    # both refreshed, one call at a time
+    assert app.board.get("blofin", SYM).ts_local == t1 and app.metrics.funnel["fallback_ok"] == 3
+
+
+async def _resting_tm(app):
+    app.on_bbo(bbo("mexc", 1.0000, 1.0010, 10.0))
+    app.on_bbo(bbo("blofin", 1.0041, 1.0061, 1.0))
+    await settle()
+    pos = app.book.open[0]
+    assert pos.status == MAKER_RESTING
+    return pos
+
+
+def _count_calls(obj, name):
+    calls = []
+    orig = getattr(obj, name)
+
+    async def wrapped(*a, **k):
+        calls.append(a)
+        return await orig(*a, **k)
+    setattr(obj, name, wrapped)
+    return calls
+
+
+async def test_shutdown_does_not_repost_a_requoted_maker(tmp_path):
+    """A requote sends the cancel and returns; its `canceled` event lands during shutdown and finalize would post the
+    new price — a fresh order resting at the venue after the sweep that was supposed to clear it."""
+    app = build_app(tmp_path)
+    pos = await _resting_tm(app)
+    app.harness.sim("blofin").supports_amend = False                            # the cancel + new-order requote path
+    posts = _count_calls(app.harness.sim("blofin"), "place_post_only")
+    app.running = False
+    app._spawn(app.executor.requote(pos, 1.0063))
+    await app.shutdown()
+    assert posts == [] and app.book.open == []                                  # discarded, nothing re-posted
+    state = json.loads((tmp_path / "real_state.json").read_text())
+    assert state["open_positions"] == [] and app.harness.sim("blofin")._resting.get(SYM, {}) == {}
+
+
+async def test_shutdown_drops_a_pending_tt_upgrade(tmp_path):
+    app = build_app(tmp_path)
+    pos = await _resting_tm(app)
+    markets = _count_calls(app.harness.sim("blofin"), "place_market") + _count_calls(app.harness.sim("mexc"), "place_market")
+    app.running = False
+    app._spawn(app.executor.upgrade_to_tt(pos))
+    await app.shutdown()
+    assert markets == [] and app.book.open == [] and app.book.closed == []      # no new position opens on the way down
+
+
+async def test_shutdown_flushes_pending_alerts(tmp_path):
+    app = build_app(tmp_path)
+    delivered = []
+
+    async def slow_notify(text):
+        await asyncio.sleep(0.1)
+        delivered.append(text)
+    app.executor.notify = slow_notify
+    app.running = False
+    app.executor._say("DEGRADED #1 XYZUSDT: check the venue by hand")
+    await app.shutdown()
+    assert delivered == ["DEGRADED #1 XYZUSDT: check the venue by hand"]         # the alert survives the process exit

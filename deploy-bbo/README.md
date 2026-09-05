@@ -10,8 +10,8 @@ Spec: `docs/superpowers/specs/2026-09-05-bbo-taker-maker-trader-design.md`.
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     ./start.sh                     # MODE=paper DATA_DIR=./data
 
-State: `data/real_state.json` (same schema as the legacy dashboard reads — run `dashboard.py` with
-`DATA_DIR=<this data dir>`). Log: `data/bbo_trader_paper.log`. Heartbeat: `data/bbo_heartbeat_paper` (never
+State: `data/real_state.json` (same schema as the legacy dashboard reads — that dashboard is `deploy-live/dashboard.py`,
+a separate component on the legacy bot's branch; run it with `DATA_DIR=<this data dir>`). Log: `data/bbo_trader_paper.log`. Heartbeat: `data/bbo_heartbeat_paper` (never
 `heartbeat_live`, which belongs to the legacy bot; DATA_DIR must not be the legacy bot's data dir — refused with exit 5). Flags: `data/stop.flag` halts entries and
 cancels resting orders, `data/start.flag` resumes. Telegram: `/stop /start /close_all /status`.
 
@@ -21,9 +21,13 @@ cancels resting orders, `data/start.flag` resumes. Telegram: `/stop /start /clos
 
 ## Layout
 
-`bbo_trader/edge.py` (pure edge math) · `strategy.py` (gates → intents) · `execution.py` (TT + pegged
-maker flows) · `positions.py` (state machine + state file) · `venues/` (protocols, WS runner, MEXC,
-BloFin, SimVenue, registry) · `app.py` (wiring + sweep) · `main.py` (entry point).
+`bbo_trader/config.py` (env → Config, venues.json) · `models.py` (BBO, Position, Intent, order events) ·
+`quotes.py` (QuoteBoard, staleness) · `edge.py` (pure edge math) · `sizing.py` (lot sizing, hedge plan) ·
+`budget.py` (per-venue rate budget) · `strategy.py` (gates → intents) · `risk.py` (halt flags, pair stats,
+cooldowns, funding gate) · `execution.py` (TT + pegged maker flows) · `positions.py` (state machine + state
+file) · `discovery.py` (universe) · `metrics.py` (latency, funnel, coverage watchdog) · `notify.py` (Telegram) ·
+`venues/` (protocols, WS runner, MEXC, BloFin, SimVenue, registry) · `app.py` (wiring + sweep) · `main.py`
+(entry point).
 
 ## Config
 
