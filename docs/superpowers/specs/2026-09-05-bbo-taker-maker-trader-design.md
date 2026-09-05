@@ -75,7 +75,7 @@ deploy-bbo/
 │   ├── reconcile.py     # startup + periodic reconciliation vs exchange truth
 │   ├── metrics.py       # latency histograms, feed coverage watchdog
 │   ├── notify.py        # Telegram
-│   ├── venues/base.py   # Venue protocols: PublicFeed, PrivateFeed, Trading, Specs
+│   ├── venues/base.py   # Venue protocols: PublicFeed, PrivateFeed, Trading, MarketData
 │   ├── venues/registry.py  # builds venues from config/venues.json + env keys
 │   ├── venues/ws.py     # generic sharded WS runner (uptime-keyed backoff, app pings)
 │   ├── venues/mexc.py, venues/blofin.py          # full adapters (public + private + trading)
