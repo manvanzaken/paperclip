@@ -90,6 +90,7 @@ class Executor:
         self._seq = itertools.count(1)
         self._locks: dict[int, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._notify_tasks: set[asyncio.Task] = set()   # never in the shutdown drain: a hung Telegram must not hold up order legs
 
     # ---- plumbing ----------------------------------------------------------------
     def _new_cid(self, pos: Position, leg: str) -> str:
@@ -128,7 +129,9 @@ class Executor:
 
     def _say(self, text: str) -> None:
         if self.notify is not None:
-            self._spawn(self.notify(text))
+            t = asyncio.get_running_loop().create_task(self._guard(self.notify(text)))
+            self._notify_tasks.add(t)
+            t.add_done_callback(self._notify_tasks.discard)
 
     def _note_rate_limit(self, venue: str, error: str) -> None:
         e = (error or "").lower()
@@ -960,6 +963,25 @@ class Executor:
             if live and not pos.maker_cancel_sent and now - since >= HEDGING_SWEEP_AFTER_S:
                 log.warning("HEDGING_SWEEP #%d %s: maker order still live on %s — cancelling", pos.id, pos.symbol, pos.maker_venue)
                 await self._cancel_maker_order(pos, priority=True)
+
+    def adopt_restored(self, pos: Position) -> None:
+        """Own a position restored mid-flight (the task behind it died with the process). Whatever its resting order
+        had filled goes on its leg FIRST — a HEDGING/EXIT_HEDGING save predates `_finalize_maker`, a MAKER_RESTING
+        save can predate the hedge task — then retry_degraded closes what the books show. In paper the venue holds
+        nothing (booked flat via `nothing to reduce`); live reconciliation (Plan 2) must confirm the venue side and
+        cancel or adopt the resting order itself. Specs are usually not loaded yet at this point, so the size is only
+        re-derived from the legs when they are."""
+        if pos.maker_venue and pos.status in (MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, EXIT_HEDGING):
+            self._apply_maker_leg(pos, "entry" if pos.status in (MAKER_RESTING, HEDGING) else "exit")
+            self._resize_from_legs(pos, self._spec(pos.venue_a, pos.symbol), self._spec(pos.venue_b, pos.symbol))
+        if pos.status == MAKER_RESTING:                   # the state machine walks resting -> hedging -> degraded
+            transition(pos, HEDGING)
+        elif pos.status == EXIT_MAKER_RESTING:
+            transition(pos, EXIT_HEDGING)
+        if pos.status != DEGRADED:
+            transition(pos, DEGRADED)
+        pos.degraded_leg, pos.last_close_attempt = "both", 0.0
+        self.book.dirty = True
 
     async def retry_degraded(self) -> None:
         now = self.clock()

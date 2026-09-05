@@ -1,9 +1,10 @@
 """App: wires quotes → strategy → executor, runs the periodic sweep, persists state, handles operator commands.
 
 Process-boundary discipline (the soak restarts under systemd): shutdown DRAINS in-flight order tasks before it
-cancels resting orders and saves, so the state file never lags the venues; every status that can be persisted is
-owned by some loop after a restart (`_adopt_transients`); a task that dies stops the process loudly
-(`TASK_DIED`) so systemd restarts it with fresh sockets instead of letting it run blind."""
+cancels resting orders, waits for those cancels to settle, then saves, so the state file does not lag the venues;
+every status that can be persisted is owned by some loop after a restart (`_adopt_transients`, which books any
+maker fill before handing the position over); a task that dies stops the process loudly (`TASK_DIED`) so systemd
+restarts it with fresh sockets instead of letting it run blind."""
 from __future__ import annotations
 
 import asyncio
@@ -28,8 +29,11 @@ log = logging.getLogger("bbo.app")
 
 SHUTDOWN_DRAIN_S = 15.0        # worst case per taker leg: EVENT_GRACE_S 1.5 + POLL_MAX_S 5, twice
 SHUTDOWN_CANCEL_S = 10.0       # a hung venue must not cost us the final state save
+SHUTDOWN_SETTLE_S = 5.0        # cancel acks arrive as order events; a save before them persists a status a restart calls stuck
 CLOSE_ALL_DRAIN_S = 10.0       # /close_all lets in-flight entries land first, or they open behind our back
-QUOTE_REFRESH_FRAC = 0.5       # REST-refresh an open position's leg at half the staleness budget, never after it
+QUOTE_REFRESH_FRAC = 0.5       # REST-refresh an open position's leg at half the staleness budget, and give the call that long
+_MAKER_FLOW = (MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, EXIT_HEDGING)
+_STOPPING_REFUSES = ("REQUOTE", "TM_EXIT", "UPGRADE_TT")   # no NEW order may rest or open once we are shutting down
 UNIVERSE_RETRY_S = 60.0        # market-data refresh cadence while the universe is empty (start-up blip)
 MARKET_DATA_S = 3600.0
 _ORPHANED_ON_RESTART = (TT_ENTERING, HEDGING, EXIT_HEDGING, TT_EXITING)
@@ -49,6 +53,8 @@ class App:
         self.universe: dict[str, list[str]] = {}
         self._pending_entries: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._notify_tasks: set[asyncio.Task] = set()
+        self._fallback_inflight: set[tuple[str, str]] = set()
         self._last_state_save = 0.0
         self._scanner: list[dict] = []
         self._last_scan = 0.0
@@ -65,6 +71,20 @@ class App:
         t = asyncio.get_running_loop().create_task(guard())
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
+
+    def _notify(self, text: str) -> None:
+        """Telegram sends live in their own set: the shutdown drain waits for order legs, never for a hung send."""
+        if self.telegram is None:
+            return
+
+        async def guard():
+            try:
+                await self.telegram.send(text)
+            except Exception:  # noqa: BLE001
+                log.exception("NOTIFY_ERROR")
+        t = asyncio.get_running_loop().create_task(guard())
+        self._notify_tasks.add(t)
+        t.add_done_callback(self._notify_tasks.discard)
 
     @property
     def n_trade_venues(self) -> int:
@@ -87,8 +107,7 @@ class App:
             exc = task.exception()
             if exc is not None:
                 log.critical("TASK_DIED %s: %r — stopping so systemd restarts with fresh sockets", name, exc, exc_info=exc)
-                if self.telegram is not None:
-                    self._spawn(self.telegram.send(f"TASK_DIED {name}: {exc!r} — restarting"))
+                self._notify(f"TASK_DIED {name}: {exc!r} — restarting")
                 self.running = False
         t.add_done_callback(done)
         return t
@@ -105,6 +124,22 @@ class App:
                 log.error("DRAIN_TIMEOUT %d order tasks unfinished after %.0fs — state may lag the venues", len(pending), timeout)
                 return
             await asyncio.wait(pending, timeout=min(left, 1.0))
+
+    async def _settle_makers(self, timeout: float) -> None:
+        """After cancel_all_resting: the acks arrive as order events and finalize in their own tasks. Wait until no
+        position is in a maker-flow status (and nothing is in flight) so the saved state says OPEN/CLOSED, not a
+        MAKER_RESTING a restart would adopt as stuck and an operator would be told to check by hand."""
+        deadline = self.clock() + timeout
+        while True:
+            pending = [t for t in (self._tasks | self.executor._tasks) if not t.done()]
+            unsettled = self.book.by_status(*_MAKER_FLOW)
+            if not pending and not unsettled:
+                return
+            if self.clock() >= deadline:
+                log.warning("SHUTDOWN_UNSETTLED %d maker-flow positions, %d tasks still pending after %.0fs — saving anyway",
+                            len(unsettled), len(pending), timeout)
+                return
+            await asyncio.sleep(0.05)
 
     # ---- quote path ----------------------------------------------------------------
     def on_bbo(self, bbo: BBO) -> None:
@@ -164,6 +199,9 @@ class App:
         else:
             return
         if it.kind == "NONE":
+            return
+        if not self.running and it.kind in _STOPPING_REFUSES:
+            log.info("STOPPING #%d %s: %s refused, cancel_all_resting/TT exits only", pos.id, pos.symbol, it.kind)
             return
         if it.kind == "REQUOTE":
             self._spawn(self.executor.requote(pos, it.rest_price))
@@ -320,18 +358,26 @@ class App:
     def _adopt_transients(self) -> None:
         """Every status that can be persisted must be driven by some loop after a restart. Positions saved mid-flight
         (SIGKILL, or a shutdown that could not drain) have no task behind them any more:
-        - TT_ENTERING / HEDGING / EXIT_HEDGING / TT_EXITING → DEGRADED: retry_degraded closes what the books show
-          (a leg the venue no longer holds is booked flat via `nothing to reduce`);
-        - MAKER_RESTING (nothing filled per our books) → discarded — the resting order died with the process in paper;
-          live reconciliation (Plan 2) must cancel/adopt it at the venue;
-        - EXIT_MAKER_RESTING → OPEN with the maker fields cleared: the position is still held, the exit is re-decided."""
+        - TT_ENTERING / HEDGING / EXIT_HEDGING / TT_EXITING, and a MAKER_RESTING / EXIT_MAKER_RESTING whose resting
+          order had filled (or with anything on its legs) → DEGRADED via `Executor.adopt_restored`, which books the
+          maker fill on its leg first; retry_degraded then closes what the books show (a leg the venue no longer
+          holds is booked flat via `nothing to reduce`);
+        - MAKER_RESTING with nothing filled per our books → discarded — the resting order died with the process in paper;
+        - EXIT_MAKER_RESTING with nothing filled → OPEN with the maker fields cleared: the position is still held, the
+          exit is re-decided.
+        None of this asks the venue: a zero-fill transient closes as `recovered` on our books alone, and a resting
+        order at a live venue is only reported. Live reconciliation (Plan 2) must query positions and open orders at
+        start-up before trusting any of it."""
         now = self.clock()
         for pos in list(self.book.open):
-            if pos.status in _ORPHANED_ON_RESTART:
-                log.error("STUCK_TRANSIENT #%d %s restored as %s with no owner -> DEGRADED", pos.id, pos.symbol, pos.status)
-                transition(pos, DEGRADED)
-                pos.degraded_leg, pos.last_close_attempt = "both", 0.0
-                self.book.dirty = True
+            maker_fill = pos.maker_filled_qty > 1e-12 or pos.maker_booked_qty > 1e-12
+            on_legs = pos.filled_a > 1e-12 or pos.filled_b > 1e-12
+            if pos.status in _ORPHANED_ON_RESTART or (pos.status == MAKER_RESTING and (maker_fill or on_legs)) \
+                    or (pos.status == EXIT_MAKER_RESTING and maker_fill):
+                log.error("STUCK_TRANSIENT #%d %s restored as %s with no owner (maker filled %s) -> DEGRADED; %s",
+                          pos.id, pos.symbol, pos.status, pos.maker_filled_qty,
+                          "check the venue for the resting order by hand" if self.cfg.mode == "live" else "paper")
+                self.executor.adopt_restored(pos)
             elif pos.status == MAKER_RESTING:
                 log.error("STUCK_RESTING #%d %s restored as MAKER_RESTING (%s resting order %s) — discarded; %s",
                           pos.id, pos.symbol, pos.maker_venue, pos.maker_client_id,
@@ -402,28 +448,43 @@ class App:
     async def _quote_fallback(self) -> None:
         """Open positions must never depend on WS health: REST-refresh a leg at HALF the staleness budget (a resting
         maker is cancelled the moment a leg reads stale, so refreshing only after the boundary always loses that
-        race); concurrently, each guarded — one hung endpoint must not delay the other legs."""
+        race) and give the call that same half — an answer after the boundary is useless, and the adapters' 5 s
+        timeout let one hung request sit through the whole budget. One fetch per leg in flight; the next 0.5 s tick
+        retries after a timeout on a fresh connection."""
         now = self.clock()
 
-        async def one(v: Venue, symbol: str) -> None:
+        async def one(v: Venue, symbol: str, budget: float) -> None:
+            key = (v.name, symbol)
+            self._fallback_inflight.add(key)
             try:
-                bbo = await v.market.fetch_bbo(symbol)
+                bbo = await asyncio.wait_for(v.market.fetch_bbo(symbol), budget)
+            except asyncio.TimeoutError:
+                n = self.metrics.funnel["fallback_timeout"] = self.metrics.funnel["fallback_timeout"] + 1
+                if n in (1, 10, 100) or n % 1000 == 0:
+                    log.warning("QUOTE_FALLBACK_TIMEOUT #%d %s %s: no answer within %.1fs (leg reads stale at %.1fs)",
+                                n, v.name, symbol, budget, self.board.stale_for(v.name))
+                return
             except Exception as e:  # noqa: BLE001
+                self.metrics.funnel["fallback_failed"] += 1
                 log.warning("QUOTE_FALLBACK_FAILED %s %s: %r", v.name, symbol, e)
                 return
+            finally:
+                self._fallback_inflight.discard(key)
             if bbo is not None:
+                self.metrics.funnel["fallback_ok"] += 1
                 self.on_bbo(bbo)
         jobs = []
         for pos in list(self.book.open):
             for venue in (pos.venue_a, pos.venue_b):
                 v = self.venues.get(venue)
-                if v is None or v.market is None:
+                if v is None or v.market is None or (venue, pos.symbol) in self._fallback_inflight:
                     continue
                 q = self.board.get(venue, pos.symbol)
                 age = (now - q.ts_local) if q is not None else float("inf")
-                if age < self.board.stale_for(venue) * QUOTE_REFRESH_FRAC:
+                budget = self.board.stale_for(venue) * QUOTE_REFRESH_FRAC
+                if age < budget:
                     continue
-                jobs.append(one(v, pos.symbol))
+                jobs.append(one(v, pos.symbol, budget))
         if jobs:
             await asyncio.gather(*jobs)
 
@@ -474,11 +535,13 @@ class App:
 
     async def shutdown(self) -> None:
         """Drain in-flight order tasks (an entry must land before we cancel and save, or the state file says we hold
-        nothing while both legs sit at the venues), cancel every resting order with a timeout, save, and say so."""
+        nothing while both legs sit at the venues), cancel every resting order with a timeout, wait for the cancels
+        to settle, save, and say so."""
         log.info("SHUTDOWN draining in-flight order tasks, cancelling resting orders, saving state")
         await self._drain(SHUTDOWN_DRAIN_S)
         try:
             await asyncio.wait_for(self.executor.cancel_all_resting(), SHUTDOWN_CANCEL_S)
+            await self._settle_makers(SHUTDOWN_SETTLE_S)
         except Exception:  # noqa: BLE001 — a stuck venue must not cost us the save
             log.exception("SHUTDOWN cancel_all_resting failed — saving state anyway")
         finally:

@@ -89,7 +89,7 @@ async def test_tm_fill_through_app_and_close_all(tmp_path):
     assert pos.status == CLOSED and pos.exit_reason == "halt" and app.risk.halted
 
 
-def test_legacy_guard(tmp_path):
+def test_legacy_guard(tmp_path, monkeypatch):
     hb = tmp_path / "heartbeat_live"
     assert not legacy_bot_running(hb, 120.0, now=1000.0)
     hb.write_text("1")
@@ -97,6 +97,12 @@ def test_legacy_guard(tmp_path):
     os.utime(hb, (1000.0, 1000.0))
     assert legacy_bot_running(hb, 120.0, now=1050.0)
     assert not legacy_bot_running(hb, 120.0, now=1200.0)
+    import pathlib
+
+    def denied(self, *a, **k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(pathlib.Path, "stat", denied)
+    assert legacy_bot_running(hb, 120.0, now=1200.0)               # unreadable: assume the legacy bot runs, a human decides
 
 
 async def test_live_refuses_corrupt_state_and_paper_falls_back_to_backup(tmp_path):
@@ -237,3 +243,163 @@ async def test_quote_fallback_refreshes_before_the_stale_boundary(tmp_path):
     app.clock = lambda: time.time() + 1.2                           # the mexc leg is 1.2 s old: past half of the 2 s budget
     await app._quote_fallback()
     assert calls == [SYM] and app.board.get("mexc", SYM).bid == 1.0001   # refreshed before it could read stale
+
+
+async def test_restored_maker_fills_are_booked_not_discarded(tmp_path, monkeypatch):
+    """A save can land between a maker fill and its hedge (MAKER_RESTING with maker_filled_qty), during HEDGING before
+    _finalize_maker booked the fill on the leg, or with an exit maker partly filled: none of these may be discarded,
+    reopened as if unfilled, or closed as if nothing was held."""
+    from bbo_trader import execution
+    app = build_app(tmp_path)
+    now = app.clock()
+    app.book.new(SYM, "blofin", "mexc", MAKER_RESTING, "TM", size_usd=25.0, maker_venue="blofin", maker_side="sell",
+                 maker_client_id="gone-1", maker_filled_qty=12.0, maker_avg_price=1.006, maker_fee_usd=0.002, entry_time=now)
+    app.book.new(SYM, "blofin", "mexc", "HEDGING", "TM", size_usd=25.0, maker_venue="blofin", maker_side="sell",
+                 maker_client_id="gone-2", maker_filled_qty=20.0, maker_avg_price=1.006, hedged_qty=20.0,
+                 filled_b=2.0, entry_price_b=1.0008, entry_time=now)          # hedge leg booked, maker leg not yet
+    app.book.new(SYM, "blofin", "mexc", EXIT_MAKER_RESTING, "TT", size_usd=25.0, maker_venue="blofin", maker_side="buy",
+                 maker_client_id="gone-3", maker_filled_qty=5.0, maker_avg_price=1.001, filled_a=20.0, filled_b=2.0,
+                 entry_price_a=1.005, entry_price_b=1.0008, entry_time=now)
+    await app.save_state(now)
+    app2 = build_app(tmp_path)
+    app2.load_state()
+    p1, p2, p3 = sorted(app2.book.open, key=lambda p: p.id)
+    assert [p.status for p in (p1, p2, p3)] == ["DEGRADED"] * 3
+    assert p1.filled_a == 12.0 and p1.entry_price_a == pytest.approx(1.006) and p1.entry_fees_usd == pytest.approx(0.002)
+    assert p2.filled_a == 20.0 and p2.filled_b == 2.0                    # the maker leg is on the books before retry_degraded looks
+    assert p3.exit_filled_a == 5.0 and p3.filled_a == 20.0               # the exit fill reduced leg a: 15 remain to close
+    monkeypatch.setattr(execution, "DEGRADED_RETRY_S", 0.0)
+    app2.harness.quote("blofin", 1.0050, 1.0060)
+    app2.harness.quote("mexc", 1.0000, 1.0008)
+    await app2.sweep_once()                                              # paper: the venues hold nothing -> booked flat
+    await settle()
+    assert app2.book.open == [] and app2.book.total_trades == 3
+
+
+async def test_quote_fallback_abandons_a_hung_fetch_within_the_budget(tmp_path, caplog):
+    import time
+    app = build_app(tmp_path, stale_quote_s=0.4)                         # refresh at 0.2 s, and give the call 0.2 s
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0))
+    calls = []
+
+    class HungMarket:
+        specs = {}
+
+        async def fetch_bbo(self, symbol):
+            calls.append(symbol)
+            await asyncio.sleep(10)
+    app.venues["blofin"].market = HungMarket()
+    app.clock = lambda: time.time() + 0.3                                # the blofin leg is 0.3 s old: past half the budget
+    t0 = time.time()
+    first = asyncio.create_task(app._quote_fallback())
+    await asyncio.sleep(0.05)
+    await app._quote_fallback()                                          # the next tick while the fetch is in flight: no duplicate
+    await first
+    assert time.time() - t0 < 0.5 and calls == [SYM]                    # abandoned at the bound, not at the adapter's 5 s
+    assert app.metrics.funnel["fallback_timeout"] == 1 and "QUOTE_FALLBACK_TIMEOUT" in caplog.text
+    assert not app._fallback_inflight
+
+
+async def test_shutdown_settles_cancelled_makers_before_saving(tmp_path):
+    app = build_app(tmp_path)
+    app.on_bbo(bbo("mexc", 1.0000, 1.0010, 10.0))
+    app.on_bbo(bbo("blofin", 1.0041, 1.0061, 1.0))                       # TM entry rests on blofin
+    await settle()
+    assert app.book.open[0].status == MAKER_RESTING
+    app.running = False
+    await app.shutdown()                                                 # the cancel ack is an order event: wait for it, then save
+    state = json.loads((tmp_path / "real_state.json").read_text())
+    assert state["open_positions"] == [] and app.book.open == []         # not a MAKER_RESTING a restart would report as stuck
+
+
+async def test_no_new_maker_orders_once_stopping(tmp_path):
+    app = build_app(tmp_path)
+    app.on_bbo(bbo("mexc", 1.0000, 1.0008, 10.0))
+    app.on_bbo(bbo("blofin", 1.0050, 1.0060, 1.0))
+    await settle()
+    pos = app.book.open[0]
+    assert pos.status == OPEN
+    app.running = False
+    app.evaluator.evaluate_exit = lambda *a, **k: Intent("TM_EXIT", symbol=SYM, venue_a="blofin", venue_b="mexc",
+                                                         maker_venue="blofin", rest_price=1.0050)
+    app._drive(pos)
+    await settle()
+    assert pos.status == OPEN                                            # no new resting order while shutting down...
+    app.evaluator.evaluate_exit = lambda *a, **k: Intent("TT_EXIT", reason="time_stop", symbol=SYM, venue_a="blofin", venue_b="mexc")
+    app._drive(pos)
+    await settle()
+    assert pos.status == CLOSED                                          # ...but a taker exit still goes through
+
+
+async def test_hung_notify_does_not_hold_the_drain(tmp_path, caplog):
+    import time
+    app = build_app(tmp_path)
+
+    async def hung(text):
+        await asyncio.sleep(10)
+    app.executor.notify = hung
+    app.executor._say("hello")
+    await asyncio.sleep(0)                                               # the send is now sitting in its 10 s sleep
+    t0 = time.time()
+    await app._drain(2.0)
+    assert time.time() - t0 < 0.5 and "DRAIN_TIMEOUT" not in caplog.text
+    sends = list(app.executor._notify_tasks)
+    assert len(sends) == 1                                               # its own set: the drain waits for order tasks only
+    for t in sends:
+        t.cancel()
+    await asyncio.gather(*sends, return_exceptions=True)
+
+
+async def test_market_data_refresh_keeps_held_specs_and_retries_fast_when_empty(tmp_path, caplog):
+    from tests.conftest import mk_spec
+    app = build_app(tmp_path)
+    h = app.harness
+    h.quote("blofin", 1.0050, 1.0060)
+    h.quote("mexc", 1.0000, 1.0008)
+    await h.ex.enter_tt(Intent("TT_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", size_usd=25.0))
+    other = mk_spec("blofin", "OTHERUSDT")
+
+    class DelistingMarket:
+        specs = {}
+
+        async def fetch_specs(self):
+            return {"OTHERUSDT": other}                                  # SYM delisted while we hold it
+
+        async def fetch_volumes(self):
+            return {"OTHERUSDT": 1e6}
+
+    class Public:
+        connected = True
+        symbols = None
+
+        def set_specs(self, specs):
+            pass
+
+        def set_symbols(self, syms):
+            self.symbols = list(syms)
+    v = app.venues["blofin"]
+    v.market, v.public = DelistingMarket(), Public()
+    await app.refresh_market_data()
+    assert SYM in v.specs and "OTHERUSDT" in v.specs and SYM in v.public.symbols   # kept its spec, stays subscribed
+    assert app.universe == {SYM: ["blofin", "mexc"]} and app._market_data_interval() == 3600.0
+    app.venues["mexc"].specs.clear()                                     # nothing on two trade venues any more
+    await app.refresh_market_data()
+    assert app.universe == {} and app._market_data_interval() == 60.0 and "UNIVERSE_EMPTY" in caplog.text
+
+
+async def test_stale_cancel_puts_the_symbol_on_a_short_cooldown(tmp_path):
+    import time
+    app = build_app(tmp_path)
+    app.on_bbo(bbo("mexc", 1.0000, 1.0010, 10.0))
+    app.on_bbo(bbo("blofin", 1.0041, 1.0061, 1.0))
+    await settle()
+    pos = app.book.open[0]
+    assert pos.status == MAKER_RESTING
+    app.evaluator.clock = lambda: time.time() + 3.0                      # every leg reads stale to the strategy
+    app._drive(pos)
+    await settle()
+    assert app.book.open == [] and app.metrics.funnel["maker_cancelled"] == 1
+    assert 4.0 < app.risk.cooldowns[SYM] - time.time() <= 5.0            # STALE_CANCEL_COOLDOWN_S, not the 60 s entry-failure one
