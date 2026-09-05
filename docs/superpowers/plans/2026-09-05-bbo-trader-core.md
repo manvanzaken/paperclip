@@ -1535,7 +1535,7 @@ git commit -m "feat(bbo): pure edge math — TT/TM edges, mode rule, pegged make
 - Create: `deploy-bbo/bbo_trader/sizing.py`
 - Test: `deploy-bbo/tests/test_sizing.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_sizing.py`:
 
@@ -1562,6 +1562,7 @@ def test_contracts_for_usd_respects_lot_and_min():
     # non-finite inputs fail closed instead of raising
     assert contracts_for_usd(float("nan"), 2.0, s) == 0.0 and contracts_for_usd(25.0, float("inf"), s) == 0.0
     assert lots_floor(2.3, mk_spec("x", lot=0.5, min_qty=0.5)) == 2.0 and lots_floor(0.3, s) == 0.0
+    assert lots_floor(2.3, mk_spec("x", lot=float("nan"), min_qty=1.0)) == 0.0   # malformed venue metadata fails closed
 
 
 def test_size_pair_matches_notionals_within_tolerance():
@@ -1626,12 +1627,12 @@ def test_excess_to_flatten_rules():
     assert excess_to_flatten(0.0, 20.0, sm, 5.0) == 0.0
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_sizing.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.sizing'`
 
-- [ ] **Step 3: Implement `bbo_trader/sizing.py`**
+- [x] **Step 3: Implement `bbo_trader/sizing.py`**
 
 ```python
 """Pure sizing: USD notional → venue contracts, matched pair legs, hedge plans and residual handling."""
@@ -1645,7 +1646,7 @@ from .models import VenueSpec
 
 def lots_floor(qty: float, spec: VenueSpec) -> float:
     """Largest lot multiple <= qty; 0.0 when below the venue minimum (or qty is not a finite positive)."""
-    if not math.isfinite(qty) or qty <= 0 or spec.lot <= 0:
+    if not math.isfinite(qty) or qty <= 0 or not (math.isfinite(spec.lot) and spec.lot > 0):
         return 0.0
     lots = qty / spec.lot
     n = round(math.floor(lots + 1e-9 * max(1.0, lots)) * spec.lot, 10)
@@ -1727,14 +1728,17 @@ def hedge_plan(unhedged_maker_qty: float, px_maker: float, spec_maker: VenueSpec
 
 def hedge_qty(filled_qty: float, px_maker: float, spec_maker: VenueSpec,
               px_hedge: float, spec_hedge: VenueSpec) -> float:
-    """Hedge-venue contracts matching a maker fill's notional; 0.0 = unhedgeable (below minimum)."""
+    """Hedge-venue contracts matching a maker fill's notional; 0.0 = unhedgeable (below minimum).
+    Simple-case shorthand for hedge_plan(...).hedge_qty; the executor uses hedge_plan."""
     return hedge_plan(filled_qty, px_maker, spec_maker, px_hedge, spec_hedge).hedge_qty
 
 
 def excess_to_flatten(residual_qty: float, matched_qty: float, spec: VenueSpec, max_mismatch_pct: float) -> float:
     """Maker-venue contracts to flatten from an unhedged residual once the resting order is terminal:
     the residual (rounded down to lots) when nothing is matched or it exceeds the mismatch tolerance
-    of the matched quantity; 0.0 to accept it as tolerable exposure."""
+    of the matched quantity. 0.0 means EITHER the residual is within tolerance (accept it as exposure)
+    OR it is below the venue minimum and cannot be sent (exposure retained) — callers must tell the two
+    apart with `residual <= matched × tolerance` when they report it."""
     if residual_qty <= 0:
         return 0.0
     if matched_qty > 0 and residual_qty <= matched_qty * max_mismatch_pct / 100.0:
@@ -1742,12 +1746,12 @@ def excess_to_flatten(residual_qty: float, matched_qty: float, spec: VenueSpec, 
     return lots_floor(residual_qty, spec)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_sizing.py -q`
 Expected: `6 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy-bbo/bbo_trader/sizing.py deploy-bbo/tests/test_sizing.py
@@ -5081,8 +5085,11 @@ class Executor:
                         log.warning("RESIDUAL #%d %s %s maker contracts unhedged (matched %s) — flattening %s",
                                     pos.id, pos.symbol, residual, pos.hedged_qty, to_flat)
                         await self._flatten_maker_fill(pos, to_flat, phase)
-                    else:
+                    elif residual <= pos.hedged_qty * self.cfg.max_leg_mismatch_pct / 100.0:
                         log.info("RESIDUAL_ACCEPTED #%d %s %s maker contracts within tolerance", pos.id, pos.symbol, residual)
+                    else:
+                        log.warning("RESIDUAL_RETAINED #%d %s %s maker contracts below the venue minimum — cannot be sent, exposure retained",
+                                    pos.id, pos.symbol, residual)
                     pos.hedged_qty = pos.maker_filled_qty
             tr = self._tracks.get(pos.maker_client_id)
             maker_terminal = tr is not None and tr.last is not None and tr.last.terminal

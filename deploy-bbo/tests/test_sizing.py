@@ -20,6 +20,7 @@ def test_contracts_for_usd_respects_lot_and_min():
     # non-finite inputs fail closed instead of raising
     assert contracts_for_usd(float("nan"), 2.0, s) == 0.0 and contracts_for_usd(25.0, float("inf"), s) == 0.0
     assert lots_floor(2.3, mk_spec("x", lot=0.5, min_qty=0.5)) == 2.0 and lots_floor(0.3, s) == 0.0
+    assert lots_floor(2.3, mk_spec("x", lot=float("nan"), min_qty=1.0)) == 0.0   # malformed venue metadata fails closed
 
 
 def test_size_pair_matches_notionals_within_tolerance():

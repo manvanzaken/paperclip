@@ -9,7 +9,7 @@ from .models import VenueSpec
 
 def lots_floor(qty: float, spec: VenueSpec) -> float:
     """Largest lot multiple <= qty; 0.0 when below the venue minimum (or qty is not a finite positive)."""
-    if not math.isfinite(qty) or qty <= 0 or spec.lot <= 0:
+    if not math.isfinite(qty) or qty <= 0 or not (math.isfinite(spec.lot) and spec.lot > 0):
         return 0.0
     lots = qty / spec.lot
     n = round(math.floor(lots + 1e-9 * max(1.0, lots)) * spec.lot, 10)
@@ -91,14 +91,17 @@ def hedge_plan(unhedged_maker_qty: float, px_maker: float, spec_maker: VenueSpec
 
 def hedge_qty(filled_qty: float, px_maker: float, spec_maker: VenueSpec,
               px_hedge: float, spec_hedge: VenueSpec) -> float:
-    """Hedge-venue contracts matching a maker fill's notional; 0.0 = unhedgeable (below minimum)."""
+    """Hedge-venue contracts matching a maker fill's notional; 0.0 = unhedgeable (below minimum).
+    Simple-case shorthand for hedge_plan(...).hedge_qty; the executor uses hedge_plan."""
     return hedge_plan(filled_qty, px_maker, spec_maker, px_hedge, spec_hedge).hedge_qty
 
 
 def excess_to_flatten(residual_qty: float, matched_qty: float, spec: VenueSpec, max_mismatch_pct: float) -> float:
     """Maker-venue contracts to flatten from an unhedged residual once the resting order is terminal:
     the residual (rounded down to lots) when nothing is matched or it exceeds the mismatch tolerance
-    of the matched quantity; 0.0 to accept it as tolerable exposure."""
+    of the matched quantity. 0.0 means EITHER the residual is within tolerance (accept it as exposure)
+    OR it is below the venue minimum and cannot be sent (exposure retained) — callers must tell the two
+    apart with `residual <= matched × tolerance` when they report it."""
     if residual_qty <= 0:
         return 0.0
     if matched_qty > 0 and residual_qty <= matched_qty * max_mismatch_pct / 100.0:
