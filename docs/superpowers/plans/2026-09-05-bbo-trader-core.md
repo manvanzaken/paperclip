@@ -161,6 +161,8 @@ Expected: `143 blocked symbols written` (the count follows the legacy list; anyt
 import json
 from pathlib import Path
 
+import pytest
+
 from bbo_trader.config import load_config, Config, VenueConfig
 
 
@@ -207,26 +209,120 @@ def test_defaults_and_env(tmp_path):
 
 def test_bot_config_json_overrides_env_but_not_mode(tmp_path):
     venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
     data = tmp_path / "data"
     data.mkdir()
     (data / "bot_config.json").write_text(json.dumps({"MAX_POSITION_USD": 12.5, "MODE": "live"}))
-    cfg = load_config(env={"DATA_DIR": str(data), "VENUES_FILE": str(venues), "MAX_POSITION_USD": "40"})
+    cfg = load_config(env={
+        "DATA_DIR": str(data), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+        "MAX_POSITION_USD": "40",
+    })
     assert cfg.max_position_usd == 12.5             # file wins over env
     assert cfg.mode == "paper"                      # MODE is process-level only
 
 
 def test_missing_venues_file_raises(tmp_path):
-    try:
+    with pytest.raises(FileNotFoundError, match="venues file not found"):
         load_config(env={"DATA_DIR": str(tmp_path), "VENUES_FILE": str(tmp_path / "nope.json")})
-    except FileNotFoundError:
-        return
-    raise AssertionError("expected FileNotFoundError")
+
+
+def test_mode_is_normalized_and_validated(tmp_path):
+    venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    base_env = {"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked)}
+
+    cfg = load_config(env={**base_env, "MODE": "Paper "})
+    assert cfg.mode == "paper"
+
+    cfg = load_config(env={**base_env, "MODE": "LIVE"})
+    assert cfg.mode == "live"
+
+    with pytest.raises(ValueError, match="MODE must be"):
+        load_config(env={**base_env, "MODE": "dry"})
+
+
+def test_unknown_role_raises(tmp_path):
+    venues = tmp_path / "venues.json"
+    venues.write_text(json.dumps({
+        "mexc": {"role": "Trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0,
+                 "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 4, "shared": False},
+                 "max_topics": 30, "min_requote_ms": 500},
+    }))
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    with pytest.raises(ValueError, match="unknown role"):
+        load_config(env={
+            "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+        })
+
+
+def test_shared_string_false_is_false(tmp_path):
+    venues = tmp_path / "venues.json"
+    venues.write_text(json.dumps({
+        "mexc": {"role": "trade", "taker_fee_pct": 0.02, "maker_fee_pct": 0.0,
+                 "rate_limits": {"orders": 20, "cancels": 20, "window_s": 2.0, "reserve": 4, "shared": "false"},
+                 "max_topics": 30, "min_requote_ms": 500},
+        "blofin": {"role": "trade", "taker_fee_pct": 0.06, "maker_fee_pct": 0.02,
+                   "rate_limits": {"orders": 30, "cancels": 30, "window_s": 10.0, "reserve": 6, "shared": "true"},
+                   "max_topics": 50, "min_requote_ms": 1000},
+    }))
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    cfg = load_config(env={
+        "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+    })
+    assert cfg.venue("mexc").rate_limits.shared is False
+    assert cfg.venue("blofin").rate_limits.shared is True
+
+
+def test_missing_blocked_file_raises(tmp_path):
+    venues = _write_venues(tmp_path)
+    with pytest.raises(FileNotFoundError, match="blocked symbols file not found"):
+        load_config(env={
+            "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues),
+            "BLOCKED_FILE": str(tmp_path / "nope_blocked.json"),
+        })
+
+
+def test_unknown_bot_config_keys_are_ignored_and_secrets_hidden(tmp_path):
+    venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "bot_config.json").write_text(json.dumps({"NOT_A_FIELD": 1, "venues": "pwned"}))
+    cfg = load_config(env={
+        "DATA_DIR": str(data), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+        "MEXC_API_SECRET": "secret-value",
+    })
+    assert cfg.trade_venues == ["mexc", "blofin"]
+    assert "secret-value" not in repr(cfg.venue("mexc"))
+
+
+def test_venue_lookup_keyerror(tmp_path):
+    venues = _write_venues(tmp_path)
+    blocked = tmp_path / "blocked.json"
+    blocked.write_text(json.dumps([]))
+    cfg = load_config(env={
+        "DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues), "BLOCKED_FILE": str(blocked),
+    })
+    with pytest.raises(KeyError):
+        cfg.venue("nope")
+
+
+def test_invalid_json_names_file(tmp_path):
+    venues = tmp_path / "venues.json"
+    venues.write_text("{")
+    with pytest.raises(ValueError, match="invalid JSON"):
+        load_config(env={"DATA_DIR": str(tmp_path / "data"), "VENUES_FILE": str(venues)})
 ```
 
 - [ ] **Step 4: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
-Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.config'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.config'` (10 tests collected, all erroring at import)
 
 - [ ] **Step 5: Implement `bbo_trader/config.py`**
 
@@ -239,7 +335,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Mapping
 
@@ -264,9 +360,10 @@ class VenueConfig:
     min_requote_ms: int = 500
     staleness_override_s: float | None = None
     symbol_whitelist: tuple[str, ...] = ()
-    api_key: str = ""
-    api_secret: str = ""
-    passphrase: str = ""
+    # secrets: excluded from repr; anything that serializes a VenueConfig (asdict) must whitelist fields
+    api_key: str = field(default="", repr=False)
+    api_secret: str = field(default="", repr=False)
+    passphrase: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -360,25 +457,32 @@ def _coerce(raw: str, target_type) -> object:
 
 
 def _read_json(path: Path):
-    with open(path, "r") as f:
-        return json.load(f)
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path}: invalid JSON: {e}") from e
 
 
 def _load_venues(path: Path, env: Mapping[str, str]) -> tuple[VenueConfig, ...]:
+    # Venue order follows venues.json key order (json.load preserves it); trade_venues/feed_venues keep that order.
     raw = _read_json(path)
     out = []
     for name, v in raw.items():
         rl = v.get("rate_limits") or {}
         prefix = name.upper()
+        role = v.get("role", "off")
+        if role not in ("trade", "quote_only", "off"):
+            raise ValueError(f"{name}: unknown role {role!r} (expected trade | quote_only | off)")
         out.append(VenueConfig(
             name=name,
-            role=v.get("role", "off"),
+            role=role,
             taker_fee_pct=float(v["taker_fee_pct"]),
             maker_fee_pct=float(v["maker_fee_pct"]),
             rate_limits=RateLimits(
                 orders=int(rl.get("orders", 20)), cancels=int(rl.get("cancels", 20)),
                 window_s=float(rl.get("window_s", 2.0)), reserve=int(rl.get("reserve", 4)),
-                shared=bool(rl.get("shared", False))),
+                shared=_coerce(rl.get("shared", False), bool)),
             max_topics=int(v.get("max_topics", 50)),
             min_requote_ms=int(v.get("min_requote_ms", 500)),
             staleness_override_s=(float(v["staleness_override_s"]) if v.get("staleness_override_s") is not None else None),
@@ -419,14 +523,22 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         raise FileNotFoundError(f"venues file not found: {venues_file}")
     overrides["venues"] = _load_venues(venues_file, env)
     blocked_file = Path(overrides.get("blocked_file", Config.blocked_file))
-    overrides["blocked_symbols"] = frozenset(_read_json(blocked_file)) if blocked_file.exists() else frozenset()
+    if not blocked_file.exists():
+        raise FileNotFoundError(f"blocked symbols file not found: {blocked_file}")
+    overrides["blocked_symbols"] = frozenset(_read_json(blocked_file))
+    # MODE is process-level only; validate and normalize so a typo (e.g. "Paper ", "dry") never
+    # silently routes to live trading, since downstream code branches on `cfg.mode == "paper"`.
+    mode = str(overrides.get("mode", Config.mode)).strip().lower()
+    if mode not in ("paper", "live"):
+        raise ValueError(f"MODE must be 'paper' or 'live', got {overrides.get('mode')!r}")
+    overrides["mode"] = mode
     return Config(**overrides)
 ```
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
-Expected: `3 passed`
+Expected: `10 passed`
 
 - [ ] **Step 7: Commit**
 
@@ -2523,7 +2635,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `37 passed`
+Expected: `44 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -3676,7 +3788,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `51 passed`
+Expected: `58 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -4774,7 +4886,7 @@ Expected: `10 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `64 passed`
+Expected: `71 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -5540,7 +5652,7 @@ Expected: `4 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `71 passed`
+Expected: `78 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -5662,6 +5774,8 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 ---
 
 ## Plan self-review (done while writing)
+
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; 7 tests added (10 total). The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
