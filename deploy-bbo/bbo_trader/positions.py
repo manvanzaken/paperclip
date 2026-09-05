@@ -6,11 +6,12 @@ import json
 import logging
 import math
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import (Position, TT_ENTERING, MAKER_RESTING, HEDGING, OPEN, EXIT_MAKER_RESTING,
-                     TT_EXITING, EXIT_HEDGING, DEGRADED, CLOSED)
+                     TT_EXITING, EXIT_HEDGING, DEGRADED, CLOSED, NON_TERMINAL)
 
 log = logging.getLogger("bbo.state")
 
@@ -152,7 +153,7 @@ class PositionBook:
         if self.peak_equity > 0:
             dd = (self.peak_equity - equity) / self.peak_equity * 100.0
             self.max_drawdown_pct = max(self.max_drawdown_pct, dd)
-        last_ts = float((self.equity_history[-1].get("_ts") or 0.0)) if self.equity_history else 0.0
+        last_ts = float(self.equity_history[-1].get("_ts", 0.0)) if self.equity_history else 0.0
         if not self.equity_history or now - last_ts >= every_s:
             self.equity_history.append({"t": _iso(now), "v": round(equity, 4), "_ts": now})
             del self.equity_history[:-self.EQUITY_POINTS]
@@ -177,8 +178,10 @@ class PositionBook:
         self.max_drawdown_pct = float(d.get("max_drawdown_pct", 0.0))
         self.equity_history = list(d.get("equity_history", []))[-self.EQUITY_POINTS:]
         self.audit = list(d.get("order_audit_log", []))
-        self.open = [Position.from_dict(x) for x in d.get("open_positions", [])]
-        self.closed = [Position.from_dict(x) for x in d.get("closed_positions", [])][-self.closed_keep:]
+        loaded_open = [Position.from_dict(x) for x in d.get("open_positions", [])]
+        self.open = [p for p in loaded_open if p.status in NON_TERMINAL]
+        stranded = [p for p in loaded_open if p.status not in NON_TERMINAL]   # a CLOSED entry under open_positions
+        self.closed = ([Position.from_dict(x) for x in d.get("closed_positions", [])] + stranded)[-self.closed_keep:]
         self._closed_dicts = [p.to_dict() for p in self.closed]
         highest = max((p.id for p in self.open + self.closed), default=0)
         self.next_id = max(int(d.get("next_id", 1)), highest + 1)   # never reuse an id the file still holds
@@ -198,46 +201,62 @@ def _sanitize(obj):
 def dumps_state(state: dict) -> str:
     try:
         return json.dumps(state, allow_nan=False)
-    except ValueError:
-        log.error("STATE_NAN non-finite float in state — sanitizing to null")
-        return json.dumps(_sanitize(state))
+    except (ValueError, TypeError) as e:
+        log.error("STATE_UNSERIALIZABLE %r — sanitizing (non-finite -> null, unknown types -> str)", e)
+        return json.dumps(_sanitize(state), default=str)
 
 
 class StateStore:
-    """Atomic, durable JSON state: write tmp → flush+fsync → keep the previous file as `.bak` → rename."""
+    """Atomic, durable JSON state. The live file is NEVER absent: write a uniquely named tmp →
+    flush+fsync → hard-link the current file to `.bak` → rename tmp over the live file. Saves are
+    serialized by a lock so an overlapping shutdown save cannot race the sweep's save."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.bak = self.path.with_suffix(self.path.suffix + ".bak")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
 
     def save(self, state: dict) -> None:
         payload = dumps_state(state)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp = self.path.with_suffix(f"{self.path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
         with open(tmp, "w") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        if self.path.exists():
-            os.replace(self.path, self.bak)
+        link = self.path.with_suffix(self.path.suffix + ".bak.tmp")
+        try:
+            link.unlink(missing_ok=True)
+            os.link(self.path, link)          # the live file itself is never unlinked
+            os.replace(link, self.bak)
+        except FileNotFoundError:
+            pass                              # first save: nothing to back up
         os.replace(tmp, self.path)
 
     async def save_async(self, state: dict) -> None:
         """Serialize + write off the event loop (state must be a snapshot the loop no longer mutates)."""
-        await asyncio.to_thread(self.save, state)
+        async with self._lock:
+            await asyncio.to_thread(self.save, state)
 
     def _read(self, path: Path) -> dict | None:
         try:
             with open(path, "r") as f:
-                return json.load(f)
+                data = json.load(f)
         except FileNotFoundError:
             return None
         except (json.JSONDecodeError, OSError) as e:
             raise StateCorrupt(f"{path}: {e}") from e
+        if not isinstance(data, dict):
+            raise StateCorrupt(f"{path}: top-level {type(data).__name__}, expected object")
+        return data
 
     def load(self) -> dict | None:
-        """None only when no state file exists (fresh start). Raises StateCorrupt otherwise."""
-        return self._read(self.path)
+        """None only when neither the state file nor a backup exists (fresh start). A missing live
+        file next to a backup is a torn save, not a fresh start. Raises StateCorrupt otherwise."""
+        d = self._read(self.path)
+        if d is None and self.bak.exists():
+            raise StateCorrupt(f"{self.path} missing but {self.bak} exists — torn save?")
+        return d
 
     def load_backup(self) -> dict | None:
         return self._read(self.bak)

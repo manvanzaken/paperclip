@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -134,3 +135,34 @@ def test_state_never_emits_nan_and_load_repairs_next_id(tmp_path):
     assert book.next_id == 8                                              # never reuse an id the file holds
     book.load({})                                                         # tolerant of missing keys
     assert book.open == [] and book.total_trades == 0
+
+
+def test_state_file_is_never_absent_and_saves_do_not_race(tmp_path):
+    store = StateStore(tmp_path / "real_state.json")
+    store.save({"n": 1})
+    store.save({"n": 2})
+    assert store.load() == {"n": 2} and store.load_backup() == {"n": 1}
+    assert not (tmp_path / "real_state.json.bak.tmp").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]      # no stray temp files
+
+    async def concurrent():
+        await asyncio.gather(store.save_async({"n": 3}), store.save_async({"n": 4}))
+    asyncio.run(concurrent())
+    assert store.load()["n"] in (3, 4) and (tmp_path / "real_state.json").exists()
+    (tmp_path / "real_state.json").unlink()                                   # torn save: only the backup survives
+    with pytest.raises(StateCorrupt, match="torn save"):
+        store.load()
+
+
+def test_non_object_state_and_stranded_closed_entries(tmp_path):
+    store = StateStore(tmp_path / "real_state.json")
+    (tmp_path / "real_state.json").write_text("[]")
+    with pytest.raises(StateCorrupt, match="expected object"):
+        store.load()
+    closed = Position(3, "X", "a", "b", CLOSED, "TT", exit_reason="convergence").to_dict()
+    live = Position(4, "X", "a", "b", OPEN, "TT").to_dict()
+    book = PositionBook()
+    book.load({"open_positions": [closed, live]})                             # a CLOSED entry under open_positions
+    assert [p.id for p in book.open] == [4] and [p.id for p in book.closed] == [3] and book.next_id == 5
+    store.save({"weird": {1, 2}})                                             # unserializable -> str fallback, no crash
+    assert "weird" in store.load()
