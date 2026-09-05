@@ -12,6 +12,12 @@ from ..config import VenueConfig
 from ..models import BBO, Fees, OrderAck, OrderEvent, VenueSpec
 
 
+class VenueError(RuntimeError):
+    """A venue REST call failed: HTTP status, non-JSON body, or an error envelope. Venues report most errors
+    as HTTP 200 plus an envelope (MEXC `{"success": false, ...}`, BloFin `{"code": "152002", ...}`), so the
+    adapters check the envelope and raise this; callers treat it as UNKNOWN, never as an empty result."""
+
+
 @dataclass(frozen=True)
 class VenuePosition:
     venue: str

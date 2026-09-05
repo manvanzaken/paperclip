@@ -3122,9 +3122,9 @@ class RiskManager:
     def funding_blocks(self, symbol: str, venue_a: str, venue_b: str) -> bool:
         """Rates are FRACTIONS as exchanges deliver them (0.0001 = 0.01 %); positive = longs pay shorts.
         Short on A receives A's rate, long on B pays B's rate. Blocks only when the settlements inside
-        `funding_block_s` net to a cost above `funding_block_min_pct` (percent points): both v1 venues
-        settle on the same 8-hour grid with near-identical rates, so a zero threshold would block half
-        of all routes over a few thousandths of a basis point. A settle stamp already in the past means
+        `funding_block_s` net to a cost above `funding_block_min_pct` (percent points): the venues settle
+        on 4 h / 8 h grids (MEXC `collectCycle`, BloFin `fundingInterval`) with near-identical rates, so a
+        zero threshold would block half of all routes over a few thousandths of a basis point. A settle stamp already in the past means
         the feed is dead for that key: treated as unknown (allowed) and reported in `stale_funding`."""
         now = self.clock()
         net, in_window = 0.0, False
@@ -3991,6 +3991,12 @@ from ..config import VenueConfig
 from ..models import BBO, Fees, OrderAck, OrderEvent, VenueSpec
 
 
+class VenueError(RuntimeError):
+    """A venue REST call failed: HTTP status, non-JSON body, or an error envelope. Venues report most errors
+    as HTTP 200 plus an envelope (MEXC `{"success": false, ...}`, BloFin `{"code": "152002", ...}`), so the
+    adapters check the envelope and raise this; callers treat it as UNKNOWN, never as an empty result."""
+
+
 @dataclass(frozen=True)
 class VenuePosition:
     venue: str
@@ -4605,6 +4611,117 @@ def test_public_feed_wiring(clock):
     feed._emit(feed._parse({"channel": "push.depth.full", "symbol": "XYZ_USDT", "ts": 1000,
                             "data": {"bids": [[1.0, 1]], "asks": [[1.1, 1]]}}, {}))
     assert got[0].contract_size == 10.0 and got[0].ts_local == clock()
+
+
+# ---- REST client + robustness (fake session; shapes frozen from live captures on 2026-09-05) ----------------
+import json
+import logging
+
+from bbo_trader.venues.base import VenueError
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    async def text(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Session:
+    def __init__(self, status=200, body="{}"):
+        self.status, self.body, self.calls = status, body, []
+
+    def get(self, url, **kw):
+        self.calls.append((url, kw))
+        return _Resp(self.status, self.body)
+
+
+LIVE_DETAIL_ROW = {"symbol": "BTC_USDT", "quoteCoin": "USDT", "settleCoin": "USDT", "contractSize": 0.0001, "priceUnit": 0.1,
+                   "volUnit": 1, "minVol": 1, "maxVol": 400000, "state": 0, "apiAllowed": True, "takerFeeRate": 0.0002,
+                   "makerFeeRate": 0, "isNew": False, "isHot": True, "openingTime": 0}
+LIVE_TICKER_ROW = {"contractId": 10, "symbol": "BTC_USDT", "lastPrice": 79805, "bid1": 79804.9, "ask1": 79805,
+                   "volume24": 229640964, "amount24": 1828276834.31004, "fundingRate": 1.8e-05, "timestamp": 1788624278796}
+LIVE_FUNDING_ROW = {"symbol": "BTC_USDT", "fundingRate": 1.8e-05, "collectCycle": 8, "nextSettleTime": 1788652800000,
+                    "timestamp": 1788624281857}
+LIVE_DEPTH_REST = {"success": True, "code": 0, "data": {"cts": None, "asks": [[79805, 99907, 7], [79805.1, 8556, 4]],
+                                                        "bids": [[79804.9, 276151, 5], [79804.8, 9060, 2]],
+                                                        "version": 41535524017, "timestamp": 1788624282021}}
+LIVE_PUSH = {"symbol": "BTC_USDT", "data": {"cts": 1788624282010, "asks": [[79805, 99907, 7]], "bids": [[79804.9, 276151, 5]],
+                                            "version": 41535524017}, "channel": "push.depth.full", "ts": 1788624282021}
+
+
+def test_live_shapes_round_trip():
+    specs = mexc.parse_specs({"success": True, "code": 0, "data": [LIVE_DETAIL_ROW]})
+    assert specs["BTCUSDT"].contract_size == 0.0001 and specs["BTCUSDT"].tick == 0.1 and specs["BTCUSDT"].lot == 1.0
+    assert mexc.parse_tickers({"success": True, "data": [LIVE_TICKER_ROW]}) == {"BTCUSDT": 1828276834.31004}
+    assert mexc.parse_funding({"success": True, "data": [LIVE_FUNDING_ROW]}) == {"BTCUSDT": (1.8e-05, 1788652800.0)}
+    b = mexc.parse_depth(LIVE_PUSH, {"BTC_USDT": 0.0001}, now=1.0)[0]
+    assert b.bid == 79804.9 and b.ask_qty == 99907.0 and b.ts_exchange == pytest.approx(1788624282.010)   # book time (cts)
+    assert b.touch_notional("buy") == pytest.approx(99907 * 79805 * 0.0001)
+    r = mexc.parse_depth_rest(LIVE_DEPTH_REST, "BTC_USDT", 0.0001, 2.0)
+    assert r.bid_qty == 276151.0 and r.ts_exchange == pytest.approx(1788624282.021) and r.contract_size == 0.0001
+
+
+def test_specs_skip_api_disallowed_and_isolate_bad_rows(caplog):
+    rows = [LIVE_DETAIL_ROW, dict(LIVE_DETAIL_ROW, symbol="FATCOIN_USDT", apiAllowed=False),
+            dict(LIVE_DETAIL_ROW, symbol="BAD_USDT", contractSize="n/a"), dict(LIVE_DETAIL_ROW, symbol="NUL_USDT", priceUnit=None),
+            "not-a-row", dict(LIVE_DETAIL_ROW, symbol="OK2_USDT")]
+    with caplog.at_level(logging.WARNING, logger="bbo.mexc"):
+        specs = mexc.parse_specs({"success": True, "data": rows})
+    assert list(specs) == ["BTCUSDT", "OK2USDT"] and "SPEC_ROWS_DROPPED mexc 3 of 6" in caplog.text
+    assert mexc.parse_tickers({"data": [dict(LIVE_TICKER_ROW, amount24=None), LIVE_TICKER_ROW, 5]}) == {"BTCUSDT": 1828276834.31004}
+    assert mexc.parse_funding({"data": [dict(LIVE_FUNDING_ROW, nextSettleTime="x"), LIVE_FUNDING_ROW]}) == {"BTCUSDT": (1.8e-05, 1788652800.0)}
+
+
+def test_unknown_instrument_and_malformed_frames_yield_nothing(caplog):
+    assert mexc.parse_depth(LIVE_PUSH, {}, 1.0) == []                                    # no contract size → no quote
+    assert mexc.parse_depth(dict(LIVE_PUSH, data=[LIVE_PUSH["data"]]), {"BTC_USDT": 1.0}, 1.0) == []
+    assert mexc.parse_depth(dict(LIVE_PUSH, data="junk"), {"BTC_USDT": 1.0}, 1.0) == []
+    assert mexc.parse_depth({"channel": "push.depth.full", "symbol": "BTC_USDT", "data": {"bids": [[1, 1]], "asks": []}},
+                            {"BTC_USDT": 1.0}, 1.0) == []                                 # one-sided book
+    assert mexc.parse_depth({"channel": "push.depth.full", "symbol": "BTC_USDT", "ts": 5000,
+                             "data": {"bids": [["1.5", "2"]], "asks": [["1.6", "3"]]}}, {"BTC_USDT": 1.0}, 1.0)[0].bid == 1.5
+    from bbo_trader.config import VenueConfig
+    got = []
+    feed = mexc.MexcPublic(VenueConfig("mexc", "trade", 0.02, 0.0, max_topics=30), got.append)
+    state = {}
+    with caplog.at_level(logging.WARNING, logger="bbo.mexc"):
+        for _ in range(12):
+            assert feed._parse({"channel": "rs.error", "data": "Contract [BOGUS_USDT] not exists", "ts": 1}, state) == []
+    assert state["errors"] == 12 and caplog.text.count("rs.error") == 2                  # logged at #1 and #10
+    with pytest.raises(ValueError):
+        mexc.to_instrument("BTCUSDC")                                                    # never map to the wrong contract
+    with pytest.raises(ValueError):
+        mexc.to_instrument("USDT")
+
+
+async def test_rest_client_raises_on_error_envelopes_and_never_returns_an_empty_universe():
+    for status, body in ((200, json.dumps({"success": False, "code": 510, "message": "request frequency"})),
+                         (404, json.dumps({"success": False, "code": 404, "message": "Not Found"})),
+                         (429, "Too Many Requests"), (200, "<html>Cloudflare</html>"), (200, json.dumps([1, 2]))):
+        m = mexc.MexcMarket(_Session(status, body))
+        with pytest.raises(VenueError):
+            await m.fetch_specs()
+        with pytest.raises(VenueError):
+            await m.fetch_volumes()
+    m = mexc.MexcMarket(_Session(200, json.dumps({"success": True, "code": 0, "data": []})))
+    with pytest.raises(VenueError, match="no usable contracts"):
+        await m.fetch_specs()                                    # an empty spec set must never reach the App
+    m = mexc.MexcMarket(_Session(200, json.dumps({"success": True, "code": 0, "data": [LIVE_DETAIL_ROW]})), clock=lambda: 7.0)
+    assert list(await m.fetch_specs()) == ["BTCUSDT"]
+    m.session = _Session(200, json.dumps(LIVE_DEPTH_REST))
+    b = await m.fetch_bbo("BTCUSDT")
+    assert b.contract_size == 0.0001 and b.ts_local == 7.0
+    url, kw = m.session.calls[0]
+    assert url.endswith("/api/v1/contract/depth/BTC_USDT?limit=5") and kw["timeout"].total == 5.0 and "User-Agent" in kw["headers"]
+    assert await m.fetch_bbo("NOPEUSDT") is None                 # no spec → no fabricated contract size
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -4616,9 +4733,18 @@ Expected: FAIL with `ImportError` (no module `bbo_trader.venues.mexc`)
 
 ```python
 """MEXC USDT-M contract venue — public side: BBO from `sub.depth.full limit=5` (top level only),
-REST specs / volumes / funding / depth fallback. Plan 2 adds MexcPrivate and MexcTrading here."""
+REST specs / volumes / funding / depth fallback. Plan 2 adds MexcPrivate and MexcTrading here.
+
+Verified against the live API on 2026-09-05: errors come back as HTTP 200 + {"success": false, "code",
+"message"} (so `_get` checks the envelope, not just the status); `state` is 0 for every contract while
+`apiAllowed` is false for ~30 live ones whose orders the API rejects; contract sizes span 1e-5 … 1e7, so an
+instrument without a known size is dropped rather than given a default; `collectCycle` is 4 h for about
+half the book; a bad subscription answers `{"channel": "rs.error", ...}` on an otherwise healthy socket."""
 from __future__ import annotations
 
+import json
+import logging
+import math
 import time
 from typing import Callable, Iterable
 
@@ -4626,7 +4752,10 @@ import aiohttp
 
 from ..config import VenueConfig
 from ..models import BBO, VenueSpec
+from .base import VenueError
 from .ws import WSAdapter, WSRunner
+
+log = logging.getLogger("bbo.mexc")
 
 NAME = "mexc"
 WS_URL = "wss://contract.mexc.com/edge"
@@ -4635,6 +4764,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (bbo-trader/1.0)"}   # Cloudflare rejects 
 
 
 def to_instrument(symbol: str) -> str:
+    if len(symbol) <= 4 or not symbol.endswith("USDT"):
+        raise ValueError(f"mexc: not a USDT symbol: {symbol!r}")
     return f"{symbol[:-4]}_USDT"
 
 
@@ -4646,58 +4777,95 @@ def subscribe(insts: list[str]) -> list[dict]:
     return [{"method": "sub.depth.full", "param": {"symbol": i, "limit": 5}} for i in insts]
 
 
-def parse_depth(raw: dict, contract_size: dict[str, float], now: float) -> list[BBO]:
-    """`push.depth.full` → one BBO from the top levels. Levels are [price, contracts, order_count]."""
-    if raw.get("channel") != "push.depth.full":
-        return []
-    d = raw.get("data") or {}
-    bids, asks = d.get("bids") or [], d.get("asks") or []
-    if not bids or not asks:
-        return []
-    inst = str(raw.get("symbol", ""))
-    return [BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]),
-                float(asks[0][1]), float(raw.get("ts") or 0) / 1000.0, now, contract_size.get(inst, 1.0))]
+def _num(x: object) -> float:
+    """Strict numeric field: missing/empty/non-finite raise so the caller drops the row instead of guessing."""
+    if x is None or x == "":
+        raise ValueError("missing numeric field")
+    f = float(x)
+    if not math.isfinite(f):
+        raise ValueError("non-finite numeric field")
+    return f
 
 
-def parse_depth_rest(raw: dict, inst: str, contract_size: float, now: float) -> BBO | None:
-    d = raw.get("data") or {}
+def _top(d: dict, inst: str, contract_size: float, ts_ms: object, now: float) -> BBO | None:
     bids, asks = d.get("bids") or [], d.get("asks") or []
     if not bids or not asks:
         return None
-    ts = float(d.get("timestamp") or d.get("ts") or 0) / 1000.0
-    return BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]),
-               float(asks[0][1]), ts, now, contract_size)
+    return BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]), float(asks[0][1]),
+               float(ts_ms or 0) / 1000.0, now, contract_size)
+
+
+def parse_depth(raw: dict, contract_size: dict[str, float], now: float) -> list[BBO]:
+    """`push.depth.full` → one BBO from the top levels. Levels are [price, contracts, order_count]. An
+    instrument without a known contract size yields nothing: touch_notional would be wrong by up to 1e4×."""
+    if raw.get("channel") != "push.depth.full":
+        return []
+    d = raw.get("data")
+    if not isinstance(d, dict):
+        return []
+    inst = str(raw.get("symbol", ""))
+    cs = contract_size.get(inst)
+    if cs is None:
+        return []
+    b = _top(d, inst, cs, d.get("cts") or raw.get("ts"), now)     # book time when present, push time otherwise
+    return [b] if b is not None else []
+
+
+def parse_depth_rest(raw: dict, inst: str, contract_size: float, now: float) -> BBO | None:
+    d = raw.get("data")
+    if not isinstance(d, dict):
+        return None
+    return _top(d, inst, contract_size, d.get("timestamp") or d.get("ts"), now)
 
 
 def parse_specs(raw: dict) -> dict[str, VenueSpec]:
-    """`/api/v1/contract/detail` → specs for enabled (state 0) USDT contracts."""
+    """`/api/v1/contract/detail` → specs for enabled, API-tradable USDT contracts. One malformed row costs
+    that row, never the refresh."""
     out: dict[str, VenueSpec] = {}
-    for c in raw.get("data") or []:
-        if c.get("quoteCoin") != "USDT" or int(c.get("state", 0) or 0) != 0:
-            continue
-        inst = c.get("symbol") or ""
-        sym = to_symbol(inst)
-        if not inst or not sym.endswith("USDT"):
-            continue
-        out[sym] = VenueSpec(NAME, sym, inst, float(c.get("contractSize") or 1), float(c.get("volUnit") or 1),
-                             float(c.get("minVol") or 1), float(c.get("priceUnit") or 0.0001))
+    rows = raw.get("data") or []
+    dropped = 0
+    for c in rows:
+        try:
+            if c.get("quoteCoin") != "USDT" or int(c.get("state", 0) or 0) != 0 or not c.get("apiAllowed", True):
+                continue
+            inst = str(c.get("symbol") or "")
+            if not inst.endswith("_USDT"):
+                continue
+            sym = to_symbol(inst)
+            out[sym] = VenueSpec(NAME, sym, inst, _num(c.get("contractSize")), _num(c.get("volUnit")),
+                                 _num(c.get("minVol")), _num(c.get("priceUnit")))
+        except (TypeError, ValueError, AttributeError):
+            dropped += 1
+    if dropped:
+        log.warning("SPEC_ROWS_DROPPED mexc %d of %d", dropped, len(rows))
     return out
 
 
 def parse_tickers(raw: dict) -> dict[str, float]:
-    """`/api/v1/contract/ticker` → 24 h turnover in USDT per symbol (`amount24`)."""
-    return {to_symbol(t["symbol"]): float(t.get("amount24") or 0)
-            for t in raw.get("data") or [] if str(t.get("symbol", "")).endswith("_USDT")}
+    """`/api/v1/contract/ticker` → 24 h turnover in USDT per symbol (`amount24`; `volume24` is contracts)."""
+    out: dict[str, float] = {}
+    for t in raw.get("data") or []:
+        try:
+            inst = str(t.get("symbol", ""))
+            if not inst.endswith("_USDT"):
+                continue
+            out[to_symbol(inst)] = _num(t.get("amount24"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
 
 
 def parse_funding(raw: dict) -> dict[str, tuple[float, float]]:
-    """`/api/v1/contract/funding_rate` → symbol -> (rate, next settlement ts seconds)."""
-    out = {}
+    """`/api/v1/contract/funding_rate` → symbol -> (rate FRACTION, next settlement unix SECONDS)."""
+    out: dict[str, tuple[float, float]] = {}
     for f in raw.get("data") or []:
-        inst = str(f.get("symbol", ""))
-        if not inst.endswith("_USDT"):
+        try:
+            inst = str(f.get("symbol", ""))
+            if not inst.endswith("_USDT"):
+                continue
+            out[to_symbol(inst)] = (_num(f.get("fundingRate")), _num(f.get("nextSettleTime")) / 1000.0)
+        except (TypeError, ValueError, AttributeError):
             continue
-        out[to_symbol(inst)] = (float(f.get("fundingRate") or 0), float(f.get("nextSettleTime") or 0) / 1000.0)
     return out
 
 
@@ -4714,6 +4882,11 @@ class MexcPublic:
             on_items=self._emit, session_factory=session_factory)
 
     def _parse(self, raw: dict, state: dict) -> list[BBO]:
+        if raw.get("channel") == "rs.error":        # a rejected topic on an otherwise healthy socket
+            n = state["errors"] = state.get("errors", 0) + 1
+            if n in (1, 10, 100) or n % 1000 == 0:
+                log.warning("mexc rs.error #%d: %.200s", n, raw.get("data"))
+            return []
         return parse_depth(raw, self.contract_size, self.clock())
 
     def _emit(self, items: list[BBO]) -> None:
@@ -4741,12 +4914,26 @@ class MexcMarket:
         self.specs = specs or {}
 
     async def _get(self, path: str, timeout: float = 10.0) -> dict:
+        """GET + envelope check: MEXC reports errors as HTTP 200 + {"success": false}; a swallowed error would
+        look like an empty market (no contracts, no volumes) to the caller."""
         async with self.session.get(REST + path, headers=HEADERS,
                                     timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            return await r.json(content_type=None)
+            body = await r.text()
+            if r.status != 200:
+                raise VenueError(f"mexc {path} HTTP {r.status}: {body[:200]}")
+        try:
+            d = json.loads(body)
+        except ValueError as e:
+            raise VenueError(f"mexc {path} non-JSON body: {body[:200]}") from e
+        if not isinstance(d, dict) or d.get("success") is not True:
+            raise VenueError(f"mexc {path} error envelope: {str(d)[:200]}")
+        return d
 
     async def fetch_specs(self) -> dict[str, VenueSpec]:
-        self.specs = parse_specs(await self._get("/api/v1/contract/detail"))
+        specs = parse_specs(await self._get("/api/v1/contract/detail"))
+        if not specs:
+            raise VenueError("mexc contract/detail returned no usable contracts")   # never hand out an empty universe
+        self.specs = specs
         return self.specs
 
     async def fetch_volumes(self) -> dict[str, float]:
@@ -4756,16 +4943,17 @@ class MexcMarket:
         return parse_funding(await self._get("/api/v1/contract/funding_rate"))
 
     async def fetch_bbo(self, symbol: str) -> BBO | None:
-        inst = to_instrument(symbol)
         spec = self.specs.get(symbol)
-        raw = await self._get(f"/api/v1/contract/depth/{inst}?limit=5", timeout=5.0)
-        return parse_depth_rest(raw, inst, spec.contract_size if spec else 1.0, self.clock())
+        if spec is None:
+            return None                              # no spec → no contract size → no honest quote
+        raw = await self._get(f"/api/v1/contract/depth/{spec.instrument}?limit=5", timeout=5.0)
+        return parse_depth_rest(raw, spec.instrument, spec.contract_size, self.clock())
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_mexc_public.py -q`
-Expected: `4 passed`
+Expected: `8 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -4809,7 +4997,8 @@ def test_parse_books5_dict_and_list_shapes():
     assert (b.symbol, b.bid, b.bid_qty, b.ask, b.ask_qty, b.contract_size) == ("XYZUSDT", 1.0041, 500.0, 1.0061, 200.0, 0.1)
     assert b.ts_exchange == pytest.approx(1700000000.123) and b.ts_local == 7.0
     raw_list = dict(raw, data=[raw["data"]])
-    assert len(blofin.parse_books5(raw_list, {}, 0.0)) == 1
+    assert len(blofin.parse_books5(raw_list, {"XYZ-USDT": 0.1}, 0.0)) == 1
+    assert blofin.parse_books5(raw_list, {}, 0.0) == []                      # unknown instrument: no contract size, no quote
     assert blofin.parse_books5({"event": "subscribe", "arg": {"channel": "books5"}}, {}, 0.0) == []
     assert blofin.parse_books5({"arg": {"channel": "trades", "instId": "X-USDT"}, "data": []}, {}, 0.0) == []
 
@@ -4841,6 +5030,106 @@ def test_public_feed_wiring(clock):
     feed._emit(feed._parse({"arg": {"channel": "books5", "instId": "XYZ-USDT"},
                             "data": {"bids": [["1", "1"]], "asks": [["1.1", "1"]], "ts": "1000"}}, {}))
     assert got[0].contract_size == 0.1 and got[0].ts_local == clock()
+
+
+# ---- REST client + robustness (fake session; shapes frozen from live captures on 2026-09-05) ----------------
+import json
+import logging
+
+from bbo_trader.venues.base import VenueError
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    async def text(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Session:
+    def __init__(self, status=200, body="{}"):
+        self.status, self.body, self.calls = status, body, []
+
+    def get(self, url, **kw):
+        self.calls.append((url, kw))
+        return _Resp(self.status, self.body)
+
+
+LIVE_INSTRUMENT = {"instId": "BTC-USDT", "baseCurrency": "BTC", "quoteCurrency": "USDT", "contractValue": "0.0001",
+                   "listTime": "1755507600000", "maxLeverage": "125", "minSize": "1", "lotSize": "1", "tickSize": "0.1",
+                   "instType": "SWAP", "contractType": "linear", "state": "live", "settleCurrency": "USDT", "offTime": ""}
+LIVE_TICKER = {"instId": "BTC-USDT", "last": "79758.8", "askPrice": "79755.2", "askSize": "26613", "bidPrice": "79755.1",
+               "bidSize": "1935", "volCurrency24h": "18.9118", "vol24h": "189118", "ts": "1788625085021"}
+LIVE_FUNDING = {"instId": "HOLO-USDT", "fundingRate": "0.000077429202847014", "fundingTime": "1788638400000",
+                "fundingInterval": "4", "fundingIntervalUnit": "hour", "fundingRateCap": "0.03", "fundingRateFloor": "-0.03"}
+LIVE_BOOKS_REST = {"code": "0", "msg": "success", "data": [{"asks": [["79738.8", "5976"], ["79738.9", "256"]],
+                                                            "bids": [["79738.7", "6316"], ["79738.6", "209"]], "ts": "1788625095610"}]}
+LIVE_PUSH = {"arg": {"channel": "books5", "instId": "BTC-USDT"}, "action": "snapshot",
+             "data": {"asks": [["79666.5", "1233"]], "bids": [["79666.4", "980"]], "ts": "1788599375999"}}
+
+
+def test_live_shapes_round_trip():
+    specs = blofin.parse_instruments({"code": "0", "msg": "success", "data": [LIVE_INSTRUMENT]})
+    assert specs["BTCUSDT"].contract_size == 0.0001 and specs["BTCUSDT"].tick == 0.1 and specs["BTCUSDT"].lot == 1.0
+    assert blofin.parse_tickers({"code": "0", "data": [LIVE_TICKER]}) == {"BTCUSDT": pytest.approx(18.9118 * 79758.8)}
+    assert blofin.parse_funding({"code": "0", "data": [LIVE_FUNDING]}) == {"HOLOUSDT": (pytest.approx(7.7429202847014e-05), 1788638400.0)}
+    b = blofin.parse_books5(LIVE_PUSH, {"BTC-USDT": 0.0001}, now=1.0)[0]
+    assert b.bid == 79666.4 and b.ask_qty == 1233.0 and b.ts_exchange == pytest.approx(1788599375.999)
+    assert b.touch_notional("buy") == pytest.approx(1233 * 79666.5 * 0.0001)
+    r = blofin.parse_books_rest(LIVE_BOOKS_REST, "BTC-USDT", 0.0001, 2.0)
+    assert r.bid_qty == 6316.0 and r.ts_exchange == pytest.approx(1788625095.610) and r.contract_size == 0.0001
+
+
+def test_instruments_isolate_bad_rows_and_unknown_instruments_yield_nothing(caplog):
+    rows = [LIVE_INSTRUMENT, dict(LIVE_INSTRUMENT, instId="BAD-USDT", contractValue="n/a"),
+            dict(LIVE_INSTRUMENT, instId="NUL-USDT", tickSize=None), "not-a-row", dict(LIVE_INSTRUMENT, instId="OK2-USDT"),
+            dict(LIVE_INSTRUMENT, instId="BTC-USDC", quoteCurrency="USDC")]
+    with caplog.at_level(logging.WARNING, logger="bbo.blofin"):
+        specs = blofin.parse_instruments({"code": "0", "data": rows})
+    assert list(specs) == ["BTCUSDT", "OK2USDT"] and "SPEC_ROWS_DROPPED blofin 3 of 6" in caplog.text
+    assert blofin.parse_tickers({"data": [dict(LIVE_TICKER, last=None), LIVE_TICKER, 5]}) == {"BTCUSDT": pytest.approx(18.9118 * 79758.8)}
+    assert blofin.parse_funding({"data": [dict(LIVE_FUNDING, fundingTime=""), LIVE_FUNDING]}) == {"HOLOUSDT": (pytest.approx(7.7429202847014e-05), 1788638400.0)}
+    assert blofin.parse_books5(LIVE_PUSH, {}, 1.0) == []                                  # no contract size → no quote
+    assert blofin.parse_books5(dict(LIVE_PUSH, data="junk"), {"BTC-USDT": 1.0}, 1.0) == []
+    assert blofin.parse_books5(dict(LIVE_PUSH, data={"bids": [], "asks": [["1", "1"]], "ts": "1"}), {"BTC-USDT": 1.0}, 1.0) == []
+    from bbo_trader.config import VenueConfig
+    feed = blofin.BlofinPublic(VenueConfig("blofin", "trade", 0.06, 0.02, max_topics=50), lambda b: None)
+    state = {}
+    with caplog.at_level(logging.WARNING, logger="bbo.blofin"):
+        for _ in range(12):
+            assert feed._parse({"event": "error", "code": "60018", "msg": "Wrong URL or channel:books5,instId:BOGUS-USDT doesn't exist"}, state) == []
+    assert state["errors"] == 12 and caplog.text.count("error event") == 2
+    with pytest.raises(ValueError):
+        blofin.to_instrument("BTCUSDC")
+
+
+async def test_rest_client_raises_on_error_envelopes_and_never_returns_an_empty_universe():
+    for status, body in ((200, json.dumps({"code": "152002", "msg": "Parameter instId error."})),
+                         (200, json.dumps({"code": "429", "msg": "Too Many Requests"})),
+                         (503, "<html>maintenance</html>"), (200, "not json"), (200, json.dumps([1]))):
+        m = blofin.BlofinMarket(_Session(status, body))
+        with pytest.raises(VenueError):
+            await m.fetch_specs()
+        with pytest.raises(VenueError):
+            await m.fetch_funding()
+    m = blofin.BlofinMarket(_Session(200, json.dumps({"code": "0", "msg": "success", "data": []})))
+    with pytest.raises(VenueError, match="no usable instruments"):
+        await m.fetch_specs()
+    m = blofin.BlofinMarket(_Session(200, json.dumps({"code": "0", "msg": "success", "data": [LIVE_INSTRUMENT]})), clock=lambda: 7.0)
+    assert list(await m.fetch_specs()) == ["BTCUSDT"]
+    m.session = _Session(200, json.dumps(LIVE_BOOKS_REST))
+    b = await m.fetch_bbo("BTCUSDT")
+    assert b.contract_size == 0.0001 and b.ts_local == 7.0
+    url, kw = m.session.calls[0]
+    assert url.endswith("/api/v1/market/books?instId=BTC-USDT&size=5") and kw["timeout"].total == 5.0 and "User-Agent" in kw["headers"]
+    assert await m.fetch_bbo("NOPEUSDT") is None
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -4853,10 +5142,18 @@ Expected: FAIL with `ImportError` (no module `bbo_trader.venues.blofin`)
 ```python
 """BloFin USDT swaps venue — public side: BBO from `books5` snapshots (top level only), REST
 instruments / tickers / funding / books fallback. Plan 2 adds BlofinPrivate and BlofinTrading here.
-Shapes as captured live by SpreadWatch (2026-08-23): books5 `data` is a DICT, keepalive is a bare
-text `ping` answered with `pong`."""
+
+Shapes as captured live (SpreadWatch 2026-08-23, re-verified 2026-09-05): books5 `data` is a DICT on the
+WS and a one-element LIST on REST, prices/sizes are strings, keepalive is a bare text `ping` answered with
+`pong`. Errors come back as HTTP 200 + {"code": "152002", "msg": ...} with no `data` (so `_get` checks
+`code == "0"`); a rejected subscription answers {"event": "error", ...} on a healthy socket; `fundingTime`
+is the UPCOMING settlement and `fundingInterval` is 4 or 8 hours; every instrument is `state: live` today,
+contract values span 1e-4 … 1e7."""
 from __future__ import annotations
 
+import json
+import logging
+import math
 import time
 from typing import Callable, Iterable
 
@@ -4864,14 +5161,20 @@ import aiohttp
 
 from ..config import VenueConfig
 from ..models import BBO, VenueSpec
+from .base import VenueError
 from .ws import WSAdapter, WSRunner
+
+log = logging.getLogger("bbo.blofin")
 
 NAME = "blofin"
 WS_URL = "wss://openapi.blofin.com/ws/public"
 REST = "https://openapi.blofin.com"
+HEADERS = {"User-Agent": "Mozilla/5.0 (bbo-trader/1.0)"}
 
 
 def to_instrument(symbol: str) -> str:
+    if len(symbol) <= 4 or not symbol.endswith("USDT"):
+        raise ValueError(f"blofin: not a USDT symbol: {symbol!r}")
     return f"{symbol[:-4]}-USDT"
 
 
@@ -4883,68 +5186,96 @@ def subscribe(insts: list[str]) -> list[dict]:
     return [{"op": "subscribe", "args": [{"channel": "books5", "instId": i} for i in insts]}]
 
 
+def _num(x: object) -> float:
+    """Strict numeric field: missing/empty/non-finite raise so the caller drops the row instead of guessing."""
+    if x is None or x == "":
+        raise ValueError("missing numeric field")
+    f = float(x)
+    if not math.isfinite(f):
+        raise ValueError("non-finite numeric field")
+    return f
+
+
 def _rows(data) -> list[dict]:
     if isinstance(data, dict):
         return [data]
     return [d for d in (data or []) if isinstance(d, dict)]
 
 
+def _top(d: dict, inst: str, contract_size: float, now: float) -> BBO | None:
+    bids, asks = d.get("bids") or [], d.get("asks") or []
+    if not bids or not asks:
+        return None
+    return BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]), float(asks[0][1]),
+               float(d.get("ts") or 0) / 1000.0, now, contract_size)
+
+
 def parse_books5(raw: dict, contract_size: dict[str, float], now: float) -> list[BBO]:
+    """books5 push → one BBO per row. An instrument without a known contract size yields nothing."""
     if (raw.get("arg") or {}).get("channel") != "books5" or "data" not in raw:
         return []
     inst = str(raw["arg"].get("instId", ""))
+    cs = contract_size.get(inst)
+    if cs is None:
+        return []
     out = []
     for d in _rows(raw["data"]):
-        bids, asks = d.get("bids") or [], d.get("asks") or []
-        if not bids or not asks:
-            continue
-        out.append(BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]),
-                       float(asks[0][1]), float(d.get("ts") or 0) / 1000.0, now, contract_size.get(inst, 1.0)))
+        b = _top(d, inst, cs, now)
+        if b is not None:
+            out.append(b)
     return out
 
 
 def parse_books_rest(raw: dict, inst: str, contract_size: float, now: float) -> BBO | None:
     rows = _rows(raw.get("data"))
-    if not rows:
-        return None
-    d = rows[0]
-    bids, asks = d.get("bids") or [], d.get("asks") or []
-    if not bids or not asks:
-        return None
-    return BBO(NAME, to_symbol(inst), float(bids[0][0]), float(bids[0][1]), float(asks[0][0]),
-               float(asks[0][1]), float(d.get("ts") or 0) / 1000.0, now, contract_size)
+    return _top(rows[0], inst, contract_size, now) if rows else None
 
 
 def parse_instruments(raw: dict) -> dict[str, VenueSpec]:
+    """`/api/v1/market/instruments` → specs for live USDT swaps. One malformed row costs that row only."""
     out: dict[str, VenueSpec] = {}
-    for c in raw.get("data") or []:
-        inst = str(c.get("instId", ""))
-        if not inst.endswith("-USDT") or str(c.get("state", "live")) != "live":
-            continue
-        sym = to_symbol(inst)
-        out[sym] = VenueSpec(NAME, sym, inst, float(c.get("contractValue") or 1), float(c.get("lotSize") or 1),
-                             float(c.get("minSize") or 1), float(c.get("tickSize") or 0.0001))
+    rows = raw.get("data") or []
+    dropped = 0
+    for c in rows:
+        try:
+            inst = str(c.get("instId", ""))
+            if not inst.endswith("-USDT") or str(c.get("state", "live")) != "live":
+                continue
+            sym = to_symbol(inst)
+            out[sym] = VenueSpec(NAME, sym, inst, _num(c.get("contractValue")), _num(c.get("lotSize")),
+                                 _num(c.get("minSize")), _num(c.get("tickSize")))
+        except (TypeError, ValueError, AttributeError):
+            dropped += 1
+    if dropped:
+        log.warning("SPEC_ROWS_DROPPED blofin %d of %d", dropped, len(rows))
     return out
 
 
 def parse_tickers(raw: dict) -> dict[str, float]:
-    """`/api/v1/market/tickers` → 24 h USD volume ≈ volCurrency24h × last."""
-    out = {}
+    """`/api/v1/market/tickers` → 24 h USD volume ≈ volCurrency24h (base units) × last."""
+    out: dict[str, float] = {}
     for t in raw.get("data") or []:
-        inst = str(t.get("instId", ""))
-        if not inst.endswith("-USDT"):
+        try:
+            inst = str(t.get("instId", ""))
+            if not inst.endswith("-USDT"):
+                continue
+            out[to_symbol(inst)] = _num(t.get("volCurrency24h")) * _num(t.get("last"))
+        except (TypeError, ValueError, AttributeError):
             continue
-        out[to_symbol(inst)] = float(t.get("volCurrency24h") or 0) * float(t.get("last") or 0)
     return out
 
 
 def parse_funding(raw: dict) -> dict[str, tuple[float, float]]:
-    out = {}
+    """`/api/v1/market/funding-rate` → symbol -> (rate FRACTION, upcoming settlement unix SECONDS)."""
+    out: dict[str, tuple[float, float]] = {}
     for f in raw.get("data") or []:
-        inst = str(f.get("instId", ""))
-        if not inst.endswith("-USDT"):
+        try:
+            inst = str(f.get("instId", ""))
+            if not inst.endswith("-USDT"):
+                continue
+            out[to_symbol(inst)] = (_num(f.get("fundingRate")), _num(f.get("fundingTime")) / 1000.0)
+        except (TypeError, ValueError, AttributeError):
             continue
-        out[to_symbol(inst)] = (float(f.get("fundingRate") or 0), float(f.get("fundingTime") or 0) / 1000.0)
     return out
 
 
@@ -4961,6 +5292,11 @@ class BlofinPublic:
             on_items=self._emit, session_factory=session_factory)
 
     def _parse(self, raw: dict, state: dict) -> list[BBO]:
+        if raw.get("event") == "error":              # a rejected topic on an otherwise healthy socket
+            n = state["errors"] = state.get("errors", 0) + 1
+            if n in (1, 10, 100) or n % 1000 == 0:
+                log.warning("blofin error event #%d: code=%s %.200s", n, raw.get("code"), raw.get("msg"))
+            return []
         return parse_books5(raw, self.contract_size, self.clock())
 
     def _emit(self, items: list[BBO]) -> None:
@@ -4988,11 +5324,25 @@ class BlofinMarket:
         self.specs = specs or {}
 
     async def _get(self, path: str, timeout: float = 10.0) -> dict:
-        async with self.session.get(REST + path, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            return await r.json(content_type=None)
+        """GET + envelope check: BloFin reports errors as HTTP 200 + {"code": "<non-zero>", "msg"} without `data`."""
+        async with self.session.get(REST + path, headers=HEADERS,
+                                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            body = await r.text()
+            if r.status != 200:
+                raise VenueError(f"blofin {path} HTTP {r.status}: {body[:200]}")
+        try:
+            d = json.loads(body)
+        except ValueError as e:
+            raise VenueError(f"blofin {path} non-JSON body: {body[:200]}") from e
+        if not isinstance(d, dict) or str(d.get("code")) != "0":
+            raise VenueError(f"blofin {path} error envelope: {str(d)[:200]}")
+        return d
 
     async def fetch_specs(self) -> dict[str, VenueSpec]:
-        self.specs = parse_instruments(await self._get("/api/v1/market/instruments"))
+        specs = parse_instruments(await self._get("/api/v1/market/instruments"))
+        if not specs:
+            raise VenueError("blofin market/instruments returned no usable instruments")
+        self.specs = specs
         return self.specs
 
     async def fetch_volumes(self) -> dict[str, float]:
@@ -5002,16 +5352,17 @@ class BlofinMarket:
         return parse_funding(await self._get("/api/v1/market/funding-rate"))
 
     async def fetch_bbo(self, symbol: str) -> BBO | None:
-        inst = to_instrument(symbol)
         spec = self.specs.get(symbol)
-        raw = await self._get(f"/api/v1/market/books?instId={inst}&size=5", timeout=5.0)
-        return parse_books_rest(raw, inst, spec.contract_size if spec else 1.0, self.clock())
+        if spec is None:
+            return None
+        raw = await self._get(f"/api/v1/market/books?instId={spec.instrument}&size=5", timeout=5.0)
+        return parse_books_rest(raw, spec.instrument, spec.contract_size, self.clock())
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_blofin_public.py -q`
-Expected: `4 passed`
+Expected: `7 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -5375,7 +5726,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `100 passed`
+Expected: `107 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py deploy-bbo/tests/test_venue_protocols.py
@@ -6547,7 +6898,7 @@ Expected: `12 passed`
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `115 passed`
+Expected: `122 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -6972,7 +7323,7 @@ from .positions import PositionBook, StateStore, StateCorrupt, build_state
 from .quotes import QuoteBoard
 from .risk import RiskManager
 from .strategy import PairEvaluator
-from .venues.base import Venue
+from .venues.base import Venue, VenueError
 from .venues.sim import SimVenue
 
 log = logging.getLogger("bbo.app")
@@ -7076,26 +7427,36 @@ class App:
 
     # ---- market data / universe ---------------------------------------------------------
     async def refresh_market_data(self) -> None:
+        """Hourly: specs (never replaced by an empty set — that would collapse the universe and unsubscribe
+        every feed) and 24 h volumes. Funding has its own 5-minute loop (4 h settlement grids)."""
         async def one(v: Venue):
             specs = await v.market.fetch_specs()
+            if not specs:
+                raise VenueError(f"{v.name}: empty spec set — keeping the {len(v.specs)} known contracts")
             v.specs.clear()
             v.specs.update(specs)
             v.public.set_specs(v.specs)
             v.market.specs = v.specs
             try:
+                volumes = await v.market.fetch_volumes()
                 v.volumes.clear()
-                v.volumes.update(await v.market.fetch_volumes())
-            except Exception as e:  # noqa: BLE001
+                v.volumes.update(volumes)
+            except Exception as e:  # noqa: BLE001 — the volume gate then fails open, counted as volume_unknown
                 log.warning("VOLUMES_FAILED %s: %r", v.name, e)
-            try:
-                self.risk.set_funding(v.name, await v.market.fetch_funding())
-            except Exception as e:  # noqa: BLE001
-                log.warning("FUNDING_FAILED %s: %r", v.name, e)
         results = await asyncio.gather(*(one(v) for v in self.venues.values() if v.market), return_exceptions=True)
         for v, r in zip([v for v in self.venues.values() if v.market], results):
             if isinstance(r, Exception):
                 log.warning("SPECS_FAILED %s: %r", v.name, r)
         self.apply_universe()
+
+    async def refresh_funding(self) -> None:
+        for v in self.venues.values():
+            if v.market is None:
+                continue
+            try:
+                self.risk.set_funding(v.name, await v.market.fetch_funding())
+            except Exception as e:  # noqa: BLE001
+                log.warning("FUNDING_FAILED %s: %r", v.name, e)
 
     def apply_universe(self) -> None:
         specs = {name: v.specs for name, v in self.venues.items()}
@@ -7222,16 +7583,27 @@ class App:
                 self.risk.set_balance(v.name, bal.get("available", 0.0), bal.get("total", 0.0))
 
     async def _quote_fallback(self) -> None:
-        """Open positions must never depend on WS health: pull a REST BBO for stale legs."""
+        """Open positions must never depend on WS health: pull a REST BBO for stale legs (concurrently, each
+        guarded — one hung endpoint must not delay the other legs)."""
         now = self.clock()
+
+        async def one(v: Venue, symbol: str) -> None:
+            try:
+                bbo = await v.market.fetch_bbo(symbol)
+            except Exception as e:  # noqa: BLE001
+                log.warning("QUOTE_FALLBACK_FAILED %s %s: %r", v.name, symbol, e)
+                return
+            if bbo is not None:
+                self.on_bbo(bbo)
+        jobs = []
         for pos in list(self.book.open):
             for venue in (pos.venue_a, pos.venue_b):
                 v = self.venues.get(venue)
                 if v is None or v.market is None or self.board.fresh(venue, pos.symbol, now) is not None:
                     continue
-                bbo = await v.market.fetch_bbo(pos.symbol)
-                if bbo is not None:
-                    self.on_bbo(bbo)
+                jobs.append(one(v, pos.symbol))
+        if jobs:
+            await asyncio.gather(*jobs)
 
     async def _poll_telegram(self) -> None:
         if self.telegram is None:
@@ -7246,6 +7618,7 @@ class App:
     async def run(self) -> None:
         self.load_state()
         await self.refresh_market_data()
+        await self.refresh_funding()
         for v in self.venues.values():
             if v.private is not None:
                 v.private.set_handler(self.executor.on_order_event)
@@ -7258,6 +7631,7 @@ class App:
                   asyncio.create_task(self._loop(30.0, self._refresh_balances)),
                   asyncio.create_task(self._loop(60.0, self._watchdog)),
                   asyncio.create_task(self._loop(3600.0, self.refresh_market_data)),
+                  asyncio.create_task(self._loop(300.0, self.refresh_funding)),
                   asyncio.create_task(self._loop(5.0, self._poll_telegram))]
         if self.telegram is not None:
             await self.telegram.send(f"BBO trader started [{self.cfg.mode}] venues={list(self.venues)} universe={len(self.universe)}")
@@ -7387,7 +7761,7 @@ Expected: `6 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `124 passed`
+Expected: `131 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -7510,7 +7884,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Third round (approved): the shipped-defaults test pins `receive_timeout is None`/`heartbeat == 20`/`data_timeout == 120`, and a close caused by a heartbeat timeout logs the socket's exception instead of "by server". Re-review round (approved): nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended after code review:** `close()` is idempotent (late duplicate terminal events), `discard()` only from TT_ENTERING/MAKER_RESTING, `OPEN → CLOSED/DEGRADED` for reconciliation, equity history uses the dashboard's `t`/`v` keys (2,000 points), `StateStore` fsyncs and keeps a `.bak`, raises `StateCorrupt` instead of silently starting fresh (live refuses to start, paper falls back to the backup), non-finite floats are sanitized, `next_id` is repaired from the ids in the file, `kill_switch` mirrors the manual halt; `App.save_state` is async (serialization off the loop) and passes realized-only `cash`; the live file is never absent (hard-link `.bak`, unique tmp, lock-serialized saves, a missing file next to a backup is a torn save), non-object JSON is corrupt, CLOSED entries under `open_positions` are routed to `closed`; 4 positions tests + 1 app test added. **Task 6 amended after code review:** a 429 penalty halves capacity for non-priority callers only (hedges/closes/cancels keep the full window, per spec), unknown budget kinds raise, the window boundary is exclusive, `to_dict` clamps at 0 and reports `shared`/`penalized`; `config.py` validates rate limits (`0 <= reserve < min(orders, cancels)`, positive window) and `venues.json` carries 10% headroom; 4 budget tests + 1 config test added. **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). **Task 8 amended after code review (2026-09-05):** flag files are edge-triggered and consumed on read (a Telegram `/start` really resumes; stop wins over a simultaneous start; an undeletable flag is logged and ignored, never raises), gates never raise and fail closed (unknown or quote-only venue → `venue_blocked`; live mode with a missing/stale balance cache → `balance_unknown`; `invalid` for same-venue or non-positive size), the pair win-rate gate reads outcomes inside `pair_stats_window_s` (so a route can recover) and ignores zero-P&L and `counts_as_trade=False` closes, strikes decay after `strike_decay_s` (`pair_strikes` values are `{n, ts}`; `build_state` maps them back to bare counts for the dashboard), the funding gate needs a net cost above `funding_block_min_pct` and reports dead feeds in `stale_funding`, the mismatch guard validates its thresholds, logs `MISMATCH_BLACKLIST` and records when/why, `to_dict()` is a true snapshot and `load()` tolerates corrupt or legacy values; Config gained `strike_decay_s`, `symbol_loss_pct`, `pair_stats_window_s`, `pair_min_trades`, `pair_min_win_rate`, `balance_max_age_s`, `funding_block_min_pct`; Task 19's `sweep_once` logs the no-op flag results; 4 tests added (9 total). Re-review round: `resume()` consumes only `start.flag` (a stop written meanwhile is still honoured), a non-file `start.flag` is logged (`FLAG_NOT_A_FILE`) and ignored while any path named `stop.flag` halts, non-finite values are rejected at load (`pair_strikes`, `pair_stats`) and ingest (`set_funding`), a bad `recent` entry drops the entry not the route, the symbol-loss blacklist applies even to `counts_as_trade=False` closes, and `build_state`'s strike mapping is covered by the positions test. Carry-forward: Plan 2 reconciliation closes must call `record_close(pos, counts_as_trade=False)`. Verified live 2026-09-05: BloFin's `fundingTime` is the UPCOMING settlement (≈2 h ahead at probe time), so Task 13's `parse_funding` needs no change. Third round (approved): a non-iterable `recent` drops the entry not the route, `OverflowError` from `int(inf)` is caught at load, and flag signatures use `lstat` so a dangling symlink named `stop.flag` still halts. **Task 9 amended after code review (2026-09-05):** the time stop fires before the stale-quote gate (a market close needs no quote), a position whose venue left the registry yields NONE/`venue_unknown` (logged once) instead of a KeyError, `UPGRADE_TT` requires the same touch depth as a TT entry, routes are ranked TT-before-TM and then by surplus over the mode's bar (a TM edge is inflated by the maker venue's width), a TT route with a thin taker touch falls back to TM on the same pair (`tt_depth_fallback`), pair-symmetric gates (`insane`, `mismatch`) count once per unordered pair on a direction-free mid spread, `evaluated`/`volume_unknown`/`upgrade_depth` funnel counters, REQUOTE is suppressed while a requote is in flight, a resting exit maker is cancelled (never orphaned) when TM exits are disabled or the policy names a third venue (`tm_exit_disabled`/`no_maker_venue`/`venue_changed`), TM exits require hedge-touch depth (`hedge_depth`), the divergence stop uses a `stop_ref_spread_pct` on the (bid_A − ask_B) basis (new Position field, Task 2), the scanner skips mismatch-blacklisted/insane pairs and sorts by the winning edge, `params` is a cached_property; 6 tests added (13 total). Cross-task: Task 16's `requote` stamps `maker_last_requote_ts` on the attempt and a cancel+new requote keeps the TTL clock (`keep_posted_ts`); Task 19's `_drive` is guarded per position (`DRIVE_ERROR`) and `App.load_state` runs `_check_position_venues` — live refuses to start (`VenueMissing`, exit 4) and paper books the position closed as `venue_removed`; 1 app test added. Quote-only venues in the scanner are Plan 3. **Task 10 amended after code review (2026-09-05):** `MarketData` declares `specs`, the `Trading` docstring fixes units (contracts / quote currency / "buy"|"sell"), the meaning of `OrderAck.ok` and the `balance()` keys, `PublicFeed` states that specs must precede quotes, `fetch_funding` documents fraction + unix seconds, `Venue.specs` is documented as a shared alias (mutate in place), `Venue.tradeable` also requires the private feed, and `Trading.cancel` returns an `OrderAck`: Task 14's `SimVenue.cancel` returns `OrderAck(False, error="terminal")`/`OrderAck(True, order_id)`, Task 16's `_cancel_maker_order` notes rate limits on cancel errors and, when the order is not terminal at the venue, clears `maker_cancel_sent`/`requote_pending`/`upgrade_pending` so the strategy can retry (`CANCEL_FAILED`); the cancel+new requote stamps `maker_last_requote_ts` on the attempt; Task 14 gains `tests/test_venue_protocols.py` (structural conformance of every adapter to the protocols); 1 executor test added. Plan 2 notes: `VenuePosition` may gain `entry_price` for reconciliation P&L; `place_market` has no `position_id` — MexcTrading keeps its own symbol→positionId map (one position per symbol). **Task 11 amended after code review (2026-09-05):** a parse/consumer exception costs one frame, never the socket (`dropped frame #n` logged at 1/10/100/…), `WSAdapter.receive_timeout` (default 10 s) drops a silent socket via `aiohttp.ClientWSTimeout(ws_receive=…)`, a failing keepalive is logged (`keepalive failed`) and closes the socket, `ws.close()` on teardown is bounded to 5 s (a venue that keeps streaming while we leave would park the shard), the pinger is awaited after cancel, repeated server closes log at DEBUG after the first; Tasks 12/13 no longer pass `heartbeat=None` (SpreadWatch runs both venues with aiohttp's 20 s protocol ping); `config.py` rejects `max_topics < 0` (zero shards); 3 ws tests + 1 config test added. Re-review round: `receive_timeout` defaults to None (under the 20 s heartbeat it churned healthy idle sockets; above it PONGs reset it so it could never fire) — liveness is aiohttp's heartbeat for wedged TCP plus a `data_timeout` watchdog (120 s without a frame that parsed to items → `no data for` → reconnect) for dead subscriptions; `closes`/`bad` are cumulative per shard with escalating log sparsity; a shipped-defaults test keeps a quiet-but-ponging socket; 1 ws test added. Third round (approved): the shipped-defaults test pins `receive_timeout is None`/`heartbeat == 20`/`data_timeout == 120`, and a close caused by a heartbeat timeout logs the socket's exception instead of "by server". **Tasks 12/13 amended after the Task 12 code review (2026-09-05, verified against both live APIs):** `_get` raises `VenueError` (new, `venues/base.py`) on a non-200 status, a non-JSON body or an error ENVELOPE (MEXC `success != true`, BloFin `code != "0"` — both venues report errors as HTTP 200), and `fetch_specs` raises rather than returning an empty set; `parse_specs` also requires `apiAllowed` (MEXC: `state` is 0 for every contract, `apiAllowed` false for ~30 live ones); every row parser isolates a malformed row (`SPEC_ROWS_DROPPED`) and uses strict numerics (no `or` defaults); an instrument without a known contract size yields no BBO (sizes span 1e-5…1e7) and `fetch_bbo` returns None without a spec; `to_instrument` rejects non-USDT symbols; MEXC `ts_exchange` prefers `data.cts`; rejected subscriptions (`rs.error` / `event: error`) are logged with escalating sparsity; BloFin sends a User-Agent. Task 19: `refresh_market_data` never applies an empty spec set, funding has its own 5-minute loop (`refresh_funding`; both venues run 4 h and 8 h grids), `_quote_fallback` fetches legs concurrently with a per-call guard (`QUOTE_FALLBACK_FAILED`). Live-shape fixtures + fake-session REST tests: 4 MEXC and 3 BloFin tests added. Re-review round (approved): nothing is emitted for a resting maker while a cancel or requote is in flight (`in_flight`, covers REQUOTE and UPGRADE_TT), `_finalize_maker` clears a stale `upgrade_pending` when it re-posts a requote, a TM position's stop reference is `min(s_now, entry_spread_pct)` (a late first evaluation cannot anchor to a diverged spread), `stop_ref_spread_pct` is `None` until set, routes rank by (TT-first, edge), `volume_unknown` counts once per evaluation, the OPEN take-profit branch is guarded on `status == OPEN`, and the scanner test has a wide-book symbol whose edge order differs from its spread order. Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.

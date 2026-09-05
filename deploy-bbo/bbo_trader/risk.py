@@ -310,9 +310,9 @@ class RiskManager:
     def funding_blocks(self, symbol: str, venue_a: str, venue_b: str) -> bool:
         """Rates are FRACTIONS as exchanges deliver them (0.0001 = 0.01 %); positive = longs pay shorts.
         Short on A receives A's rate, long on B pays B's rate. Blocks only when the settlements inside
-        `funding_block_s` net to a cost above `funding_block_min_pct` (percent points): both v1 venues
-        settle on the same 8-hour grid with near-identical rates, so a zero threshold would block half
-        of all routes over a few thousandths of a basis point. A settle stamp already in the past means
+        `funding_block_s` net to a cost above `funding_block_min_pct` (percent points): the venues settle
+        on 4 h / 8 h grids (MEXC `collectCycle`, BloFin `fundingInterval`) with near-identical rates, so a
+        zero threshold would block half of all routes over a few thousandths of a basis point. A settle stamp already in the past means
         the feed is dead for that key: treated as unknown (allowed) and reported in `stale_funding`."""
         now = self.clock()
         net, in_window = 0.0, False
