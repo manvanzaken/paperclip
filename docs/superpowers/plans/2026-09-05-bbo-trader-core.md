@@ -1542,7 +1542,8 @@ git commit -m "feat(bbo): pure edge math — TT/TM edges, mode rule, pegged make
 ```python
 import pytest
 
-from bbo_trader.sizing import contracts_for_usd, notional, size_pair, hedge_qty
+from bbo_trader.sizing import (contracts_for_usd, notional, size_pair, hedge_qty, hedge_plan, lots_floor,
+                               excess_to_flatten)
 from tests.conftest import mk_spec
 
 
@@ -1554,6 +1555,13 @@ def test_contracts_for_usd_respects_lot_and_min():
     assert contracts_for_usd(25.0, 0.0031, mk_spec("mexc", lot=10.0)) == 8060.0   # 8064.5 -> lot 10
     assert contracts_for_usd(0.0, 2.0, s) == 0.0
     assert notional(12.0, 2.0, s) == 24.0
+    # fractional lots stay on the lot grid; sub-unit contract sizes (BloFin BTC = 0.001) work
+    assert contracts_for_usd(25.0, 65000.0, mk_spec("blofin", contract_size=0.001, lot=0.1, min_qty=0.1)) == 0.3
+    assert contracts_for_usd(0.3 * 65.0, 65000.0, mk_spec("blofin", contract_size=0.001, lot=0.1, min_qty=0.1)) == 0.3
+    assert contracts_for_usd(25.0, 65000.0, mk_spec("blofin", contract_size=0.001, lot=1.0, min_qty=1.0)) == 0.0
+    # non-finite inputs fail closed instead of raising
+    assert contracts_for_usd(float("nan"), 2.0, s) == 0.0 and contracts_for_usd(25.0, float("inf"), s) == 0.0
+    assert lots_floor(2.3, mk_spec("x", lot=0.5, min_qty=0.5)) == 2.0 and lots_floor(0.3, s) == 0.0
 
 
 def test_size_pair_matches_notionals_within_tolerance():
@@ -1576,11 +1584,46 @@ def test_size_pair_returns_none_when_unexpressible():
     assert size_pair(25.0, 1.0, 1.0, mk_spec("blofin", min_qty=30.0), sa, 5.0) is None
 
 
-def test_hedge_qty_and_unhedgeable_partial():
+def test_size_pair_coarse_vs_fine_lots_and_min_usd():
+    fine = mk_spec("blofin", contract_size=1.0, lot=1.0, min_qty=1.0)          # $0.001 per contract
+    coarse = mk_spec("mexc", contract_size=10000.0, lot=1.0, min_qty=1.0)      # $10 per contract
+    legs = size_pair(25.0, 0.001, 0.001, fine, coarse, max_mismatch_pct=5.0)   # 4,000 single-lot steps before
+    assert legs is not None and legs.qty_b == 2.0 and legs.matched_usd == pytest.approx(20.0)
+    assert legs.qty_a == 21000.0 and legs.mismatch_pct == pytest.approx(5.0)
+    # the matched notional can fall below the minimum position: enforce it here
+    assert size_pair(25.0, 0.001, 0.001, fine, coarse, 5.0, min_usd=10.0) is not None   # matched $20 >= $10
+    assert size_pair(25.0, 0.001, 0.001, fine, coarse, 5.0, min_usd=21.0) is None       # matched $20 < $21
+    assert size_pair(12.0, 0.001, 0.001, fine, coarse, 5.0, min_usd=10.0).matched_usd == pytest.approx(10.0)
+    assert size_pair(9.0, 0.001, 0.001, fine, coarse, 5.0, min_usd=10.0) is None        # one $10 contract does not fit $9
+    # both legs shrink when neither is a multiple of the other
+    a3 = mk_spec("a", contract_size=3.0, lot=1.0, min_qty=1.0)
+    b7 = mk_spec("b", contract_size=7.0, lot=1.0, min_qty=1.0)
+    legs = size_pair(25.0, 1.0, 1.0, a3, b7, max_mismatch_pct=5.0)
+    assert legs is not None and legs.mismatch_pct <= 5.0 and legs.matched_usd == pytest.approx(21.0)
+    assert (legs.qty_a, legs.qty_b) == (7.0, 3.0)
+
+
+def test_hedge_plan_tracks_covered_and_residual():
     sm = mk_spec("blofin", contract_size=1.0, lot=1.0, min_qty=1.0)
     sh = mk_spec("mexc", contract_size=10.0, lot=1.0, min_qty=1.0)
     assert hedge_qty(20.0, 1.0, sm, 1.0, sh) == 2.0
     assert hedge_qty(7.0, 1.0, sm, 1.0, sh) == 0.0      # $7 < one $10 contract -> unhedgeable
+    plan = hedge_plan(25.0, 1.0, sm, 1.0, sh)           # $25 of maker fill, $10 hedge contracts
+    assert plan.hedge_qty == 2.0 and plan.covered_maker_qty == 20.0 and plan.residual_maker_qty == 5.0
+    plan = hedge_plan(10.0, 1.0061, sm, 1.0010, sh)     # $10.06 fill -> 1 hedge contract ($10.01) covers 9.949
+    assert plan.hedge_qty == 1.0 and plan.covered_maker_qty == pytest.approx(9.9493, abs=1e-3)
+    assert plan.residual_maker_qty == pytest.approx(10.0 - plan.covered_maker_qty)
+    none = hedge_plan(7.0, 1.0, sm, 1.0, sh)
+    assert none.hedge_qty == 0.0 and none.covered_maker_qty == 0.0 and none.residual_maker_qty == 7.0
+
+
+def test_excess_to_flatten_rules():
+    sm = mk_spec("blofin", contract_size=1.0, lot=1.0, min_qty=1.0)
+    assert excess_to_flatten(0.05, 9.95, sm, 5.0) == 0.0          # within tolerance -> accept
+    assert excess_to_flatten(5.0, 20.0, sm, 5.0) == 5.0           # 25% of matched -> flatten all 5 lots
+    assert excess_to_flatten(7.0, 0.0, sm, 5.0) == 7.0            # nothing matched -> flatten
+    assert excess_to_flatten(0.4, 0.0, sm, 5.0) == 0.0            # below one lot: dust, cannot be sent
+    assert excess_to_flatten(0.0, 20.0, sm, 5.0) == 0.0
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1591,7 +1634,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bbo_trader.sizing'`
 - [ ] **Step 3: Implement `bbo_trader/sizing.py`**
 
 ```python
-"""Pure sizing: USD notional → venue contracts, matched pair legs, hedge quantities."""
+"""Pure sizing: USD notional → venue contracts, matched pair legs, hedge plans and residual handling."""
 from __future__ import annotations
 
 import math
@@ -1600,13 +1643,20 @@ from dataclasses import dataclass
 from .models import VenueSpec
 
 
+def lots_floor(qty: float, spec: VenueSpec) -> float:
+    """Largest lot multiple <= qty; 0.0 when below the venue minimum (or qty is not a finite positive)."""
+    if not math.isfinite(qty) or qty <= 0 or spec.lot <= 0:
+        return 0.0
+    lots = qty / spec.lot
+    n = round(math.floor(lots + 1e-9 * max(1.0, lots)) * spec.lot, 10)
+    return n if n >= spec.min_qty - 1e-12 else 0.0
+
+
 def contracts_for_usd(usd: float, price: float, spec: VenueSpec) -> float:
     """Largest lot-multiple not exceeding `usd` at `price`; 0.0 when below the venue minimum."""
-    if usd <= 0 or price <= 0 or spec.contract_size <= 0 or spec.lot <= 0:
+    if not (math.isfinite(usd) and math.isfinite(price)) or usd <= 0 or price <= 0 or spec.contract_size <= 0:
         return 0.0
-    raw = usd / (price * spec.contract_size)
-    n = round(math.floor(raw / spec.lot + 1e-9) * spec.lot, 10)
-    return n if n >= spec.min_qty - 1e-12 else 0.0
+    return lots_floor(usd / (price * spec.contract_size), spec)
 
 
 def notional(qty: float, price: float, spec: VenueSpec) -> float:
@@ -1631,36 +1681,71 @@ class LegSizes:
 
 
 def size_pair(usd: float, px_a: float, px_b: float, spec_a: VenueSpec, spec_b: VenueSpec,
-              max_mismatch_pct: float) -> LegSizes | None:
-    """Contracts per leg for `usd` per leg, shrinking the larger leg lot by lot until the
-    notionals match within `max_mismatch_pct`. None when a leg cannot be expressed."""
+              max_mismatch_pct: float, min_usd: float = 0.0) -> LegSizes | None:
+    """Contracts per leg for `usd` per leg. The larger leg is shrunk onto the smaller one's notional
+    (closed-form jump per iteration, so coarse/fine lot combinations converge in a few steps) until the
+    notionals match within `max_mismatch_pct`. None when a leg cannot be expressed or the matched
+    notional ends up below `min_usd`."""
     qa = contracts_for_usd(usd, px_a, spec_a)
     qb = contracts_for_usd(usd, px_b, spec_b)
     if qa <= 0 or qb <= 0:
         return None
-    for _ in range(200):
+    tol = 1.0 + max_mismatch_pct / 100.0
+    for _ in range(64):
         legs = LegSizes(qa, qb, notional(qa, px_a, spec_a), notional(qb, px_b, spec_b))
         if legs.mismatch_pct <= max_mismatch_pct:
-            return legs
+            return legs if legs.matched_usd >= min_usd else None
         if legs.notional_a > legs.notional_b:
-            qa = round(qa - spec_a.lot, 10)
+            nq = contracts_for_usd(legs.notional_b * tol, px_a, spec_a)
+            qa = nq if nq < qa else round(qa - spec_a.lot, 10)      # jump, else guarantee progress
         else:
-            qb = round(qb - spec_b.lot, 10)
+            nq = contracts_for_usd(legs.notional_a * tol, px_b, spec_b)
+            qb = nq if nq < qb else round(qb - spec_b.lot, 10)
         if qa < spec_a.min_qty - 1e-12 or qb < spec_b.min_qty - 1e-12:
             return None
     return None
 
 
+@dataclass(frozen=True)
+class HedgePlan:
+    hedge_qty: float            # contracts to send on the hedge venue (0.0 = nothing hedgeable yet)
+    covered_maker_qty: float    # maker-venue contracts the hedge notional actually covers
+    residual_maker_qty: float   # maker contracts still unhedged after this round
+
+
+def hedge_plan(unhedged_maker_qty: float, px_maker: float, spec_maker: VenueSpec,
+               px_hedge: float, spec_hedge: VenueSpec) -> HedgePlan:
+    """Hedge-venue contracts for a maker fill, and how much of the fill they really cover (the hedge
+    is floored to whole lots, so a residual below one hedge contract stays unhedged and must be
+    tracked — never marked hedged)."""
+    hq = contracts_for_usd(notional(unhedged_maker_qty, px_maker, spec_maker), px_hedge, spec_hedge)
+    if hq <= 0:
+        return HedgePlan(0.0, 0.0, unhedged_maker_qty)
+    covered = min(unhedged_maker_qty, notional(hq, px_hedge, spec_hedge) / (px_maker * spec_maker.contract_size))
+    return HedgePlan(hq, round(covered, 10), round(unhedged_maker_qty - covered, 10))
+
+
 def hedge_qty(filled_qty: float, px_maker: float, spec_maker: VenueSpec,
               px_hedge: float, spec_hedge: VenueSpec) -> float:
     """Hedge-venue contracts matching a maker fill's notional; 0.0 = unhedgeable (below minimum)."""
-    return contracts_for_usd(notional(filled_qty, px_maker, spec_maker), px_hedge, spec_hedge)
+    return hedge_plan(filled_qty, px_maker, spec_maker, px_hedge, spec_hedge).hedge_qty
+
+
+def excess_to_flatten(residual_qty: float, matched_qty: float, spec: VenueSpec, max_mismatch_pct: float) -> float:
+    """Maker-venue contracts to flatten from an unhedged residual once the resting order is terminal:
+    the residual (rounded down to lots) when nothing is matched or it exceeds the mismatch tolerance
+    of the matched quantity; 0.0 to accept it as tolerable exposure."""
+    if residual_qty <= 0:
+        return 0.0
+    if matched_qty > 0 and residual_qty <= matched_qty * max_mismatch_pct / 100.0:
+        return 0.0
+    return lots_floor(residual_qty, spec)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_sizing.py -q`
-Expected: `4 passed`
+Expected: `6 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -2939,7 +3024,7 @@ Expected: `7 passed`
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `59 passed`
+Expected: `61 passed`
 
 - [ ] **Step 6: Commit**
 
@@ -4092,7 +4177,7 @@ Expected: `4 passed`
 - [ ] **Step 5: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `73 passed`
+Expected: `75 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/sim.py deploy-bbo/tests/test_sim.py
@@ -4434,6 +4519,25 @@ async def test_tm_partial_fill_cancels_remainder_and_opens_partial(tmp_path):
     assert pos.size_usd == pytest.approx(min(10 * 1.0061, 1 * 1.0010 * 10))
     assert await h.sim("blofin").open_orders() == []              # remainder cancelled on first fill
     assert pos.maker_cancel_sent
+    # the $10.01 hedge contract covered 9.95 maker contracts; the 0.05 residual is within tolerance
+    assert (await h.sim("blofin").positions())[0].qty == 10.0
+
+
+async def test_tm_residual_beyond_tolerance_is_flattened(tmp_path):
+    h = Harness(tmp_path, max_position_usd=31.0)
+    h.quote("blofin", 1.0000, 1.0020)
+    h.quote("mexc", 1.0000, 1.0010)
+    pos = await h.ex.enter_tm(Intent("TM_ENTER", symbol=SYM, venue_a="blofin", venue_b="mexc", maker_venue="blofin",
+                                     rest_price=1.0020, size_usd=31.0))
+    assert pos.maker_qty == 30.0 and pos.qty_b == 3.0              # $30.06 vs 3 × $10.01
+    await asyncio.sleep(0.005)
+    h.quote("blofin", 1.0020, 1.0021, bq=50.0)                   # 50% of 50 -> 25 contracts fill, then cancel
+    await settle()
+    assert pos.status == OPEN
+    # $25.05 filled -> 2 mexc contracts ($20.02) cover ~19.98 maker contracts; residual ~5 > 5% -> flattened
+    assert pos.filled_b == 2.0 and pos.filled_a == pytest.approx(20.0, abs=0.2)
+    assert (await h.sim("blofin").positions())[0].qty == pytest.approx(pos.filled_a)
+    assert pos.exit_fees_usd > 0                                 # the flatten paid a taker fee
 
 
 async def test_tm_cancel_with_nothing_filled_discards(tmp_path):
@@ -4548,7 +4652,7 @@ from .models import (Intent, OrderEvent, Position, TT_ENTERING, MAKER_RESTING, H
 from .positions import PositionBook, transition
 from .quotes import QuoteBoard
 from .risk import RiskManager
-from .sizing import size_pair, hedge_qty, notional
+from .sizing import size_pair, hedge_plan, excess_to_flatten, lots_floor, notional
 from .venues.base import Venue
 
 log = logging.getLogger("bbo.exec")
@@ -4705,7 +4809,8 @@ class Executor:
         spec_a, spec_b = self._spec(a, sym), self._spec(b, sym)
         if qa is None or qb is None or spec_a is None or spec_b is None:
             return None
-        legs = size_pair(intent.size_usd, qa.bid, qb.ask, spec_a, spec_b, self.cfg.max_leg_mismatch_pct)
+        legs = size_pair(intent.size_usd, qa.bid, qb.ask, spec_a, spec_b, self.cfg.max_leg_mismatch_pct,
+                         min_usd=self.cfg.min_position_usd)
         if legs is None:
             self.metrics.funnel["size_fail"] += 1
             return None
@@ -4803,7 +4908,8 @@ class Executor:
             return None
         px_a = intent.rest_price if mv == a else qa.bid
         px_b = intent.rest_price if mv == b else qb.ask
-        legs = size_pair(intent.size_usd, px_a, px_b, spec_a, spec_b, self.cfg.max_leg_mismatch_pct)
+        legs = size_pair(intent.size_usd, px_a, px_b, spec_a, spec_b, self.cfg.max_leg_mismatch_pct,
+                         min_usd=self.cfg.min_position_usd)
         if legs is None:
             self.metrics.funnel["size_fail"] += 1
             return None
@@ -4925,12 +5031,17 @@ class Executor:
         return "sell" if maker_is_a else "buy"         # maker bought back on A → sell B; maker sold on B → buy A
 
     async def _hedge_delta(self, pos: Position, terminal: bool) -> None:
+        """Hedge whatever the resting order has filled but we have not yet covered. The hedge is
+        floored to whole hedge-venue lots, so `hedged_qty` only advances by the maker quantity the
+        hedge notional really covers; the residual waits for more fills and, once the resting order
+        is terminal, is flattened on the maker venue when it exceeds the mismatch tolerance."""
         async with self._lock(pos.id):
             if pos.status not in (MAKER_RESTING, HEDGING, EXIT_MAKER_RESTING, EXIT_HEDGING):
                 return
             phase = "entry" if pos.status in (MAKER_RESTING, HEDGING) else "exit"
             mv = pos.maker_venue
             hv = pos.venue_b if mv == pos.venue_a else pos.venue_a
+            spec_m, spec_h = self._spec(mv, pos.symbol), self._spec(hv, pos.symbol)
             unhedged = round(pos.maker_filled_qty - pos.hedged_qty, 10)
             if unhedged > 1e-12:
                 if pos.status == MAKER_RESTING:
@@ -4939,22 +5050,15 @@ class Executor:
                     transition(pos, EXIT_HEDGING)
                 if not terminal:
                     await self._cancel_maker_order(pos, priority=True)   # first fill cancels the remainder
-                spec_m, spec_h = self._spec(mv, pos.symbol), self._spec(hv, pos.symbol)
                 side = self._hedge_side(pos, phase)
                 q_h = self.board.get(hv, pos.symbol)
                 px_h = ((q_h.ask if side == "buy" else q_h.bid) if q_h else pos.maker_avg_price) or pos.maker_avg_price
-                hq = hedge_qty(unhedged, pos.maker_avg_price, spec_m, px_h, spec_h)
-                if hq <= 0:
-                    if not terminal:
-                        return                              # wait for more fills before hedging
-                    log.warning("UNHEDGEABLE #%d %s maker qty %s below hedge minimum — flattening", pos.id, pos.symbol, unhedged)
-                    await self._flatten_maker_fill(pos, unhedged, phase)
-                    pos.hedged_qty = pos.maker_filled_qty
-                else:
+                plan = hedge_plan(unhedged, pos.maker_avg_price, spec_m, px_h, spec_h)
+                if plan.hedge_qty > 0:
                     t_fill = pos.maker_fill_ts or self.clock()
                     ev = None
                     for attempt in range(HEDGE_RETRIES):
-                        ev = await self._place_taker(pos, hv, f"hedge_{phase}{attempt}", side, hq,
+                        ev = await self._place_taker(pos, hv, f"hedge_{phase}{attempt}", side, plan.hedge_qty,
                                                      phase == "exit", priority=True)
                         if ev.state == "filled" and ev.filled_qty > 0:
                             break
@@ -4962,13 +5066,24 @@ class Executor:
                     if ev is None or not (ev.state == "filled" and ev.filled_qty > 0):
                         log.error("HEDGE_FAILED #%d %s on %s — flattening maker fill", pos.id, pos.symbol, hv)
                         self.risk.record_strike(pos.symbol, pos.venue_a, pos.venue_b)
-                        await self._flatten_maker_fill(pos, unhedged, phase)
+                        await self._flatten_maker_fill(pos, lots_floor(unhedged, spec_m), phase)
                         pos.hedged_qty = pos.maker_filled_qty
                     else:
-                        pos.hedged_qty = round(pos.hedged_qty + unhedged, 10)
+                        pos.hedged_qty = round(pos.hedged_qty + plan.covered_maker_qty, 10)
                         self._accumulate_leg(pos, hv, phase, ev)
                         self.metrics.record("fill_to_hedged", (self.clock() - t_fill) * 1000.0)
-                        log.info("TM_HEDGE #%d %s %s %s qty=%s @%s", pos.id, pos.symbol, hv, side, ev.filled_qty, ev.avg_price)
+                        log.info("TM_HEDGE #%d %s %s %s qty=%s @%s covers=%s maker", pos.id, pos.symbol, hv, side,
+                                 ev.filled_qty, ev.avg_price, plan.covered_maker_qty)
+                residual = round(pos.maker_filled_qty - pos.hedged_qty, 10)
+                if residual > 1e-12 and terminal:
+                    to_flat = excess_to_flatten(residual, pos.hedged_qty, spec_m, self.cfg.max_leg_mismatch_pct)
+                    if to_flat > 0:
+                        log.warning("RESIDUAL #%d %s %s maker contracts unhedged (matched %s) — flattening %s",
+                                    pos.id, pos.symbol, residual, pos.hedged_qty, to_flat)
+                        await self._flatten_maker_fill(pos, to_flat, phase)
+                    else:
+                        log.info("RESIDUAL_ACCEPTED #%d %s %s maker contracts within tolerance", pos.id, pos.symbol, residual)
+                    pos.hedged_qty = pos.maker_filled_qty
             tr = self._tracks.get(pos.maker_client_id)
             maker_terminal = tr is not None and tr.last is not None and tr.last.terminal
             if maker_terminal and round(pos.maker_filled_qty - pos.hedged_qty, 10) <= 1e-12:
@@ -4976,6 +5091,8 @@ class Executor:
 
     async def _flatten_maker_fill(self, pos: Position, qty: float, phase: str) -> None:
         """Undo an unhedgeable/unhedged maker fill on the maker venue itself (reduce-only market)."""
+        if qty <= 0:
+            return
         side = "buy" if pos.maker_side == "sell" else "sell"
         for i, delay in enumerate(FLATTEN_LADDER_S[:3]):
             ev = await self._place_taker(pos, pos.maker_venue, f"mflat{i}", side, qty, True, priority=True)
@@ -5185,12 +5302,12 @@ class Executor:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_execution_tt.py tests/test_execution_tm.py -q`
-Expected: `10 passed`
+Expected: `11 passed`
 
 - [ ] **Step 6: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `86 passed`
+Expected: `89 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/execution.py deploy-bbo/tests/test_execution_tt.py deploy-bbo/tests/test_execution_tm.py
@@ -5956,7 +6073,7 @@ Expected: `4 passed`
 - [ ] **Step 7: Run the whole suite and commit**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: `93 passed`
+Expected: `96 passed`
 
 ```bash
 git add deploy-bbo/bbo_trader/venues/registry.py deploy-bbo/bbo_trader/app.py deploy-bbo/bbo_trader/main.py deploy-bbo/tests/test_app.py
@@ -6079,7 +6196,7 @@ git commit -m "feat(bbo): run script, systemd unit, README, env example"
 
 ## Plan self-review (done while writing)
 
-- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
+- **Task 1 amended after code review (2026-09-05):** MODE normalized/validated (`paper`|`live`, else `ValueError`), venue `role` validated, `shared` coerced like other bools, secrets excluded from `repr`, missing blocklist file fails closed, JSON errors name the file; venues.json must be an object and the blocklist a list of strings; `shared` must be a real boolean; Telegram token hidden from repr; MODE checked before any file I/O; 11 tests added (14 total). **Task 2 amended after code review:** `touch_notional` rejects unknown sides, `from_dict` falls back to the ISO timestamps and copies dicts (no aliasing), `NON_TERMINAL` is a frozenset; 3 tests added (7 total). **Task 3 amended after code review:** `mk_bbo` gained a `ts_exchange` kwarg and the quotes test now proves `ts_local` governs staleness, the boundary is inclusive and newer quotes overwrite (mutation-checked). **Task 4 amended after code review:** pegs must be strictly positive and strictly inside the book (`_postable`), `needs_requote` tolerance scales with the tick, `tick_decimals` from the shortest repr (rejects non-positive ticks), relative rounding epsilon, `tm_required_pct(maker_fees, taker_fees, p)`; 7 tests added incl. a deterministic peg property sweep (13 total). **Task 5 amended after code review:** `size_pair` shrinks the larger leg with a closed-form jump (coarse/fine lot pairs no longer time out) and enforces `min_usd`; `contracts_for_usd`/`lots_floor` fail closed on non-finite inputs; new `hedge_plan` returns hedge qty + covered maker qty + residual, `excess_to_flatten` decides what residual to flatten; 2 tests added (6 total). **Task 16 amended accordingly:** `_hedge_delta` advances `hedged_qty` only by the covered maker quantity and, once the resting order is terminal, flattens residuals beyond `MAX_LEG_MISMATCH_PCT`; both `size_pair` calls pass `min_usd=cfg.min_position_usd`; 1 TM test added (11 total). **Task 7 amended before implementation (from the Task 2 review):** closed positions' dashboard dicts are cached at close time and `closed_keep` defaults to 200, so a state save never re-serializes hundreds of closed positions; 1 test added (5 total). Carry-forward notes: Task 19 must normalize `coverage` over the configured venues and reject quotes with `ts_local > now + 1 s` (`QUOTE_TS_SKEW`); Task 7 should cache closed positions' dicts so state saves do not re-serialize 500 closed positions. The code blocks above are the amended versions.
 
 - **Spec coverage:** decisions 1–10 → Tasks 1 (registry, roles), 3/12/13 (BBO-only feeds), 9/19 (event-driven, 500 ms sweep), 16 (event-driven fills, REST fallback, TT priority, PeggedMaker for entry and exit, rate budgets with reserve, flatten ladder, degraded retry), 8/19 (manual halt via flags and Telegram, no kill switch), 14/19 (paper mode over real feeds), 7/19 (dashboard-schema state file, `DATA_DIR`), 19/20 (legacy heartbeat guard, systemd unit). Mismatch guard, funding gate, touch-depth guard, volume gate, win-rate gate, cooldowns and strikes → Tasks 8–9. Latency metrics and coverage watchdog → Task 15/19. Not in this plan by design: live adapters (Plan 2), quote-only venues and further trade venues (Plan 3), the 48 h paper soak (operational, after Task 20).
 - **Placeholder scan:** none.
