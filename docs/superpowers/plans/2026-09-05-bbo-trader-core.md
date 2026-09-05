@@ -2896,7 +2896,7 @@ git commit -m "feat(bbo): generic sharded WebSocket runner with uptime-keyed bac
 - Create: `deploy-bbo/bbo_trader/venues/mexc.py`
 - Test: `deploy-bbo/tests/test_mexc_public.py`
 
-Message shapes follow the MEXC contract API docs and SpreadWatch's live captures (`push.depth.full` levels are `[price, contracts, order_count]`). **Before relying on this adapter live, capture 15 s of real frames and compare** (Plan 2 does this for the private channel too).
+Message shapes follow the MEXC contract API docs and SpreadWatch's live captures (`push.depth.full` levels are `[price, contracts, order_count]`). **Verified against live frames on 2026-09-05** with exactly this parser: subscription ack `{"channel":"rs.sub.depth.full","data":"success"}` (ignored), pushes `{"symbol":"BTC_USDT","data":{"cts":...,"asks":[[79666.5,166847,6],...],"bids":[...],"version":...},"channel":"push.depth.full","ts":...}`; measured 1.2–3 BBO updates/s per symbol. Plan 2 repeats the capture for the private channel.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3129,6 +3129,8 @@ git commit -m "feat(bbo): MEXC public adapter — depth.full BBO feed, specs, vo
 **Files:**
 - Create: `deploy-bbo/bbo_trader/venues/blofin.py`
 - Test: `deploy-bbo/tests/test_blofin_public.py`
+
+**Verified against live frames on 2026-09-05** with exactly this parser: subscribe ack `{"event":"subscribe","arg":{...}}` (ignored), pushes `{"arg":{"channel":"books5","instId":"BTC-USDT"},"action":"snapshot","data":{"asks":[["79666.5","1233"],...],"bids":[...],"ts":"1788599375999"}}` (`data` is a dict); measured ~9 pushes/s per symbol even when the book is unchanged — expect ~10 evaluations/s per BloFin symbol.
 
 - [ ] **Step 1: Write the failing tests**
 
